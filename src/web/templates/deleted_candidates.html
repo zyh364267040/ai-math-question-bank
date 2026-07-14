@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}已删除候选题 · AI 数学题库{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">REVIEW RECOVERY</p>
+  <h1>已删除候选题</h1>
+  <p>{{ job.paper_name }} · 原始试卷和图片仍完整保留</p>
+</section>
+<p><a href="/papers">← 返回试卷与审核</a></p>
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}" data-page-csrf>
+<section class="question-list">
+{% for q in questions %}
+  <article class="question-list-item deleted-item">
+    <h2>原题号 {{ q.source_question_no }}</h2>
+    <p>删除时间：{{ q.deleted_at }}</p>
+    <p>原因：{{ reason_names.get(q.deletion_reason, q.deletion_reason or '未记录') }}</p>
+    {% if q.deletion_note %}<p>备注：{{ q.deletion_note }}</p>{% endif %}
+    <form method="post" action="/reviews/{{ job.id }}/questions/{{ q.source_question_no }}/restore">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="version" value="{{ q.version }}">
+      <button type="submit">恢复本题</button>
+    </form>
+  </article>
+{% else %}
+  <p class="empty-state">目前没有已删除的候选题。</p>
+{% endfor %}
+</section>
+{% endblock %}

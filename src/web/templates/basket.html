@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}选题篮 · AI 数学题库{% endblock %}
+{% block content %}
+<section class="page-heading questions-heading"><p class="eyebrow">QUESTION BASKET</p><h1>选题篮</h1><p>按当前顺序导出，共 {{ questions|length }} 道题。</p></section>
+{% if questions %}
+<section class="basket-toolbar"><form method="post" action="/basket/clear"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger" type="submit">清空选题篮</button></form></section>
+<section class="question-list">{% for q in questions %}<article class="question-list-item basket-item">
+  <div class="basket-number">{{ loop.index }}</div><div class="basket-content">
+  <div class="question-card-tags"><span class="tag">{{ q.question_type_name }}</span><span class="tag">{{ '含图' if q.has_figure else '无图' }}</span><span class="tag {{ 'tag-warning' if q.answer_status=='missing' else 'tag-ready' }}">{{ '答案缺失' if q.answer_status=='missing' else '已有答案' }}</span></div>
+  <div class="question-stem">{{ q.stem_markdown }}</div>
+  {% if q.options %}<div class="question-list-options">{% for o in q.options %}<div><span class="option-label">{{ o.option_code }}</span>{{ o.content_markdown }}</div>{% endfor %}</div>{% endif %}
+  {% with subquestion_display=q.subquestion_display %}{% include "_subquestions.html" %}{% endwith %}
+  <div class="question-secondary"><span>{{ q.source_paper_name }} · {{ q.exam_year or '年份未知' }} · 原题号 {{ q.source_question_no }}</span><span>知识点：{{ q.primary_knowledge_name }}</span><a href="/questions/{{ q.question_code }}">详情</a></div>
+  <div class="basket-actions">{% for action,label in [('move-up','上移'),('move-down','下移'),('remove','移出选题篮')] %}<form method="post" action="/basket/{{ action }}/{{ q.question_code }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">{{ label }}</button></form>{% endfor %}</div>
+  {% set delete_label = '从题库删除' %}{% set delete_next = '/basket' %}{% include "_delete_question.html" %}
+  </div></article>{% endfor %}</section>
+<section class="export-preview-panel">
+<form class="export-form" data-basket-preview-form method="post" action="/basket/export"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><h2>导出设置</h2>
+  <label><input type="checkbox" name="include_source"> 来源</label><label><input type="checkbox" name="include_knowledge"> 知识点</label><label><input type="checkbox" name="include_answers"> 答案</label><label><input type="checkbox" name="include_analysis"> 解析</label><p>题目必需的配图将自动携带。</p><button type="submit">导出新版本</button>
+</form>
+<div class="preview-shell"><div class="preview-status" data-preview-status role="status" aria-live="polite">正在生成预览…</div><div data-preview-output></div><button class="preview-retry" data-preview-retry type="button" hidden>重试预览</button></div>
+</section>
+<script defer src="/static/basket_preview.js"></script>
+{% else %}<p class="empty-state">选题篮还是空的，先去<a href="/questions">我的题库</a>挑几道题吧。</p>{% endif %}
+{% endblock %}

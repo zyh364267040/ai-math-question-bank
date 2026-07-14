@@ -1,0 +1,44 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 编辑器与本地代理文件
+.vscode/
+.idea/
+.hermes/
+
+# 私有数据：仅保留目录占位文件
+data/private/*
+!data/private/.gitkeep
+
+# 原始试卷、数据库、日志与临时产物
+*.pdf
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.pid
+
+# 临时 OCR、截图和导出文件
+*.ocr.tmp
+*.ocr.json
+*ocr-temp*
+*ocr_tmp*
+*screenshot-temp*
+*screenshot_tmp*
+tmp/
+build/
+dist/
+exports/

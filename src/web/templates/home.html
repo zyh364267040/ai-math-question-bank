@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <p class="eyebrow">LOCAL · READ ONLY</p>
+  <h1>AI 数学题库</h1>
+  <p>从试卷识别结果开始，把每一道题整理得清楚、可靠、可追溯。</p>
+</section>
+<section class="stats" aria-label="真实数据统计">
+  <div><strong>{{ stats.papers }}</strong><span>原始试卷数</span></div>
+  <div><strong>{{ stats.jobs }}</strong><span>导入任务数</span></div>
+  <div><strong>{{ stats.review_jobs }}</strong><span>待审核任务数</span></div>
+  <div><strong>{{ stats.questions }}</strong><span>正式题目数</span></div>
+</section>
+<section class="feature-grid">
+  <a class="feature active" href="/questions"><span>01</span><h2>我的题库</h2><p>浏览 {{ stats.questions }} 道正式题目。</p><b>立即进入 →</b></a>
+  <a class="feature active" href="/papers"><span>02</span><h2>试卷与审核</h2><p>查看试卷、候选识别和原始页面。</p><b>立即进入 →</b></a>
+  <a class="feature active" href="/basket"><span>03</span><h2>选题篮</h2><p>已选 {{ stats.basket }} 道题，组合并导出练习。</p><b>立即进入 →</b></a>
+  <article class="feature muted"><span>04</span><h2>数据与设置</h2><p>维护本地数据和偏好。</p><b>开发中</b></article>
+</section>
+{% endblock %}

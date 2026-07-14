@@ -1,0 +1,39 @@
+.subquestion-groups,
+.subquestion-children,
+.subquestion-fallback {
+  list-style: none;
+  margin: 8px 0;
+  padding-left: 0;
+}
+
+.subquestion-main {
+  margin: 8px 0;
+}
+
+.subquestion-main > b,
+.subquestion-children b,
+.subquestion-fallback b {
+  display: inline-block;
+  margin-right: 8px;
+  color: var(--green);
+}
+
+.subquestion-children {
+  padding-left: 2em;
+}
+
+.subquestion-children li {
+  margin: 6px 0;
+}
+
+.complete-subquestions > .subquestion-main {
+  display: block;
+}
+
+.complete-subquestions > .subquestion-main > .inline-editable {
+  margin-left: 8px;
+}
+
+.complete-subquestions .subquestion-children {
+  margin-top: 10px;
+}

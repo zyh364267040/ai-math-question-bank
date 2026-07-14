@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}本题已删除 · AI 数学题库{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">REMOVED FROM REVIEW</p>
+  <h1>本题已从审核流程删除</h1>
+  <p>{{ job.paper_name }} · 原题号 {{ number }}</p>
+</section>
+<section class="deleted-candidate-status">
+  <p>这道题不会继续参与审核或入库，原试卷、候选数据、裁图和历史修改仍然保留。</p>
+  <p><b>删除时间：</b>{{ draft.deleted_at }}</p>
+  <p><b>删除原因：</b>{{ reason_names.get(draft.deletion_reason, draft.deletion_reason or '未记录') }}</p>
+  {% if draft.deletion_note %}<p><b>备注：</b>{{ draft.deletion_note }}</p>{% endif %}
+  <form method="post" action="/reviews/{{ job.id }}/questions/{{ number }}/restore">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="version" value="{{ draft.version }}">
+    <button class="button" type="submit">恢复本题</button>
+  </form>
+  <p><a href="/reviews/{{ job.id }}/deleted">查看全部已删除题目</a> · <a href="/papers">返回试卷与审核</a></p>
+</section>
+{% endblock %}

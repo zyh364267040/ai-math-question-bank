@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}{{ job.paper_name }} · 审核查看{% endblock %}
+{% block content %}
+<section class="review-heading">
+  <a href="/papers">← 返回试卷列表</a>
+  <p class="eyebrow">REVIEW · TASK #{{ job.id }}</p>
+  <h1>{{ job.paper_name }}</h1>
+  <p><span class="warning-pill">候选识别，尚未人工确认</span> 本页面仅供对照查看，不会写入正式题库。</p>
+</section>
+{% if audit_error %}<div class="audit-error"><b>AI复核数据损坏或不完整</b><span>已停止使用本次AI复核结果，下面按原有方式展示全部候选题。</span></div>{% endif %}
+{% if audit %}
+<section class="review-stats">
+  <div><strong>{{ summary.total }}</strong><span>整卷 {{ summary.total }} 道候选题</span></div>
+  <div><strong>{{ audit.counts.auto_pass }}</strong><span>自动通过</span><small>{% for q in all_questions if q.ai_audit.audit_status == 'auto_pass' %}{{ q.source_question_no }}{% if not loop.last %}、{% endif %}{% endfor %}</small></div>
+  <div><strong>{{ audit.counts.disputed }}</strong><span>AI有争议</span><small>{% for q in all_questions if q.ai_audit.audit_status == 'disputed' %}{{ q.source_question_no }}{% if not loop.last %}、{% endif %}{% else %}无{% endfor %}</small></div>
+  <div><strong>{{ audit.counts.human_required }}</strong><span>需人工确认</span><small>{% for q in all_questions if q.ai_audit.audit_status == 'human_required' %}{{ q.source_question_no }}{% if not loop.last %}、{% endif %}{% endfor %}</small></div>
+</section>
+<nav class="audit-filters" aria-label="AI审核筛选">
+  <a class="{% if active_status == 'human_required' %}active{% endif %}" href="?status=human_required">需人工确认 <b>{{ audit.counts.human_required }}</b></a>
+  <a class="{% if active_status == 'disputed' %}active{% endif %}" href="?status=disputed">AI有争议 <b>{{ audit.counts.disputed }}</b></a>
+  <a class="{% if active_status == 'auto_pass' %}active{% endif %}" href="?status=auto_pass">AI自动通过 <b>{{ audit.counts.auto_pass }}</b></a>
+  <a class="{% if active_status == 'all' %}active{% endif %}" href="?status=all">全部 <b>{{ summary.total }}</b></a>
+</nav>
+{% if audit.random_sample_recommendation %}
+<section class="sample-recommendation">
+  <b>建议抽查</b>
+  <div>{% for sample in sample_questions %}<a href="/review/{{ job.id }}?status={{ sample.filter }}#question-{{ sample.number }}">{{ sample.number }}</a>{% endfor %}</div>
+  <p>{{ audit.random_sample_recommendation.reason }}</p>
+</section>
+{% endif %}
+<p class="visible-count">当前显示 {{ questions | length }} 道</p>
+{% else %}
+<section class="review-stats">
+  <div><strong>{{ summary.total }}</strong><span>{{ summary.total }} 道候选题</span></div>
+  <div><strong>{{ summary.high }}</strong><span>高置信度</span></div>
+  <div><strong>{{ summary.medium }}</strong><span>中置信度</span></div>
+  <div><strong>{{ summary.figures }}</strong><span>含图题</span></div>
+  <div><strong>{{ summary.focus }}</strong><span>重点核对题</span></div>
+</section>
+{% endif %}
+<div class="review-layout">
+  <aside class="source-panel">
+    <h2>原始页面</h2><p>点击缩略图查看高清页面</p>
+    {% for page in pages %}
+    <a class="page-thumb" href="/private-pages/{{ job.id }}/{{ page.relative_path }}" target="_blank" rel="noopener">
+      <img src="/private-pages/{{ job.id }}/{{ page.relative_path }}" alt="原始试卷第 {{ page.page_number }} 页" loading="lazy">
+      <span>第 {{ page.page_number }} 页 · 高清查看 ↗</span>
+    </a>
+    {% endfor %}
+  </aside>
+  <section class="questions">
+    {% if audit and not questions %}
+      <div class="empty audit-empty">{% if active_status == 'disputed' %}本卷暂无AI争议题{% elif active_status == 'human_required' %}本卷暂无需人工确认题{% elif active_status == 'auto_pass' %}本卷暂无AI自动通过题{% else %}本卷暂无候选题{% endif %}</div>
+    {% endif %}
+    <nav class="question-nav" aria-label="题号快速导航">
+      {% for q in questions %}<a href="#question-{{ q.source_question_no }}">{{ q.source_question_no }}</a>{% endfor %}
+    </nav>
+    {% for q in questions %}
+    <article id="question-{{ q.source_question_no }}" class="question-card confidence-{{ q.confidence }}{% if q.ai_audit %} audit-{{ q.ai_audit.audit_status }}{% endif %}">
+      <header><div><span class="question-no">{{ q.source_question_no }}</span><span class="type">{{ {'single_choice':'单选题','multiple_choice':'多选题','fill_blank':'填空题','solution':'解答题'}.get(q.question_type_code, q.question_type_code) }}</span></div><span class="confidence">{{ '高置信度' if q.confidence == 'high' else '中置信度' if q.confidence == 'medium' else '低置信度' }}</span></header>
+      {% if q.ai_audit %}
+      <section class="audit-result {{ q.ai_audit.audit_status }}">
+        <b>第二轮AI审核：{{ {'human_required':'需人工确认','disputed':'有争议','auto_pass':'自动通过'}[q.ai_audit.audit_status] }}</b>
+        {% if q.ai_audit.audit_status == 'auto_pass' %}<p>仅文字/结构/公式复核通过；答案正确性尚未审核</p>{% endif %}
+        {% if q.ai_audit.audit_status != 'auto_pass' %}<div><strong>{% if q.ai_audit.audit_status == 'disputed' %}争议{% else %}问题{% endif %}</strong><ul>{% for issue in q.ai_audit.issues %}<li>{{ issue }}</li>{% else %}<li>未提供具体说明</li>{% endfor %}</ul></div>{% endif %}
+        {% if q.ai_audit.audit_status != 'auto_pass' %}<div><strong>建议更正</strong><ul>{% for correction in q.ai_audit.suggested_corrections %}<li>{{ correction }}</li>{% else %}<li>未提供建议更正</li>{% endfor %}</ul></div>{% endif %}
+        <small>证据页：第 {{ q.ai_audit.evidence_page }} 页</small>
+      </section>
+      {% endif %}
+      <div class="stem">{{ q.stem_markdown }}</div>
+      {% if q.options %}<ol class="options">{% for option in q.options %}<li><b>{{ option.code }}</b><span>{{ option.content }}</span></li>{% endfor %}</ol>{% endif %}
+      {% with subquestion_display=q.subquestion_display %}{% include "_subquestions.html" %}{% endwith %}
+      {% if q.question_crop %}<section class="question-figures complete-question-crop"><b>{{ '完整题目原图（AI复核通过）' if q.question_crop.review_status == 'ai_review_passed' else '完整题目原图（待AI复核）' }}</b><a href="/private-pages/{{ job.id }}/{{ q.question_crop.output_relative_path }}" target="_blank" rel="noopener"><img src="/private-pages/{{ job.id }}/{{ q.question_crop.output_relative_path }}" alt="第 {{ q.source_question_no }} 题完整原图" loading="lazy"><span>点击查看高清</span></a>{% if q.question_crop.warnings %}<ul>{% for warning in q.question_crop.warnings %}<li>{{ warning }}</li>{% endfor %}</ul>{% endif %}</section>
+      {% else %}<div class="figure-alert question-crop-missing"><b>单题原图尚未生成或清单异常</b></div>{% endif %}
+      <dl class="metadata">
+        <div><dt>来源页</dt><dd>{{ q.source_pages | join('、') }}</dd></div>
+        <div><dt>知识点</dt><dd>{{ q.primary_knowledge_name }}{% if q.related_knowledge_names %}<small>关联：{{ q.related_knowledge_names | join('、') }}</small>{% endif %}</dd></div>
+      </dl>
+      {% set figures = q.figure_assets | selectattr('kind', 'equalto', 'question_figure') | list %}
+      {% set evidence = q.figure_assets | selectattr('kind', 'equalto', 'review_evidence') | list %}
+      {% set passed_figures = figures | selectattr('review_status', 'equalto', 'ai_review_passed') | list %}
+      {% if figures %}<section class="question-figures"><b>{{ '配图AI复核通过' if passed_figures | length == figures | length else '配图待AI复核' }}</b>{% for asset in figures %}<a href="/private-pages/{{ job.id }}/{{ asset.output_relative_path }}" target="_blank" rel="noopener"><img src="/private-pages/{{ job.id }}/{{ asset.output_relative_path }}" alt="第 {{ q.source_question_no }} 题配图" loading="lazy"></a>{% endfor %}</section>
+      {% elif q.figure_required %}<div class="figure-alert"><b>需要切图</b><span>{{ q.figure_notes }}</span></div>{% endif %}
+      {% if evidence %}<section class="review-evidence"><b>审核证据</b><div>{% for asset in evidence %}<a href="/private-pages/{{ job.id }}/{{ asset.output_relative_path }}" target="_blank" rel="noopener"><img src="/private-pages/{{ job.id }}/{{ asset.output_relative_path }}" alt="第 {{ q.source_question_no }} 题{{ '增强' if asset.processing.variant == 'enhanced' else '原色' }}审核证据" loading="lazy"><span>{{ '增强局部' if asset.processing.variant == 'enhanced' else '原色局部' }} · 点击查看高清</span></a>{% endfor %}</div><small>增强仅用于辨认，不代表恢复原文</small></section>{% endif %}
+      {% if q.review_notes %}<div class="review-notes"><b>审核备注</b><ul>{% for note in q.review_notes %}<li>{{ note }}</li>{% endfor %}</ul></div>{% endif %}
+      <div class="answer-empty">本卷未提供答案</div>
+      {% set candidate_number = q.source_question_no %}{% set candidate_version = q.review_version %}{% include "_delete_candidate_question.html" %}
+      <footer><a href="{% if not loop.first %}#question-{{ questions[loop.index0 - 1].source_question_no }}{% else %}#question-{{ q.source_question_no }}{% endif %}">← 上一题</a><a href="{% if not loop.last %}#question-{{ questions[loop.index0 + 1].source_question_no }}{% else %}#question-{{ q.source_question_no }}{% endif %}">下一题 →</a></footer>
+    </article>
+    {% endfor %}
+  </section>
+</div>
+{% endblock %}

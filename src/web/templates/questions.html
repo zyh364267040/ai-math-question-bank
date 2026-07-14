@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading questions-heading"><p class="eyebrow">QUESTION BANK</p><h1>我的题库</h1><p>共 {{ questions|length }} 道符合当前条件的正式题目 · <a href="/questions/deleted">已删除题目</a></p></section>
+<form class="question-filters" method="get" action="/questions">
+  <label><span>知识点</span><select name="knowledge"><option value="">全部</option>{% for item in filters.knowledge %}<option value="{{ item.code }}" {% if active.knowledge == item.code %}selected{% endif %}>{{ item.name }}</option>{% endfor %}</select></label>
+  <label><span>题型</span><select name="question_type"><option value="">全部</option>{% for item in filters.types %}<option value="{{ item.code }}" {% if active.question_type == item.code %}selected{% endif %}>{{ item.name }}</option>{% endfor %}</select></label>
+  <label><span>来源</span><input name="source" value="{{ active.source }}" placeholder="试卷或学校名称"></label>
+  <label><span>图片</span><select name="has_figure"><option value="">全部</option><option value="true" {% if active.has_figure=='true' %}selected{% endif %}>含必要图片</option><option value="false" {% if active.has_figure=='false' %}selected{% endif %}>无必要图片</option></select></label>
+  <button type="submit">筛选</button>
+</form>
+<section class="question-list">{% for q in questions %}
+  <div class="question-list-item">
+    <article>
+      <div class="question-card-tags">
+        <span class="tag tag-number">原题号 {{ q.source_question_no }}</span><span class="tag">{{ q.question_type_name }}</span><span class="tag">{{ '含图' if q.has_figure else '无图' }}</span><span class="tag {{ 'tag-warning' if q.answer_status == 'missing' else 'tag-ready' }}">{{ '答案缺失' if q.answer_status == 'missing' else '已有答案' }}</span>
+      </div>
+      <div class="question-stem">{{ q.stem_markdown }}</div>
+      {% if q.options %}<div class="question-list-options">{% for option in q.options %}
+        <div class="question-list-option"><span class="option-label">{{ option.option_code }}</span><span class="option-content">{{ option.content_markdown }}</span></div>
+      {% endfor %}</div>{% endif %}
+      {% if q.subquestion_display.flat_items %}{% set subquestion_display = q.subquestion_display %}{% include "_subquestions.html" %}{% endif %}
+      {% if q.display_assets %}<div class="question-required-images">{% for asset in q.display_assets %}<figure><a href="{{ asset.url }}" target="_blank" rel="noopener"><img class="question-required-image" src="{{ asset.url }}" alt="{{ asset.alt }}" loading="lazy"></a></figure>{% endfor %}</div>
+      {% elif q.required_image_unavailable %}<p class="question-image-unavailable" role="status">题目配图暂不可用，请进入详情核对</p>{% endif %}
+      <div class="question-secondary"><span>{{ q.paper_name }}</span><span>{{ q.exam_year or '年份未知' }}</span><span>知识点：{{ q.primary_knowledge_name }}</span><a href="/questions/{{ q.question_code }}">查看详情 →</a></div>
+      <div class="question-card-actions">
+        <form class="basket-inline-form" method="post" action="/basket/{{ 'remove' if q.in_basket else 'add' }}/{{ q.question_code }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}"><button type="submit" class="{{ 'joined' if q.in_basket else '' }}">{{ '已加入' if q.in_basket else '加入选题篮' }}</button><span class="basket-status" role="status" aria-live="polite"></span></form>
+        {% set delete_next = '/questions' %}{% set delete_panel_class = 'question-card-delete' %}{% include "_delete_question.html" %}
+      </div>
+    </article>
+  </div>
+{% else %}<p class="empty-state">没有符合条件的正式题目。</p>{% endfor %}</section>
+{% endblock %}

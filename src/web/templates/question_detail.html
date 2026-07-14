@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<article class="question-detail">
+  <p><a href="/questions">← 返回我的题库</a></p><p class="eyebrow">{{ question.question_code }}</p><h1>原题号 {{ question.source_question_no }}</h1>
+  <form class="basket-inline-form" method="post" action="/basket/{{ 'remove' if in_basket else 'add' }}/{{ question.question_code }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ request.url.path }}"><button type="submit" class="{{ 'joined' if in_basket else '' }}">{{ '移出选题篮' if in_basket else '加入选题篮' }}</button><span class="basket-status" role="status" aria-live="polite"></span></form>
+  {% set q = question %}{% set delete_next = '/questions' %}{% include "_delete_question.html" %}
+  <section><h2>题干</h2><p class="stem">{{ question.stem_markdown }}</p></section>
+  {% if options %}<ol class="options">{% for option in options %}<li><b>{{ option.option_code }}.</b> {{ option.content_markdown }}</li>{% endfor %}</ol>{% endif %}
+  {% if subquestions %}<section><h2>小问</h2>{% include "_subquestions.html" %}</section>{% endif %}
+  <section><h2>题目图片</h2>{% for asset in assets %}<figure><figcaption>{{ '完整题目原图' if asset.asset_kind == 'complete_question' else '独立配图' }}</figcaption><a href="/question-assets/{{ question.question_code }}/{{ asset.relative_path }}"><img src="/question-assets/{{ question.question_code }}/{{ asset.relative_path }}" alt="{{ '完整题目原图' if asset.asset_kind == 'complete_question' else '独立配图' }}"></a></figure>{% endfor %}</section>
+  <section><h2>来源</h2><p>{{ question.source_paper_name }} · {{ question.exam_year or '年份未知' }} · 原题号 {{ question.source_question_no }} · 页码 {{ question.source_pages_json }}</p></section>
+  <section><h2>知识点</h2><p>主知识点：{{ question.primary_knowledge_name }}（{{ question.primary_knowledge_code }}）</p>{% if related %}<p>关联：{% for item in related %}{{ item.name }}{% if not loop.last %}、{% endif %}{% endfor %}</p>{% endif %}</section>
+  <section><h2>审核与答案</h2><p>{{ 'AI审核通过' if review else '审核记录缺失' }}</p><p class="answer-status">{{ '原卷未提供答案' if question.answer_status == 'missing' else question.answer_markdown }}</p></section>
+</article>
+{% endblock %}

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}AI 数学题库{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='questions.css') }}?v=20260714-actions">
+  <link rel="stylesheet" href="{{ url_for('static', path='subquestions.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='audit.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='workbench.css') }}?v=20260714-actions">
+  <script>
+    window.MathJax = {tex: {inlineMath: [['$', '$'], ['\\(', '\\)']]}, options: {skipHtmlTags: ['script','noscript','style','textarea','pre','code']}};
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script defer src="/static/basket.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/">AI 数学题库</a>
+    <nav><a href="/questions">我的题库</a><a href="/basket" data-basket-count>选题篮（{{ basket_count }}）</a><a href="/papers">试卷与审核</a></nav>
+  </header>
+  <main>{% block content %}{% endblock %}</main>
+  <footer>本地题库 · 数据不会上传</footer>
+</body>
+</html>

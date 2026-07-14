@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}试卷与审核 · AI 数学题库{% endblock %}
+{% block content %}
+<section class="page-heading"><p class="eyebrow">PAPERS</p><h1>试卷与审核</h1><p>这里展示数据库中的真实导入任务。</p></section>
+<section class="paper-list">
+{% for job in jobs %}
+  <article class="paper-card">
+    <div><span class="status {{ job.status }}">{{ job.status_name }}</span><small>任务 #{{ job.id }}</small></div>
+    <h2>{{ job.paper_name }}</h2>
+    <p class="source">来源文件：{{ job.original_filename }}</p>
+    <dl>
+      <div><dt>地区</dt><dd>{{ job.region_name }}</dd></div>
+      <div><dt>年份</dt><dd>{{ job.exam_year or '未注明' }}</dd></div>
+      <div><dt>考试类型</dt><dd>{{ job.exam_type_name }}</dd></div>
+      <div><dt>页码</dt><dd>{% if job.page_start %}{{ job.page_start }}–{{ job.page_end }}{% else %}全部{% endif %}</dd></div>
+      <div><dt>候选题</dt><dd>{% if job.candidate_count is number %}{{ job.candidate_count }} 道{% else %}{{ job.candidate_count or '尚未生成' }}{% endif %}</dd></div>
+      <div><dt>删除情况</dt><dd><span>已删除 {{ job.deleted_count }} 题</span>{% if job.deleted_count %} · <a href="/reviews/{{ job.id }}/deleted">查看已删除题目</a>{% endif %}</dd></div>
+    </dl>
+    {% if job.audit %}
+      <section class="paper-audit">
+        <b>AI已复核</b>
+        <span>自动通过 {{ job.audit.counts.auto_pass }}</span>
+        <span>AI有争议 {{ job.audit.counts.disputed }}</span>
+        <span>需人工确认 {{ job.audit.counts.human_required }}</span>
+      </section>
+      <a class="button urgent" href="/reviews/{{ job.id }}/questions/{{ job.first_question_no }}">进入审核工作台</a>
+      <a class="text-link" href="/review/{{ job.id }}?status=human_required">处理人工确认</a>
+      <a class="text-link" href="/review/{{ job.id }}?status=all">查看全部</a>
+    {% elif job.has_candidates %}
+      <p class="audit-waiting">{% if job.audit_error %}AI复核数据异常{% else %}等待AI复核{% endif %}</p>
+      <a class="button" href="/reviews/{{ job.id }}/questions/{{ job.first_question_no }}">进入审核工作台</a>
+      <a class="text-link" href="/review/{{ job.id }}">只读审核</a>
+    {% else %}<span class="disabled-button">暂无候选数据</span>{% endif %}
+  </article>
+{% else %}<p class="empty">尚无导入任务。</p>{% endfor %}
+</section>
+{% endblock %}

@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}已删除题目 · AI 数学题库{% endblock %}
+{% block content %}
+<section class="page-heading questions-heading"><p class="eyebrow">RECOVERY</p><h1>已删除题目</h1><p>这里的题目及原始证据仍被保留，可以安全恢复。</p></section>
+{% if already_active %}<p class="notice">题目已经处于正常状态。</p>{% endif %}
+<section class="question-list">{% for q in questions %}<article class="question-list-item deleted-item">
+  <div class="question-card-tags"><span class="tag tag-number">原题号 {{ q.source_question_no or '未知' }}</span><span class="tag">{{ q.paper_name or '来源未知' }}</span></div>
+  <p>删除时间：{{ q.deleted_at }}</p><p>原因：{{ reason_names.get(q.deletion_reason, q.deletion_reason or '未记录') }}</p>{% if q.deletion_note %}<p>备注：{{ q.deletion_note }}</p>{% endif %}
+  <form method="post" action="/questions/{{ q.question_code }}/restore"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">恢复题目</button></form>
+</article>{% else %}<p class="empty-state">目前没有已删除的正式题目。</p>{% endfor %}</section>
+{% endblock %}

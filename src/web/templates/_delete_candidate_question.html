@@ -1,0 +1,12 @@
+<details class="delete-panel candidate-delete-panel">
+  <summary>删除本题</summary>
+  <form method="post" action="/reviews/{{ job.id }}/questions/{{ candidate_number }}/delete">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="version" value="{{ candidate_version }}">
+    <label>删除原因<select name="reason" required><option value="">请选择</option><option value="unreadable">看不清</option><option value="incomplete">题目不完整</option><option value="duplicate">重复题</option><option value="unneeded">不需要</option><option value="other">其他</option></select></label>
+    <label>备注（可选）<textarea name="note" maxlength="500" rows="2"></textarea></label>
+    <label class="delete-confirm"><input type="checkbox" name="confirmed" value="yes" required> 我确认将这道题移出当前审核流程</label>
+    <p>原始试卷、候选数据和图片不会销毁，可在已删除题目中恢复。</p>
+    <button class="confirm-delete" type="submit">确认删除</button>
+  </form>
+</details>

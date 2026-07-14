@@ -1,0 +1,4770 @@
+[
+  {
+    "code": "01",
+    "name": "基础工具",
+    "level": 1,
+    "parent_code": null,
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "01.01",
+    "name": "集合",
+    "level": 2,
+    "parent_code": "01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "01.01.01",
+    "name": "集合的含义与表示",
+    "level": 3,
+    "parent_code": "01.01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "01.01.02",
+    "name": "元素与集合的关系",
+    "level": 3,
+    "parent_code": "01.01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "01.01.03",
+    "name": "集合的确定性、互异性与无序性",
+    "level": 3,
+    "parent_code": "01.01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "01.01.04",
+    "name": "空集、子集与真子集",
+    "level": 3,
+    "parent_code": "01.01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "01.01.05",
+    "name": "集合相等",
+    "level": 3,
+    "parent_code": "01.01",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "01.01.06",
+    "name": "交集、并集与补集",
+    "level": 3,
+    "parent_code": "01.01",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "01.01.07",
+    "name": "区间与数轴表示",
+    "level": 3,
+    "parent_code": "01.01",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "01.01.08",
+    "name": "集合中元素个数",
+    "level": 3,
+    "parent_code": "01.01",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "01.01.09",
+    "name": "集合关系中的参数问题",
+    "level": 3,
+    "parent_code": "01.01",
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "01.01.10",
+    "name": "集合与不等式、方程的综合",
+    "level": 3,
+    "parent_code": "01.01",
+    "system_version": "v1",
+    "sort_order": 10
+  },
+  {
+    "code": "01.02",
+    "name": "常用逻辑用语",
+    "level": 2,
+    "parent_code": "01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "01.02.01",
+    "name": "命题及真假判断",
+    "level": 3,
+    "parent_code": "01.02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "01.02.02",
+    "name": "充分条件与必要条件",
+    "level": 3,
+    "parent_code": "01.02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "01.02.03",
+    "name": "充要条件",
+    "level": 3,
+    "parent_code": "01.02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "01.02.04",
+    "name": "条件关系的集合解释",
+    "level": 3,
+    "parent_code": "01.02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "01.02.05",
+    "name": "全称量词与存在量词",
+    "level": 3,
+    "parent_code": "01.02",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "01.02.06",
+    "name": "含量词命题的否定",
+    "level": 3,
+    "parent_code": "01.02",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "01.02.07",
+    "name": "命题真假与反例",
+    "level": 3,
+    "parent_code": "01.02",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "01.02.08",
+    "name": "含参数命题",
+    "level": 3,
+    "parent_code": "01.02",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "01.03",
+    "name": "不等式基础",
+    "level": 2,
+    "parent_code": "01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "01.03.01",
+    "name": "不等式的性质",
+    "level": 3,
+    "parent_code": "01.03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "01.03.02",
+    "name": "比较大小",
+    "level": 3,
+    "parent_code": "01.03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "01.03.03",
+    "name": "一元一次不等式与不等式组",
+    "level": 3,
+    "parent_code": "01.03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "01.03.04",
+    "name": "一元二次不等式",
+    "level": 3,
+    "parent_code": "01.03",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "01.03.05",
+    "name": "分式不等式",
+    "level": 3,
+    "parent_code": "01.03",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "01.03.06",
+    "name": "绝对值不等式",
+    "level": 3,
+    "parent_code": "01.03",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "01.03.07",
+    "name": "含参数不等式",
+    "level": 3,
+    "parent_code": "01.03",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "01.03.08",
+    "name": "不等式恒成立与能成立",
+    "level": 3,
+    "parent_code": "01.03",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "01.03.09",
+    "name": "不等式整数解",
+    "level": 3,
+    "parent_code": "01.03",
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "01.04",
+    "name": "基本不等式",
+    "level": 2,
+    "parent_code": "01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "01.04.01",
+    "name": "基本不等式及等号条件",
+    "level": 3,
+    "parent_code": "01.04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "01.04.02",
+    "name": "配凑法",
+    "level": 3,
+    "parent_code": "01.04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "01.04.03",
+    "name": "常数代换",
+    "level": 3,
+    "parent_code": "01.04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "01.04.04",
+    "name": "和定积最大",
+    "level": 3,
+    "parent_code": "01.04",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "01.04.05",
+    "name": "积定和最小",
+    "level": 3,
+    "parent_code": "01.04",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "01.04.06",
+    "name": "基本不等式求最值",
+    "level": 3,
+    "parent_code": "01.04",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "01.04.07",
+    "name": "基本不等式的实际应用",
+    "level": 3,
+    "parent_code": "01.04",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "01.04.08",
+    "name": "基本不等式与函数、导数综合",
+    "level": 3,
+    "parent_code": "01.04",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "01.05",
+    "name": "一元二次模型",
+    "level": 2,
+    "parent_code": "01",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "01.05.01",
+    "name": "一元二次方程及判别式",
+    "level": 3,
+    "parent_code": "01.05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "01.05.02",
+    "name": "根与系数的关系",
+    "level": 3,
+    "parent_code": "01.05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "01.05.03",
+    "name": "二次函数图像与性质",
+    "level": 3,
+    "parent_code": "01.05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "01.05.04",
+    "name": "二次方程根的分布",
+    "level": 3,
+    "parent_code": "01.05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "01.05.05",
+    "name": "二次函数、方程和不等式的联系",
+    "level": 3,
+    "parent_code": "01.05",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "01.05.06",
+    "name": "二次模型中的参数范围",
+    "level": 3,
+    "parent_code": "01.05",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "01.05.07",
+    "name": "二次模型的恒成立问题",
+    "level": 3,
+    "parent_code": "01.05",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "01.06",
+    "name": "复数",
+    "level": 2,
+    "parent_code": "01",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "01.06.01",
+    "name": "复数的概念与分类",
+    "level": 3,
+    "parent_code": "01.06",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "01.06.02",
+    "name": "实部、虚部与复数相等",
+    "level": 3,
+    "parent_code": "01.06",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "01.06.03",
+    "name": "共轭复数",
+    "level": 3,
+    "parent_code": "01.06",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "01.06.04",
+    "name": "复数的模",
+    "level": 3,
+    "parent_code": "01.06",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "01.06.05",
+    "name": "复数四则运算",
+    "level": 3,
+    "parent_code": "01.06",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "01.06.06",
+    "name": "复数中虚数单位的周期性",
+    "level": 3,
+    "parent_code": "01.06",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "01.06.07",
+    "name": "复平面与复数的几何意义",
+    "level": 3,
+    "parent_code": "01.06",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "01.06.08",
+    "name": "复数与向量、距离、轨迹",
+    "level": 3,
+    "parent_code": "01.06",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "02",
+    "name": "函数",
+    "level": 1,
+    "parent_code": null,
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.01",
+    "name": "函数概念与表示",
+    "level": 2,
+    "parent_code": "02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "02.01.01",
+    "name": "函数的概念",
+    "level": 3,
+    "parent_code": "02.01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "02.01.02",
+    "name": "函数三要素",
+    "level": 3,
+    "parent_code": "02.01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.01.03",
+    "name": "相同函数的判断",
+    "level": 3,
+    "parent_code": "02.01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "02.01.04",
+    "name": "函数的表示方法",
+    "level": 3,
+    "parent_code": "02.01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "02.01.05",
+    "name": "分段函数",
+    "level": 3,
+    "parent_code": "02.01",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "02.01.06",
+    "name": "抽象函数",
+    "level": 3,
+    "parent_code": "02.01",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "02.01.07",
+    "name": "复合函数",
+    "level": 3,
+    "parent_code": "02.01",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "02.02",
+    "name": "定义域",
+    "level": 2,
+    "parent_code": "02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.02.01",
+    "name": "具体函数定义域",
+    "level": 3,
+    "parent_code": "02.02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "02.02.02",
+    "name": "复合函数定义域",
+    "level": 3,
+    "parent_code": "02.02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.02.03",
+    "name": "抽象函数定义域",
+    "level": 3,
+    "parent_code": "02.02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "02.02.04",
+    "name": "含参数函数定义域",
+    "level": 3,
+    "parent_code": "02.02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "02.02.05",
+    "name": "实际问题中的定义域",
+    "level": 3,
+    "parent_code": "02.02",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "02.03",
+    "name": "值域与最值",
+    "level": 2,
+    "parent_code": "02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "02.03.01",
+    "name": "直接观察法",
+    "level": 3,
+    "parent_code": "02.03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "02.03.02",
+    "name": "配方法",
+    "level": 3,
+    "parent_code": "02.03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.03.03",
+    "name": "换元法",
+    "level": 3,
+    "parent_code": "02.03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "02.03.04",
+    "name": "分离常数法",
+    "level": 3,
+    "parent_code": "02.03",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "02.03.05",
+    "name": "判别式法",
+    "level": 3,
+    "parent_code": "02.03",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "02.03.06",
+    "name": "单调性法",
+    "level": 3,
+    "parent_code": "02.03",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "02.03.07",
+    "name": "图像法",
+    "level": 3,
+    "parent_code": "02.03",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "02.03.08",
+    "name": "基本不等式法",
+    "level": 3,
+    "parent_code": "02.03",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "02.03.09",
+    "name": "含参数值域",
+    "level": 3,
+    "parent_code": "02.03",
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "02.04",
+    "name": "函数单调性",
+    "level": 2,
+    "parent_code": "02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "02.04.01",
+    "name": "单调性的定义",
+    "level": 3,
+    "parent_code": "02.04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "02.04.02",
+    "name": "单调区间",
+    "level": 3,
+    "parent_code": "02.04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.04.03",
+    "name": "定义法判断单调性",
+    "level": 3,
+    "parent_code": "02.04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "02.04.04",
+    "name": "图像法判断单调性",
+    "level": 3,
+    "parent_code": "02.04",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "02.04.05",
+    "name": "复合函数单调性",
+    "level": 3,
+    "parent_code": "02.04",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "02.04.06",
+    "name": "抽象函数单调性",
+    "level": 3,
+    "parent_code": "02.04",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "02.04.07",
+    "name": "含参数单调性",
+    "level": 3,
+    "parent_code": "02.04",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "02.04.08",
+    "name": "单调性比较大小",
+    "level": 3,
+    "parent_code": "02.04",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "02.04.09",
+    "name": "单调性解不等式",
+    "level": 3,
+    "parent_code": "02.04",
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "02.05",
+    "name": "奇偶性、对称性与周期性",
+    "level": 2,
+    "parent_code": "02",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "02.05.01",
+    "name": "奇函数与偶函数",
+    "level": 3,
+    "parent_code": "02.05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "02.05.02",
+    "name": "奇偶性的判断",
+    "level": 3,
+    "parent_code": "02.05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.05.03",
+    "name": "奇偶函数的图像性质",
+    "level": 3,
+    "parent_code": "02.05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "02.05.04",
+    "name": "奇偶性与定义域",
+    "level": 3,
+    "parent_code": "02.05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "02.05.05",
+    "name": "函数图像对称性",
+    "level": 3,
+    "parent_code": "02.05",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "02.05.06",
+    "name": "函数周期性",
+    "level": 3,
+    "parent_code": "02.05",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "02.05.07",
+    "name": "最小正周期",
+    "level": 3,
+    "parent_code": "02.05",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "02.05.08",
+    "name": "对称性与周期性的综合",
+    "level": 3,
+    "parent_code": "02.05",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "02.05.09",
+    "name": "抽象函数性质",
+    "level": 3,
+    "parent_code": "02.05",
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "02.06",
+    "name": "基本初等函数",
+    "level": 2,
+    "parent_code": "02",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "02.06.01",
+    "name": "一次函数",
+    "level": 3,
+    "parent_code": "02.06",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "02.06.02",
+    "name": "二次函数",
+    "level": 3,
+    "parent_code": "02.06",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.06.03",
+    "name": "反比例函数",
+    "level": 3,
+    "parent_code": "02.06",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "02.06.04",
+    "name": "幂函数",
+    "level": 3,
+    "parent_code": "02.06",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "02.06.05",
+    "name": "指数运算与指数函数",
+    "level": 3,
+    "parent_code": "02.06",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "02.06.06",
+    "name": "对数运算与对数函数",
+    "level": 3,
+    "parent_code": "02.06",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "02.06.07",
+    "name": "指数函数和对数函数的图像与性质",
+    "level": 3,
+    "parent_code": "02.06",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "02.06.08",
+    "name": "指数方程与指数不等式",
+    "level": 3,
+    "parent_code": "02.06",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "02.06.09",
+    "name": "对数方程与对数不等式",
+    "level": 3,
+    "parent_code": "02.06",
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "02.06.10",
+    "name": "指数、对数大小比较",
+    "level": 3,
+    "parent_code": "02.06",
+    "system_version": "v1",
+    "sort_order": 10
+  },
+  {
+    "code": "02.07",
+    "name": "函数图像",
+    "level": 2,
+    "parent_code": "02",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "02.07.01",
+    "name": "函数图像识别",
+    "level": 3,
+    "parent_code": "02.07",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "02.07.02",
+    "name": "平移变换",
+    "level": 3,
+    "parent_code": "02.07",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.07.03",
+    "name": "伸缩变换",
+    "level": 3,
+    "parent_code": "02.07",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "02.07.04",
+    "name": "翻折与对称变换",
+    "level": 3,
+    "parent_code": "02.07",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "02.07.05",
+    "name": "绝对值函数图像",
+    "level": 3,
+    "parent_code": "02.07",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "02.07.06",
+    "name": "分段函数图像",
+    "level": 3,
+    "parent_code": "02.07",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "02.07.07",
+    "name": "图像交点",
+    "level": 3,
+    "parent_code": "02.07",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "02.07.08",
+    "name": "数形结合",
+    "level": 3,
+    "parent_code": "02.07",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "02.08",
+    "name": "函数零点与方程",
+    "level": 2,
+    "parent_code": "02",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "02.08.01",
+    "name": "函数零点的概念",
+    "level": 3,
+    "parent_code": "02.08",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "02.08.02",
+    "name": "零点存在性",
+    "level": 3,
+    "parent_code": "02.08",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.08.03",
+    "name": "零点个数",
+    "level": 3,
+    "parent_code": "02.08",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "02.08.04",
+    "name": "二分法思想",
+    "level": 3,
+    "parent_code": "02.08",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "02.08.05",
+    "name": "函数图像交点与方程根",
+    "level": 3,
+    "parent_code": "02.08",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "02.08.06",
+    "name": "含参数零点问题",
+    "level": 3,
+    "parent_code": "02.08",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "02.08.07",
+    "name": "零点分布",
+    "level": 3,
+    "parent_code": "02.08",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "02.08.08",
+    "name": "零点与不等式",
+    "level": 3,
+    "parent_code": "02.08",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "02.09",
+    "name": "函数模型与应用",
+    "level": 2,
+    "parent_code": "02",
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "02.09.01",
+    "name": "一次函数模型",
+    "level": 3,
+    "parent_code": "02.09",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "02.09.02",
+    "name": "二次函数模型",
+    "level": 3,
+    "parent_code": "02.09",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.09.03",
+    "name": "指数增长与衰减模型",
+    "level": 3,
+    "parent_code": "02.09",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "02.09.04",
+    "name": "对数模型",
+    "level": 3,
+    "parent_code": "02.09",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "02.09.05",
+    "name": "分段函数模型",
+    "level": 3,
+    "parent_code": "02.09",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "02.09.06",
+    "name": "实际问题建模",
+    "level": 3,
+    "parent_code": "02.09",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "02.09.07",
+    "name": "函数模型比较与选择",
+    "level": 3,
+    "parent_code": "02.09",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "02.10",
+    "name": "函数综合",
+    "level": 2,
+    "parent_code": "02",
+    "system_version": "v1",
+    "sort_order": 10
+  },
+  {
+    "code": "02.10.01",
+    "name": "函数性质综合",
+    "level": 3,
+    "parent_code": "02.10",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "02.10.02",
+    "name": "函数与方程综合",
+    "level": 3,
+    "parent_code": "02.10",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "02.10.03",
+    "name": "函数与不等式综合",
+    "level": 3,
+    "parent_code": "02.10",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "02.10.04",
+    "name": "函数与数列综合",
+    "level": 3,
+    "parent_code": "02.10",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "02.10.05",
+    "name": "函数与导数综合",
+    "level": 3,
+    "parent_code": "02.10",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "02.10.06",
+    "name": "含参数函数问题",
+    "level": 3,
+    "parent_code": "02.10",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "03",
+    "name": "三角函数与解三角形",
+    "level": 1,
+    "parent_code": null,
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "03.01",
+    "name": "任意角与弧度制",
+    "level": 2,
+    "parent_code": "03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "03.01.01",
+    "name": "任意角",
+    "level": 3,
+    "parent_code": "03.01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "03.01.02",
+    "name": "象限角",
+    "level": 3,
+    "parent_code": "03.01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "03.01.03",
+    "name": "终边相同的角",
+    "level": 3,
+    "parent_code": "03.01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "03.01.04",
+    "name": "弧度制",
+    "level": 3,
+    "parent_code": "03.01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "03.01.05",
+    "name": "角度与弧度互化",
+    "level": 3,
+    "parent_code": "03.01",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "03.01.06",
+    "name": "弧长与扇形面积",
+    "level": 3,
+    "parent_code": "03.01",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "03.02",
+    "name": "三角函数概念",
+    "level": 2,
+    "parent_code": "03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "03.02.01",
+    "name": "任意角三角函数定义",
+    "level": 3,
+    "parent_code": "03.02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "03.02.02",
+    "name": "三角函数值的符号",
+    "level": 3,
+    "parent_code": "03.02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "03.02.03",
+    "name": "特殊角三角函数值",
+    "level": 3,
+    "parent_code": "03.02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "03.02.04",
+    "name": "单位圆",
+    "level": 3,
+    "parent_code": "03.02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "03.02.05",
+    "name": "三角函数线",
+    "level": 3,
+    "parent_code": "03.02",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "03.03",
+    "name": "三角函数关系与诱导公式",
+    "level": 2,
+    "parent_code": "03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "03.03.01",
+    "name": "同角三角函数基本关系",
+    "level": 3,
+    "parent_code": "03.03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "03.03.02",
+    "name": "诱导公式",
+    "level": 3,
+    "parent_code": "03.03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "03.03.03",
+    "name": "齐次式与弦切互化",
+    "level": 3,
+    "parent_code": "03.03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "03.03.04",
+    "name": "三角函数求值",
+    "level": 3,
+    "parent_code": "03.03",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "03.03.05",
+    "name": "已知三角函数值求其他值",
+    "level": 3,
+    "parent_code": "03.03",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "03.04",
+    "name": "三角恒等变换",
+    "level": 2,
+    "parent_code": "03",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "03.04.01",
+    "name": "两角和与差公式",
+    "level": 3,
+    "parent_code": "03.04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "03.04.02",
+    "name": "二倍角公式",
+    "level": 3,
+    "parent_code": "03.04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "03.04.03",
+    "name": "降幂与升幂",
+    "level": 3,
+    "parent_code": "03.04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "03.04.04",
+    "name": "辅助角公式",
+    "level": 3,
+    "parent_code": "03.04",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "03.04.05",
+    "name": "三角式化简",
+    "level": 3,
+    "parent_code": "03.04",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "03.04.06",
+    "name": "三角式求值",
+    "level": 3,
+    "parent_code": "03.04",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "03.04.07",
+    "name": "三角恒等式证明",
+    "level": 3,
+    "parent_code": "03.04",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "03.05",
+    "name": "三角函数图像与性质",
+    "level": 2,
+    "parent_code": "03",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "03.05.01",
+    "name": "正弦、余弦、正切函数图像",
+    "level": 3,
+    "parent_code": "03.05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "03.05.02",
+    "name": "定义域和值域",
+    "level": 3,
+    "parent_code": "03.05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "03.05.03",
+    "name": "单调性",
+    "level": 3,
+    "parent_code": "03.05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "03.05.04",
+    "name": "奇偶性",
+    "level": 3,
+    "parent_code": "03.05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "03.05.05",
+    "name": "周期性",
+    "level": 3,
+    "parent_code": "03.05",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "03.05.06",
+    "name": "对称性",
+    "level": 3,
+    "parent_code": "03.05",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "03.05.07",
+    "name": "三角函数最值",
+    "level": 3,
+    "parent_code": "03.05",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "03.06",
+    "name": "正弦型函数",
+    "level": 2,
+    "parent_code": "03",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "03.06.01",
+    "name": "$y=A\\sin(\\omega x+\\varphi)$ 的参数意义",
+    "level": 3,
+    "parent_code": "03.06",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "03.06.02",
+    "name": "周期、振幅和初相",
+    "level": 3,
+    "parent_code": "03.06",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "03.06.03",
+    "name": "图像变换",
+    "level": 3,
+    "parent_code": "03.06",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "03.06.04",
+    "name": "解析式确定",
+    "level": 3,
+    "parent_code": "03.06",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "03.06.05",
+    "name": "单调区间",
+    "level": 3,
+    "parent_code": "03.06",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "03.06.06",
+    "name": "对称轴与对称中心",
+    "level": 3,
+    "parent_code": "03.06",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "03.06.07",
+    "name": "最值与取值范围",
+    "level": 3,
+    "parent_code": "03.06",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "03.06.08",
+    "name": "实际周期模型",
+    "level": 3,
+    "parent_code": "03.06",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "03.07",
+    "name": "解三角形",
+    "level": 2,
+    "parent_code": "03",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "03.07.01",
+    "name": "正弦定理",
+    "level": 3,
+    "parent_code": "03.07",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "03.07.02",
+    "name": "余弦定理",
+    "level": 3,
+    "parent_code": "03.07",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "03.07.03",
+    "name": "三角形面积公式",
+    "level": 3,
+    "parent_code": "03.07",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "03.07.04",
+    "name": "边角互化",
+    "level": 3,
+    "parent_code": "03.07",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "03.07.05",
+    "name": "三角形形状判断",
+    "level": 3,
+    "parent_code": "03.07",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "03.07.06",
+    "name": "解三角形多解问题",
+    "level": 3,
+    "parent_code": "03.07",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "03.07.07",
+    "name": "三角形中的范围与最值",
+    "level": 3,
+    "parent_code": "03.07",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "03.07.08",
+    "name": "解三角形实际应用",
+    "level": 3,
+    "parent_code": "03.07",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "03.08",
+    "name": "三角综合",
+    "level": 2,
+    "parent_code": "03",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "03.08.01",
+    "name": "三角恒等变换与图像性质",
+    "level": 3,
+    "parent_code": "03.08",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "03.08.02",
+    "name": "三角函数与平面向量",
+    "level": 3,
+    "parent_code": "03.08",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "03.08.03",
+    "name": "三角函数与函数零点",
+    "level": 3,
+    "parent_code": "03.08",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "03.08.04",
+    "name": "三角函数与不等式",
+    "level": 3,
+    "parent_code": "03.08",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "03.08.05",
+    "name": "解三角形与几何",
+    "level": 3,
+    "parent_code": "03.08",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "04",
+    "name": "平面向量",
+    "level": 1,
+    "parent_code": null,
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "04.01",
+    "name": "向量概念与线性运算",
+    "level": 2,
+    "parent_code": "04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "04.01.01",
+    "name": "向量、零向量与单位向量",
+    "level": 3,
+    "parent_code": "04.01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "04.01.02",
+    "name": "相等向量与相反向量",
+    "level": 3,
+    "parent_code": "04.01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "04.01.03",
+    "name": "向量加法与减法",
+    "level": 3,
+    "parent_code": "04.01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "04.01.04",
+    "name": "向量数乘",
+    "level": 3,
+    "parent_code": "04.01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "04.01.05",
+    "name": "向量共线",
+    "level": 3,
+    "parent_code": "04.01",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "04.01.06",
+    "name": "向量线性表示",
+    "level": 3,
+    "parent_code": "04.01",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "04.02",
+    "name": "平面向量基本定理",
+    "level": 2,
+    "parent_code": "04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "04.02.01",
+    "name": "基底",
+    "level": 3,
+    "parent_code": "04.02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "04.02.02",
+    "name": "平面向量基本定理",
+    "level": 3,
+    "parent_code": "04.02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "04.02.03",
+    "name": "向量分解",
+    "level": 3,
+    "parent_code": "04.02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "04.02.04",
+    "name": "三点共线",
+    "level": 3,
+    "parent_code": "04.02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "04.02.05",
+    "name": "基底法解决几何问题",
+    "level": 3,
+    "parent_code": "04.02",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "04.02.06",
+    "name": "含参数向量关系",
+    "level": 3,
+    "parent_code": "04.02",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "04.03",
+    "name": "向量坐标运算",
+    "level": 2,
+    "parent_code": "04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "04.03.01",
+    "name": "向量坐标表示",
+    "level": 3,
+    "parent_code": "04.03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "04.03.02",
+    "name": "向量加减与数乘坐标",
+    "level": 3,
+    "parent_code": "04.03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "04.03.03",
+    "name": "共线条件",
+    "level": 3,
+    "parent_code": "04.03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "04.03.04",
+    "name": "中点与定比分点",
+    "level": 3,
+    "parent_code": "04.03",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "04.03.05",
+    "name": "坐标法解决平面几何问题",
+    "level": 3,
+    "parent_code": "04.03",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "04.04",
+    "name": "平面向量数量积",
+    "level": 2,
+    "parent_code": "04",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "04.04.01",
+    "name": "数量积的定义",
+    "level": 3,
+    "parent_code": "04.04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "04.04.02",
+    "name": "数量积运算律",
+    "level": 3,
+    "parent_code": "04.04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "04.04.03",
+    "name": "向量夹角",
+    "level": 3,
+    "parent_code": "04.04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "04.04.04",
+    "name": "向量垂直",
+    "level": 3,
+    "parent_code": "04.04",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "04.04.05",
+    "name": "向量长度与距离",
+    "level": 3,
+    "parent_code": "04.04",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "04.04.06",
+    "name": "投影与投影向量",
+    "level": 3,
+    "parent_code": "04.04",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "04.04.07",
+    "name": "数量积的坐标表示",
+    "level": 3,
+    "parent_code": "04.04",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "04.05",
+    "name": "向量综合应用",
+    "level": 2,
+    "parent_code": "04",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "04.05.01",
+    "name": "向量与三角形",
+    "level": 3,
+    "parent_code": "04.05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "04.05.02",
+    "name": "向量与三角函数",
+    "level": 3,
+    "parent_code": "04.05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "04.05.03",
+    "name": "向量与解三角形",
+    "level": 3,
+    "parent_code": "04.05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "04.05.04",
+    "name": "向量与解析几何",
+    "level": 3,
+    "parent_code": "04.05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "04.05.05",
+    "name": "向量最值与范围",
+    "level": 3,
+    "parent_code": "04.05",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "05",
+    "name": "立体几何与空间向量",
+    "level": 1,
+    "parent_code": null,
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "05.01",
+    "name": "空间几何体",
+    "level": 2,
+    "parent_code": "05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "05.01.01",
+    "name": "柱、锥、台、球",
+    "level": 3,
+    "parent_code": "05.01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "05.01.02",
+    "name": "三视图与直观图",
+    "level": 3,
+    "parent_code": "05.01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "05.01.03",
+    "name": "表面积",
+    "level": 3,
+    "parent_code": "05.01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "05.01.04",
+    "name": "体积",
+    "level": 3,
+    "parent_code": "05.01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "05.01.05",
+    "name": "外接球与内切球",
+    "level": 3,
+    "parent_code": "05.01",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "05.01.06",
+    "name": "截面问题",
+    "level": 3,
+    "parent_code": "05.01",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "05.02",
+    "name": "空间点线面位置关系",
+    "level": 2,
+    "parent_code": "05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "05.02.01",
+    "name": "平面的基本性质",
+    "level": 3,
+    "parent_code": "05.02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "05.02.02",
+    "name": "异面直线",
+    "level": 3,
+    "parent_code": "05.02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "05.02.03",
+    "name": "直线与平面的位置关系",
+    "level": 3,
+    "parent_code": "05.02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "05.02.04",
+    "name": "平面与平面的位置关系",
+    "level": 3,
+    "parent_code": "05.02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "05.02.05",
+    "name": "空间中的距离",
+    "level": 3,
+    "parent_code": "05.02",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "05.03",
+    "name": "平行关系",
+    "level": 2,
+    "parent_code": "05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "05.03.01",
+    "name": "线线平行",
+    "level": 3,
+    "parent_code": "05.03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "05.03.02",
+    "name": "线面平行的判定与性质",
+    "level": 3,
+    "parent_code": "05.03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "05.03.03",
+    "name": "面面平行的判定与性质",
+    "level": 3,
+    "parent_code": "05.03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "05.03.04",
+    "name": "平行关系的相互转化",
+    "level": 3,
+    "parent_code": "05.03",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "05.03.05",
+    "name": "平行关系证明",
+    "level": 3,
+    "parent_code": "05.03",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "05.04",
+    "name": "垂直关系",
+    "level": 2,
+    "parent_code": "05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "05.04.01",
+    "name": "线线垂直",
+    "level": 3,
+    "parent_code": "05.04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "05.04.02",
+    "name": "线面垂直的判定与性质",
+    "level": 3,
+    "parent_code": "05.04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "05.04.03",
+    "name": "面面垂直的判定与性质",
+    "level": 3,
+    "parent_code": "05.04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "05.04.04",
+    "name": "垂直关系的相互转化",
+    "level": 3,
+    "parent_code": "05.04",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "05.04.05",
+    "name": "垂直关系证明",
+    "level": 3,
+    "parent_code": "05.04",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "05.05",
+    "name": "空间向量",
+    "level": 2,
+    "parent_code": "05",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "05.05.01",
+    "name": "空间向量及运算",
+    "level": 3,
+    "parent_code": "05.05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "05.05.02",
+    "name": "空间向量基本定理",
+    "level": 3,
+    "parent_code": "05.05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "05.05.03",
+    "name": "空间向量坐标表示",
+    "level": 3,
+    "parent_code": "05.05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "05.05.04",
+    "name": "空间直角坐标系",
+    "level": 3,
+    "parent_code": "05.05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "05.05.05",
+    "name": "方向向量与法向量",
+    "level": 3,
+    "parent_code": "05.05",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "05.05.06",
+    "name": "空间向量数量积",
+    "level": 3,
+    "parent_code": "05.05",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "05.06",
+    "name": "空间角",
+    "level": 2,
+    "parent_code": "05",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "05.06.01",
+    "name": "异面直线所成角",
+    "level": 3,
+    "parent_code": "05.06",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "05.06.02",
+    "name": "直线与平面所成角",
+    "level": 3,
+    "parent_code": "05.06",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "05.06.03",
+    "name": "二面角",
+    "level": 3,
+    "parent_code": "05.06",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "05.06.04",
+    "name": "几何法求角",
+    "level": 3,
+    "parent_code": "05.06",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "05.06.05",
+    "name": "空间向量法求角",
+    "level": 3,
+    "parent_code": "05.06",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "05.07",
+    "name": "空间距离",
+    "level": 2,
+    "parent_code": "05",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "05.07.01",
+    "name": "点到点距离",
+    "level": 3,
+    "parent_code": "05.07",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "05.07.02",
+    "name": "点到直线距离",
+    "level": 3,
+    "parent_code": "05.07",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "05.07.03",
+    "name": "点到平面距离",
+    "level": 3,
+    "parent_code": "05.07",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "05.07.04",
+    "name": "线面距离",
+    "level": 3,
+    "parent_code": "05.07",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "05.07.05",
+    "name": "面面距离",
+    "level": 3,
+    "parent_code": "05.07",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "05.07.06",
+    "name": "空间向量法求距离",
+    "level": 3,
+    "parent_code": "05.07",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "05.08",
+    "name": "立体几何综合",
+    "level": 2,
+    "parent_code": "05",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "05.08.01",
+    "name": "几何证明与向量计算",
+    "level": 3,
+    "parent_code": "05.08",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "05.08.02",
+    "name": "动点问题",
+    "level": 3,
+    "parent_code": "05.08",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "05.08.03",
+    "name": "存在性问题",
+    "level": 3,
+    "parent_code": "05.08",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "05.08.04",
+    "name": "空间角与距离综合",
+    "level": 3,
+    "parent_code": "05.08",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "05.08.05",
+    "name": "体积与位置关系综合",
+    "level": 3,
+    "parent_code": "05.08",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "06",
+    "name": "解析几何",
+    "level": 1,
+    "parent_code": null,
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "06.01",
+    "name": "直线",
+    "level": 2,
+    "parent_code": "06",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "06.01.01",
+    "name": "倾斜角与斜率",
+    "level": 3,
+    "parent_code": "06.01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "06.01.02",
+    "name": "直线方程",
+    "level": 3,
+    "parent_code": "06.01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "06.01.03",
+    "name": "两直线平行与垂直",
+    "level": 3,
+    "parent_code": "06.01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "06.01.04",
+    "name": "两直线交点",
+    "level": 3,
+    "parent_code": "06.01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "06.01.05",
+    "name": "点到直线距离",
+    "level": 3,
+    "parent_code": "06.01",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "06.01.06",
+    "name": "两平行线距离",
+    "level": 3,
+    "parent_code": "06.01",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "06.01.07",
+    "name": "对称问题",
+    "level": 3,
+    "parent_code": "06.01",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "06.01.08",
+    "name": "直线系与含参数直线",
+    "level": 3,
+    "parent_code": "06.01",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "06.02",
+    "name": "圆",
+    "level": 2,
+    "parent_code": "06",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "06.02.01",
+    "name": "圆的标准方程与一般方程",
+    "level": 3,
+    "parent_code": "06.02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "06.02.02",
+    "name": "圆心与半径",
+    "level": 3,
+    "parent_code": "06.02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "06.02.03",
+    "name": "点与圆的位置关系",
+    "level": 3,
+    "parent_code": "06.02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "06.02.04",
+    "name": "直线与圆的位置关系",
+    "level": 3,
+    "parent_code": "06.02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "06.02.05",
+    "name": "圆的切线",
+    "level": 3,
+    "parent_code": "06.02",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "06.02.06",
+    "name": "弦长问题",
+    "level": 3,
+    "parent_code": "06.02",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "06.02.07",
+    "name": "圆与圆的位置关系",
+    "level": 3,
+    "parent_code": "06.02",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "06.02.08",
+    "name": "圆系方程",
+    "level": 3,
+    "parent_code": "06.02",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "06.02.09",
+    "name": "轨迹与圆",
+    "level": 3,
+    "parent_code": "06.02",
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "06.03",
+    "name": "椭圆",
+    "level": 2,
+    "parent_code": "06",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "06.03.01",
+    "name": "椭圆的定义",
+    "level": 3,
+    "parent_code": "06.03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "06.03.02",
+    "name": "标准方程",
+    "level": 3,
+    "parent_code": "06.03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "06.03.03",
+    "name": "焦点、焦距与离心率",
+    "level": 3,
+    "parent_code": "06.03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "06.03.04",
+    "name": "椭圆的几何性质",
+    "level": 3,
+    "parent_code": "06.03",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "06.03.05",
+    "name": "椭圆中的距离与范围",
+    "level": 3,
+    "parent_code": "06.03",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "06.03.06",
+    "name": "直线与椭圆",
+    "level": 3,
+    "parent_code": "06.03",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "06.04",
+    "name": "双曲线",
+    "level": 2,
+    "parent_code": "06",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "06.04.01",
+    "name": "双曲线的定义",
+    "level": 3,
+    "parent_code": "06.04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "06.04.02",
+    "name": "标准方程",
+    "level": 3,
+    "parent_code": "06.04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "06.04.03",
+    "name": "焦点、焦距与离心率",
+    "level": 3,
+    "parent_code": "06.04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "06.04.04",
+    "name": "渐近线",
+    "level": 3,
+    "parent_code": "06.04",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "06.04.05",
+    "name": "双曲线的几何性质",
+    "level": 3,
+    "parent_code": "06.04",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "06.04.06",
+    "name": "直线与双曲线",
+    "level": 3,
+    "parent_code": "06.04",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "06.05",
+    "name": "抛物线",
+    "level": 2,
+    "parent_code": "06",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "06.05.01",
+    "name": "抛物线的定义",
+    "level": 3,
+    "parent_code": "06.05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "06.05.02",
+    "name": "标准方程",
+    "level": 3,
+    "parent_code": "06.05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "06.05.03",
+    "name": "焦点与准线",
+    "level": 3,
+    "parent_code": "06.05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "06.05.04",
+    "name": "抛物线的几何性质",
+    "level": 3,
+    "parent_code": "06.05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "06.05.05",
+    "name": "焦半径",
+    "level": 3,
+    "parent_code": "06.05",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "06.05.06",
+    "name": "直线与抛物线",
+    "level": 3,
+    "parent_code": "06.05",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "06.06",
+    "name": "直线与圆锥曲线",
+    "level": 2,
+    "parent_code": "06",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "06.06.01",
+    "name": "位置关系",
+    "level": 3,
+    "parent_code": "06.06",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "06.06.02",
+    "name": "方程联立",
+    "level": 3,
+    "parent_code": "06.06",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "06.06.03",
+    "name": "判别式",
+    "level": 3,
+    "parent_code": "06.06",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "06.06.04",
+    "name": "根与系数关系",
+    "level": 3,
+    "parent_code": "06.06",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "06.06.05",
+    "name": "设而不求",
+    "level": 3,
+    "parent_code": "06.06",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "06.06.06",
+    "name": "弦长",
+    "level": 3,
+    "parent_code": "06.06",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "06.06.07",
+    "name": "中点弦",
+    "level": 3,
+    "parent_code": "06.06",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "06.06.08",
+    "name": "焦点弦",
+    "level": 3,
+    "parent_code": "06.06",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "06.06.09",
+    "name": "切线问题",
+    "level": 3,
+    "parent_code": "06.06",
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "06.07",
+    "name": "圆锥曲线综合",
+    "level": 2,
+    "parent_code": "06",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "06.07.01",
+    "name": "定点问题",
+    "level": 3,
+    "parent_code": "06.07",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "06.07.02",
+    "name": "定值问题",
+    "level": 3,
+    "parent_code": "06.07",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "06.07.03",
+    "name": "定直线问题",
+    "level": 3,
+    "parent_code": "06.07",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "06.07.04",
+    "name": "范围与最值",
+    "level": 3,
+    "parent_code": "06.07",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "06.07.05",
+    "name": "轨迹问题",
+    "level": 3,
+    "parent_code": "06.07",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "06.07.06",
+    "name": "面积问题",
+    "level": 3,
+    "parent_code": "06.07",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "06.07.07",
+    "name": "斜率关系",
+    "level": 3,
+    "parent_code": "06.07",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "06.07.08",
+    "name": "共线与共点",
+    "level": 3,
+    "parent_code": "06.07",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "06.07.09",
+    "name": "对称问题",
+    "level": 3,
+    "parent_code": "06.07",
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "06.07.10",
+    "name": "存在性问题",
+    "level": 3,
+    "parent_code": "06.07",
+    "system_version": "v1",
+    "sort_order": 10
+  },
+  {
+    "code": "06.07.11",
+    "name": "参数问题",
+    "level": 3,
+    "parent_code": "06.07",
+    "system_version": "v1",
+    "sort_order": 11
+  },
+  {
+    "code": "07",
+    "name": "数列",
+    "level": 1,
+    "parent_code": null,
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "07.01",
+    "name": "数列基础",
+    "level": 2,
+    "parent_code": "07",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "07.01.01",
+    "name": "数列的概念与表示",
+    "level": 3,
+    "parent_code": "07.01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "07.01.02",
+    "name": "通项公式",
+    "level": 3,
+    "parent_code": "07.01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "07.01.03",
+    "name": "递推公式",
+    "level": 3,
+    "parent_code": "07.01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "07.01.04",
+    "name": "数列单调性",
+    "level": 3,
+    "parent_code": "07.01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "07.01.05",
+    "name": "数列周期性",
+    "level": 3,
+    "parent_code": "07.01",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "07.01.06",
+    "name": "数列与函数",
+    "level": 3,
+    "parent_code": "07.01",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "07.02",
+    "name": "等差数列",
+    "level": 2,
+    "parent_code": "07",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "07.02.01",
+    "name": "等差数列的定义",
+    "level": 3,
+    "parent_code": "07.02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "07.02.02",
+    "name": "通项公式",
+    "level": 3,
+    "parent_code": "07.02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "07.02.03",
+    "name": "前 $n$ 项和",
+    "level": 3,
+    "parent_code": "07.02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "07.02.04",
+    "name": "等差中项",
+    "level": 3,
+    "parent_code": "07.02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "07.02.05",
+    "name": "等差数列性质",
+    "level": 3,
+    "parent_code": "07.02",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "07.02.06",
+    "name": "等差数列判断与证明",
+    "level": 3,
+    "parent_code": "07.02",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "07.03",
+    "name": "等比数列",
+    "level": 2,
+    "parent_code": "07",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "07.03.01",
+    "name": "等比数列的定义",
+    "level": 3,
+    "parent_code": "07.03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "07.03.02",
+    "name": "通项公式",
+    "level": 3,
+    "parent_code": "07.03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "07.03.03",
+    "name": "前 $n$ 项和",
+    "level": 3,
+    "parent_code": "07.03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "07.03.04",
+    "name": "等比中项",
+    "level": 3,
+    "parent_code": "07.03",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "07.03.05",
+    "name": "等比数列性质",
+    "level": 3,
+    "parent_code": "07.03",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "07.03.06",
+    "name": "等比数列判断与证明",
+    "level": 3,
+    "parent_code": "07.03",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "07.04",
+    "name": "数列通项",
+    "level": 2,
+    "parent_code": "07",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "07.04.01",
+    "name": "观察归纳",
+    "level": 3,
+    "parent_code": "07.04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "07.04.02",
+    "name": "公式法",
+    "level": 3,
+    "parent_code": "07.04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "07.04.03",
+    "name": "累加法",
+    "level": 3,
+    "parent_code": "07.04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "07.04.04",
+    "name": "累乘法",
+    "level": 3,
+    "parent_code": "07.04",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "07.04.05",
+    "name": "构造等差数列",
+    "level": 3,
+    "parent_code": "07.04",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "07.04.06",
+    "name": "构造等比数列",
+    "level": 3,
+    "parent_code": "07.04",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "07.04.07",
+    "name": "取倒数法",
+    "level": 3,
+    "parent_code": "07.04",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "07.04.08",
+    "name": "特征根思想",
+    "level": 3,
+    "parent_code": "07.04",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "07.05",
+    "name": "数列求和",
+    "level": 2,
+    "parent_code": "07",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "07.05.01",
+    "name": "公式法",
+    "level": 3,
+    "parent_code": "07.05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "07.05.02",
+    "name": "分组求和",
+    "level": 3,
+    "parent_code": "07.05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "07.05.03",
+    "name": "并项求和",
+    "level": 3,
+    "parent_code": "07.05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "07.05.04",
+    "name": "裂项相消",
+    "level": 3,
+    "parent_code": "07.05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "07.05.05",
+    "name": "错位相减",
+    "level": 3,
+    "parent_code": "07.05",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "07.05.06",
+    "name": "倒序相加",
+    "level": 3,
+    "parent_code": "07.05",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "07.05.07",
+    "name": "奇偶项求和",
+    "level": 3,
+    "parent_code": "07.05",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "07.05.08",
+    "name": "递推数列求和",
+    "level": 3,
+    "parent_code": "07.05",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "07.06",
+    "name": "数列综合",
+    "level": 2,
+    "parent_code": "07",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "07.06.01",
+    "name": "数列与函数",
+    "level": 3,
+    "parent_code": "07.06",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "07.06.02",
+    "name": "数列与不等式",
+    "level": 3,
+    "parent_code": "07.06",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "07.06.03",
+    "name": "数列中的最值",
+    "level": 3,
+    "parent_code": "07.06",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "07.06.04",
+    "name": "数列中的恒成立",
+    "level": 3,
+    "parent_code": "07.06",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "07.06.05",
+    "name": "数列与归纳思想",
+    "level": 3,
+    "parent_code": "07.06",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "07.06.06",
+    "name": "数列应用题",
+    "level": 3,
+    "parent_code": "07.06",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "07.06.07",
+    "name": "数列新定义问题",
+    "level": 3,
+    "parent_code": "07.06",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "08",
+    "name": "导数及其应用",
+    "level": 1,
+    "parent_code": null,
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "08.01",
+    "name": "导数概念与运算",
+    "level": 2,
+    "parent_code": "08",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "08.01.01",
+    "name": "平均变化率与瞬时变化率",
+    "level": 3,
+    "parent_code": "08.01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "08.01.02",
+    "name": "导数的概念",
+    "level": 3,
+    "parent_code": "08.01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "08.01.03",
+    "name": "导数的几何意义",
+    "level": 3,
+    "parent_code": "08.01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "08.01.04",
+    "name": "基本初等函数的导数",
+    "level": 3,
+    "parent_code": "08.01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "08.01.05",
+    "name": "导数运算法则",
+    "level": 3,
+    "parent_code": "08.01",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "08.01.06",
+    "name": "复合函数求导",
+    "level": 3,
+    "parent_code": "08.01",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "08.02",
+    "name": "切线问题",
+    "level": 2,
+    "parent_code": "08",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "08.02.01",
+    "name": "已知切点求切线",
+    "level": 3,
+    "parent_code": "08.02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "08.02.02",
+    "name": "过点作曲线切线",
+    "level": 3,
+    "parent_code": "08.02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "08.02.03",
+    "name": "公切线",
+    "level": 3,
+    "parent_code": "08.02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "08.02.04",
+    "name": "切线斜率",
+    "level": 3,
+    "parent_code": "08.02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "08.02.05",
+    "name": "切线与参数",
+    "level": 3,
+    "parent_code": "08.02",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "08.02.06",
+    "name": "切线与最值、不等式",
+    "level": 3,
+    "parent_code": "08.02",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "08.03",
+    "name": "单调性",
+    "level": 2,
+    "parent_code": "08",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "08.03.01",
+    "name": "导数与单调性的关系",
+    "level": 3,
+    "parent_code": "08.03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "08.03.02",
+    "name": "求单调区间",
+    "level": 3,
+    "parent_code": "08.03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "08.03.03",
+    "name": "已知单调性求参数",
+    "level": 3,
+    "parent_code": "08.03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "08.03.04",
+    "name": "含参数导函数符号",
+    "level": 3,
+    "parent_code": "08.03",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "08.03.05",
+    "name": "单调性与方程根",
+    "level": 3,
+    "parent_code": "08.03",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "08.04",
+    "name": "极值与最值",
+    "level": 2,
+    "parent_code": "08",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "08.04.01",
+    "name": "极值的概念与判断",
+    "level": 3,
+    "parent_code": "08.04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "08.04.02",
+    "name": "极值点与极值",
+    "level": 3,
+    "parent_code": "08.04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "08.04.03",
+    "name": "闭区间最值",
+    "level": 3,
+    "parent_code": "08.04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "08.04.04",
+    "name": "已知极值求参数",
+    "level": 3,
+    "parent_code": "08.04",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "08.04.05",
+    "name": "含参数最值",
+    "level": 3,
+    "parent_code": "08.04",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "08.04.06",
+    "name": "实际问题最优化",
+    "level": 3,
+    "parent_code": "08.04",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "08.05",
+    "name": "导数与零点",
+    "level": 2,
+    "parent_code": "08",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "08.05.01",
+    "name": "函数零点个数",
+    "level": 3,
+    "parent_code": "08.05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "08.05.02",
+    "name": "零点存在性",
+    "level": 3,
+    "parent_code": "08.05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "08.05.03",
+    "name": "零点分布",
+    "level": 3,
+    "parent_code": "08.05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "08.05.04",
+    "name": "双零点与相切",
+    "level": 3,
+    "parent_code": "08.05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "08.05.05",
+    "name": "隐零点",
+    "level": 3,
+    "parent_code": "08.05",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "08.05.06",
+    "name": "零点与参数范围",
+    "level": 3,
+    "parent_code": "08.05",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "08.06",
+    "name": "导数与恒成立",
+    "level": 2,
+    "parent_code": "08",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "08.06.01",
+    "name": "恒成立问题转化",
+    "level": 3,
+    "parent_code": "08.06",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "08.06.02",
+    "name": "分离参数",
+    "level": 3,
+    "parent_code": "08.06",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "08.06.03",
+    "name": "最值法",
+    "level": 3,
+    "parent_code": "08.06",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "08.06.04",
+    "name": "分类讨论",
+    "level": 3,
+    "parent_code": "08.06",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "08.06.05",
+    "name": "参变分离",
+    "level": 3,
+    "parent_code": "08.06",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "08.06.06",
+    "name": "多变量恒成立",
+    "level": 3,
+    "parent_code": "08.06",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "08.07",
+    "name": "导数与不等式",
+    "level": 2,
+    "parent_code": "08",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "08.07.01",
+    "name": "构造函数证明不等式",
+    "level": 3,
+    "parent_code": "08.07",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "08.07.02",
+    "name": "作差构造",
+    "level": 3,
+    "parent_code": "08.07",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "08.07.03",
+    "name": "比值构造",
+    "level": 3,
+    "parent_code": "08.07",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "08.07.04",
+    "name": "对数化与指数化",
+    "level": 3,
+    "parent_code": "08.07",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "08.07.05",
+    "name": "切线不等式",
+    "level": 3,
+    "parent_code": "08.07",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "08.07.06",
+    "name": "放缩法",
+    "level": 3,
+    "parent_code": "08.07",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "08.07.07",
+    "name": "双变量不等式",
+    "level": 3,
+    "parent_code": "08.07",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "08.08",
+    "name": "导数综合",
+    "level": 2,
+    "parent_code": "08",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "08.08.01",
+    "name": "函数性质与导数",
+    "level": 3,
+    "parent_code": "08.08",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "08.08.02",
+    "name": "参数分类讨论",
+    "level": 3,
+    "parent_code": "08.08",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "08.08.03",
+    "name": "零点、极值和最值综合",
+    "level": 3,
+    "parent_code": "08.08",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "08.08.04",
+    "name": "恒成立与能成立",
+    "level": 3,
+    "parent_code": "08.08",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "08.08.05",
+    "name": "导数与数列",
+    "level": 3,
+    "parent_code": "08.08",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "08.08.06",
+    "name": "导数与解析几何",
+    "level": 3,
+    "parent_code": "08.08",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "08.08.07",
+    "name": "导数压轴综合",
+    "level": 3,
+    "parent_code": "08.08",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "09",
+    "name": "概率统计",
+    "level": 1,
+    "parent_code": null,
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "09.01",
+    "name": "随机抽样与数据整理",
+    "level": 2,
+    "parent_code": "09",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "09.01.01",
+    "name": "总体、个体、样本",
+    "level": 3,
+    "parent_code": "09.01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "09.01.02",
+    "name": "简单随机抽样",
+    "level": 3,
+    "parent_code": "09.01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "09.01.03",
+    "name": "分层随机抽样",
+    "level": 3,
+    "parent_code": "09.01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "09.01.04",
+    "name": "样本数据整理",
+    "level": 3,
+    "parent_code": "09.01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "09.01.05",
+    "name": "频率分布表",
+    "level": 3,
+    "parent_code": "09.01",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "09.01.06",
+    "name": "频率分布直方图",
+    "level": 3,
+    "parent_code": "09.01",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "09.01.07",
+    "name": "茎叶图及其他统计图表",
+    "level": 3,
+    "parent_code": "09.01",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "09.02",
+    "name": "数据数字特征",
+    "level": 2,
+    "parent_code": "09",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "09.02.01",
+    "name": "众数、中位数与平均数",
+    "level": 3,
+    "parent_code": "09.02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "09.02.02",
+    "name": "方差与标准差",
+    "level": 3,
+    "parent_code": "09.02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "09.02.03",
+    "name": "百分位数",
+    "level": 3,
+    "parent_code": "09.02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "09.02.04",
+    "name": "极差",
+    "level": 3,
+    "parent_code": "09.02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "09.02.05",
+    "name": "数据特征的估计",
+    "level": 3,
+    "parent_code": "09.02",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "09.02.06",
+    "name": "数据变化对数字特征的影响",
+    "level": 3,
+    "parent_code": "09.02",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "09.03",
+    "name": "统计关系与统计案例",
+    "level": 2,
+    "parent_code": "09",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "09.03.01",
+    "name": "变量的相关关系",
+    "level": 3,
+    "parent_code": "09.03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "09.03.02",
+    "name": "散点图",
+    "level": 3,
+    "parent_code": "09.03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "09.03.03",
+    "name": "相关系数",
+    "level": 3,
+    "parent_code": "09.03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "09.03.04",
+    "name": "一元线性回归模型",
+    "level": 3,
+    "parent_code": "09.03",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "09.03.05",
+    "name": "回归直线方程",
+    "level": 3,
+    "parent_code": "09.03",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "09.03.06",
+    "name": "残差分析",
+    "level": 3,
+    "parent_code": "09.03",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "09.03.07",
+    "name": "列联表",
+    "level": 3,
+    "parent_code": "09.03",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "09.03.08",
+    "name": "独立性检验",
+    "level": 3,
+    "parent_code": "09.03",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "09.04",
+    "name": "概率基础",
+    "level": 2,
+    "parent_code": "09",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "09.04.01",
+    "name": "随机事件与样本空间",
+    "level": 3,
+    "parent_code": "09.04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "09.04.02",
+    "name": "频率与概率",
+    "level": 3,
+    "parent_code": "09.04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "09.04.03",
+    "name": "互斥事件与对立事件",
+    "level": 3,
+    "parent_code": "09.04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "09.04.04",
+    "name": "概率加法公式",
+    "level": 3,
+    "parent_code": "09.04",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "09.04.05",
+    "name": "古典概型",
+    "level": 3,
+    "parent_code": "09.04",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "09.04.06",
+    "name": "几何概型思想",
+    "level": 3,
+    "parent_code": "09.04",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "09.05",
+    "name": "条件概率与事件独立性",
+    "level": 2,
+    "parent_code": "09",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "09.05.01",
+    "name": "条件概率",
+    "level": 3,
+    "parent_code": "09.05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "09.05.02",
+    "name": "乘法公式",
+    "level": 3,
+    "parent_code": "09.05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "09.05.03",
+    "name": "全概率公式",
+    "level": 3,
+    "parent_code": "09.05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "09.05.04",
+    "name": "贝叶斯思想",
+    "level": 3,
+    "parent_code": "09.05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "09.05.05",
+    "name": "相互独立事件",
+    "level": 3,
+    "parent_code": "09.05",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "09.05.06",
+    "name": "独立重复试验",
+    "level": 3,
+    "parent_code": "09.05",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "09.06",
+    "name": "离散型随机变量及其分布",
+    "level": 2,
+    "parent_code": "09",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "09.06.01",
+    "name": "离散型随机变量",
+    "level": 3,
+    "parent_code": "09.06",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "09.06.02",
+    "name": "分布列",
+    "level": 3,
+    "parent_code": "09.06",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "09.06.03",
+    "name": "分布列的性质",
+    "level": 3,
+    "parent_code": "09.06",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "09.06.04",
+    "name": "数学期望",
+    "level": 3,
+    "parent_code": "09.06",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "09.06.05",
+    "name": "方差",
+    "level": 3,
+    "parent_code": "09.06",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "09.06.06",
+    "name": "两点分布",
+    "level": 3,
+    "parent_code": "09.06",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "09.06.07",
+    "name": "二项分布",
+    "level": 3,
+    "parent_code": "09.06",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "09.06.08",
+    "name": "超几何分布",
+    "level": 3,
+    "parent_code": "09.06",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "09.07",
+    "name": "概率统计综合",
+    "level": 2,
+    "parent_code": "09",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "09.07.01",
+    "name": "概率模型识别",
+    "level": 3,
+    "parent_code": "09.07",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "09.07.02",
+    "name": "实际背景建模",
+    "level": 3,
+    "parent_code": "09.07",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "09.07.03",
+    "name": "统计图表与概率",
+    "level": 3,
+    "parent_code": "09.07",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "09.07.04",
+    "name": "分布列、期望与决策",
+    "level": 3,
+    "parent_code": "09.07",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "09.07.05",
+    "name": "条件概率与分布列",
+    "level": 3,
+    "parent_code": "09.07",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "09.07.06",
+    "name": "概率统计开放性问题",
+    "level": 3,
+    "parent_code": "09.07",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "10",
+    "name": "计数原理与二项式定理",
+    "level": 1,
+    "parent_code": null,
+    "system_version": "v1",
+    "sort_order": 10
+  },
+  {
+    "code": "10.01",
+    "name": "基本计数原理",
+    "level": 2,
+    "parent_code": "10",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "10.01.01",
+    "name": "分类加法计数原理",
+    "level": 3,
+    "parent_code": "10.01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "10.01.02",
+    "name": "分步乘法计数原理",
+    "level": 3,
+    "parent_code": "10.01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "10.01.03",
+    "name": "分类与分步的判断",
+    "level": 3,
+    "parent_code": "10.01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "10.01.04",
+    "name": "树状图与枚举",
+    "level": 3,
+    "parent_code": "10.01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "10.01.05",
+    "name": "容斥思想",
+    "level": 3,
+    "parent_code": "10.01",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "10.02",
+    "name": "排列",
+    "level": 2,
+    "parent_code": "10",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "10.02.01",
+    "name": "排列的概念",
+    "level": 3,
+    "parent_code": "10.02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "10.02.02",
+    "name": "排列数公式",
+    "level": 3,
+    "parent_code": "10.02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "10.02.03",
+    "name": "全排列",
+    "level": 3,
+    "parent_code": "10.02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "10.02.04",
+    "name": "相邻问题",
+    "level": 3,
+    "parent_code": "10.02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "10.02.05",
+    "name": "不相邻问题",
+    "level": 3,
+    "parent_code": "10.02",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "10.02.06",
+    "name": "特殊元素与特殊位置",
+    "level": 3,
+    "parent_code": "10.02",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "10.02.07",
+    "name": "定序问题",
+    "level": 3,
+    "parent_code": "10.02",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "10.02.08",
+    "name": "分组排列",
+    "level": 3,
+    "parent_code": "10.02",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "10.03",
+    "name": "组合",
+    "level": 2,
+    "parent_code": "10",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "10.03.01",
+    "name": "组合的概念",
+    "level": 3,
+    "parent_code": "10.03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "10.03.02",
+    "name": "组合数公式",
+    "level": 3,
+    "parent_code": "10.03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "10.03.03",
+    "name": "组合数性质",
+    "level": 3,
+    "parent_code": "10.03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "10.03.04",
+    "name": "分组与分配",
+    "level": 3,
+    "parent_code": "10.03",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "10.03.05",
+    "name": "至少、至多问题",
+    "level": 3,
+    "parent_code": "10.03",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "10.03.06",
+    "name": "选取与安排综合",
+    "level": 3,
+    "parent_code": "10.03",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "10.04",
+    "name": "二项式定理",
+    "level": 2,
+    "parent_code": "10",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "10.04.01",
+    "name": "二项式展开式",
+    "level": 3,
+    "parent_code": "10.04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "10.04.02",
+    "name": "二项式通项",
+    "level": 3,
+    "parent_code": "10.04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "10.04.03",
+    "name": "指定项",
+    "level": 3,
+    "parent_code": "10.04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "10.04.04",
+    "name": "常数项",
+    "level": 3,
+    "parent_code": "10.04",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "10.04.05",
+    "name": "有理项",
+    "level": 3,
+    "parent_code": "10.04",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "10.04.06",
+    "name": "二项式系数",
+    "level": 3,
+    "parent_code": "10.04",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "10.04.07",
+    "name": "项的系数",
+    "level": 3,
+    "parent_code": "10.04",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "10.04.08",
+    "name": "系数和",
+    "level": 3,
+    "parent_code": "10.04",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "10.04.09",
+    "name": "最大项与最值",
+    "level": 3,
+    "parent_code": "10.04",
+    "system_version": "v1",
+    "sort_order": 9
+  },
+  {
+    "code": "10.04.10",
+    "name": "二项式定理与组合恒等式",
+    "level": 3,
+    "parent_code": "10.04",
+    "system_version": "v1",
+    "sort_order": 10
+  },
+  {
+    "code": "10.05",
+    "name": "计数与概率综合",
+    "level": 2,
+    "parent_code": "10",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "10.05.01",
+    "name": "排列组合与古典概型",
+    "level": 3,
+    "parent_code": "10.05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "10.05.02",
+    "name": "计数与条件概率",
+    "level": 3,
+    "parent_code": "10.05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "10.05.03",
+    "name": "计数与分布列",
+    "level": 3,
+    "parent_code": "10.05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "10.05.04",
+    "name": "二项式与概率",
+    "level": 3,
+    "parent_code": "10.05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "11",
+    "name": "综合与跨模块问题",
+    "level": 1,
+    "parent_code": null,
+    "system_version": "v1",
+    "sort_order": 11
+  },
+  {
+    "code": "11.01",
+    "name": "函数与不等式综合",
+    "level": 2,
+    "parent_code": "11",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "11.01.01",
+    "name": "函数性质解不等式",
+    "level": 3,
+    "parent_code": "11.01",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "11.01.02",
+    "name": "参数范围",
+    "level": 3,
+    "parent_code": "11.01",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "11.01.03",
+    "name": "恒成立与能成立",
+    "level": 3,
+    "parent_code": "11.01",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "11.01.04",
+    "name": "最值与范围",
+    "level": 3,
+    "parent_code": "11.01",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "11.02",
+    "name": "函数与导数综合",
+    "level": 2,
+    "parent_code": "11",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "11.02.01",
+    "name": "单调性与零点",
+    "level": 3,
+    "parent_code": "11.02",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "11.02.02",
+    "name": "极值与参数",
+    "level": 3,
+    "parent_code": "11.02",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "11.02.03",
+    "name": "恒成立",
+    "level": 3,
+    "parent_code": "11.02",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "11.02.04",
+    "name": "不等式证明",
+    "level": 3,
+    "parent_code": "11.02",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "11.03",
+    "name": "三角函数与向量综合",
+    "level": 2,
+    "parent_code": "11",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "11.03.01",
+    "name": "数量积与三角恒等变换",
+    "level": 3,
+    "parent_code": "11.03",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "11.03.02",
+    "name": "向量与解三角形",
+    "level": 3,
+    "parent_code": "11.03",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "11.03.03",
+    "name": "图像性质与向量",
+    "level": 3,
+    "parent_code": "11.03",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "11.04",
+    "name": "立体几何综合",
+    "level": 2,
+    "parent_code": "11",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "11.04.01",
+    "name": "几何证明与空间向量",
+    "level": 3,
+    "parent_code": "11.04",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "11.04.02",
+    "name": "角、距离与体积",
+    "level": 3,
+    "parent_code": "11.04",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "11.04.03",
+    "name": "存在性与动点",
+    "level": 3,
+    "parent_code": "11.04",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "11.05",
+    "name": "解析几何综合",
+    "level": 2,
+    "parent_code": "11",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "11.05.01",
+    "name": "圆锥曲线与向量",
+    "level": 3,
+    "parent_code": "11.05",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "11.05.02",
+    "name": "圆锥曲线与函数",
+    "level": 3,
+    "parent_code": "11.05",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "11.05.03",
+    "name": "圆锥曲线与导数",
+    "level": 3,
+    "parent_code": "11.05",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "11.05.04",
+    "name": "定点、定值、范围和存在性",
+    "level": 3,
+    "parent_code": "11.05",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "11.06",
+    "name": "数列综合",
+    "level": 2,
+    "parent_code": "11",
+    "system_version": "v1",
+    "sort_order": 6
+  },
+  {
+    "code": "11.06.01",
+    "name": "数列与函数",
+    "level": 3,
+    "parent_code": "11.06",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "11.06.02",
+    "name": "数列与不等式",
+    "level": 3,
+    "parent_code": "11.06",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "11.06.03",
+    "name": "数列与导数",
+    "level": 3,
+    "parent_code": "11.06",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "11.06.04",
+    "name": "递推、求和与证明",
+    "level": 3,
+    "parent_code": "11.06",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "11.07",
+    "name": "概率统计综合",
+    "level": 2,
+    "parent_code": "11",
+    "system_version": "v1",
+    "sort_order": 7
+  },
+  {
+    "code": "11.07.01",
+    "name": "数据分析与概率决策",
+    "level": 3,
+    "parent_code": "11.07",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "11.07.02",
+    "name": "计数与概率",
+    "level": 3,
+    "parent_code": "11.07",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "11.07.03",
+    "name": "随机变量与实际模型",
+    "level": 3,
+    "parent_code": "11.07",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "11.08",
+    "name": "创新与新定义问题",
+    "level": 2,
+    "parent_code": "11",
+    "system_version": "v1",
+    "sort_order": 8
+  },
+  {
+    "code": "11.08.01",
+    "name": "新定义函数",
+    "level": 3,
+    "parent_code": "11.08",
+    "system_version": "v1",
+    "sort_order": 1
+  },
+  {
+    "code": "11.08.02",
+    "name": "新定义数列",
+    "level": 3,
+    "parent_code": "11.08",
+    "system_version": "v1",
+    "sort_order": 2
+  },
+  {
+    "code": "11.08.03",
+    "name": "新运算",
+    "level": 3,
+    "parent_code": "11.08",
+    "system_version": "v1",
+    "sort_order": 3
+  },
+  {
+    "code": "11.08.04",
+    "name": "信息迁移",
+    "level": 3,
+    "parent_code": "11.08",
+    "system_version": "v1",
+    "sort_order": 4
+  },
+  {
+    "code": "11.08.05",
+    "name": "开放性问题",
+    "level": 3,
+    "parent_code": "11.08",
+    "system_version": "v1",
+    "sort_order": 5
+  },
+  {
+    "code": "11.08.06",
+    "name": "探究性问题",
+    "level": 3,
+    "parent_code": "11.08",
+    "system_version": "v1",
+    "sort_order": 6
+  }
+]

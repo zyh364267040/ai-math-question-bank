@@ -1,0 +1,15 @@
+<article class="practice-preview" aria-label="练习预览">
+  <h2>数学练习预览</h2>
+  {% for q in questions %}<section class="preview-question" data-question-code="{{ q.question_code }}">
+    <h3><span class="preview-number">{{ q.number }}</span>.</h3>
+    <div class="preview-markdown">{{ q.stem_markdown }}</div>
+    {% if q.display_options %}<div class="preview-options">{% for option in q.display_options %}<p><b>{{ option.option_code }}.</b> {{ option.content_markdown }}</p>{% endfor %}</div>{% endif %}
+    {% with subquestion_display=q.subquestion_display %}{% include "_subquestions.html" %}{% endwith %}
+    {% for asset in q.display_assets %}<img class="preview-image" src="{{ asset.preview_url }}" alt="第{{ q.number }}题图片" loading="lazy">{% endfor %}
+    {% if options.include_source %}<p class="preview-meta">预览来源：{{ q.source_paper_name }} · {{ q.exam_year or '年份未知' }} · 原题号 {{ q.source_question_no }}</p>{% endif %}
+    {% if options.include_knowledge %}<p class="preview-meta">预览知识点：{{ q.primary_knowledge_name }}</p>{% endif %}
+    {% if options.include_answers %}<p class="preview-answer"><b>答案：</b> {{ q.answer_display }}</p>{% endif %}
+    {% if options.include_analysis %}<p class="preview-analysis"><b>解析：</b> {{ q.analysis_display }}</p>{% endif %}
+    <form method="post" action="/basket/remove/{{ q.question_code }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="/basket"><button type="submit">移出选题篮</button></form>
+  </section>{% endfor %}
+</article>
