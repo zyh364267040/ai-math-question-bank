@@ -34,6 +34,7 @@ CORE_TABLES = {
     "source_papers",
     "import_jobs",
     "import_upload_receipts",
+    "import_page_render_runs",
 }
 
 
@@ -266,6 +267,60 @@ class DatabaseSchemaTests(unittest.TestCase):
                    (token, source_paper_id, import_job_id) VALUES ('other-token', ?, ?)""",
                 (source_id, job_id),
             )
+
+    def test_existing_database_gets_render_runs_without_data_loss(self):
+        question_id, _ = self.insert_question()
+        source_id = self.connection.execute(
+            """INSERT INTO source_papers
+               (sha256, file_size, original_filename, stored_path,
+                region_code, exam_type_code, paper_name)
+               VALUES (?, 123, 'render-existing.pdf',
+                       'raw_papers/TJ/unknown/render-existing.pdf',
+                       'TJ', 'GK', '渲染迁移试卷')""",
+            ("d" * 64,),
+        ).lastrowid
+        job_id = self.connection.execute(
+            "INSERT INTO import_jobs (source_paper_id, status) VALUES (?, 'pending')",
+            (source_id,),
+        ).lastrowid
+        self.connection.execute("DROP TABLE IF EXISTS import_page_render_runs")
+        self.connection.commit()
+
+        initialize_database(self.db_path).close()
+
+        self.assertEqual(
+            (source_id, "渲染迁移试卷"),
+            self.connection.execute(
+                "SELECT id, paper_name FROM source_papers WHERE id = ?", (source_id,)
+            ).fetchone(),
+        )
+        self.assertEqual(
+            (job_id, source_id, "pending"),
+            self.connection.execute(
+                "SELECT id, source_paper_id, status FROM import_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone(),
+        )
+        self.assertEqual(
+            question_id,
+            self.connection.execute(
+                "SELECT id FROM questions WHERE id = ?", (question_id,)
+            ).fetchone()[0],
+        )
+        columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(import_page_render_runs)"
+            )
+        }
+        self.assertTrue(
+            {
+                "import_job_id", "status", "dpi", "total_pages",
+                "rendered_pages", "error_message", "started_at",
+                "completed_at", "updated_at",
+            }
+            <= columns
+        )
 
     def test_soft_delete_columns_are_migrated_idempotently_without_data_loss(self):
         question_id, _ = self.insert_question()

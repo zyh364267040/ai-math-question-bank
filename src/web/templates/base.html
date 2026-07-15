@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}AI 数学题库{% endblock %}</title>
+  {% block head_extra %}{% endblock %}
   <link rel="stylesheet" href="{{ url_for('static', path='styles.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', path='questions.css') }}?v=20260714-actions">
   <link rel="stylesheet" href="{{ url_for('static', path='subquestions.css') }}">

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}试卷与审核 · AI 数学题库{% endblock %}
 {% block content %}
-<section class="page-heading"><p class="eyebrow">PAPERS</p><h1>试卷与审核</h1><p>这里展示数据库中的真实导入任务。上传预览不会入库，确认后也不会自动启动识别。</p><a class="button" href="/imports/new">导入新试卷</a></section>
+<section class="page-heading"><p class="eyebrow">PAPERS</p><h1>试卷与审核</h1><p>这里展示数据库中的真实导入任务。上传预览不会入库；确认导入后也不会自动渲染或识别，必须再次点击“开始页面处理”。</p><a class="button" href="/imports/new">导入新试卷</a></section>
 <section class="paper-list">
 {% for job in jobs %}
   <article class="paper-card">
@@ -16,6 +16,14 @@
       <div><dt>候选题</dt><dd>{% if job.candidate_count is number %}{{ job.candidate_count }} 道{% else %}{{ job.candidate_count or '尚未生成' }}{% endif %}</dd></div>
       <div><dt>删除情况</dt><dd><span>已删除 {{ job.deleted_count }} 题</span>{% if job.deleted_count %} · <a href="/reviews/{{ job.id }}/deleted">查看已删除题目</a>{% endif %}</dd></div>
     </dl>
+    {% if job.status == 'pending' and not job.render_status %}
+      <form method="post" action="/imports/{{ job.id }}/render">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="button" type="submit">开始页面处理</button>
+      </form>
+    {% elif job.render_status %}
+      <a class="button" href="/imports/{{ job.id }}/processing">查看处理进度</a>
+    {% endif %}
     {% if job.audit %}
       <section class="paper-audit">
         <b>AI已复核</b>

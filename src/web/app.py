@@ -13,13 +13,14 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, unquote, urlsplit
 
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from PIL import Image, UnidentifiedImageError
 
 from src.database import baskets as basket_store
+from src.database.initialize import initialize_database
 from src.importing.pdf_intake import PdfIntakeError, has_intake_receipt, intake_pdf
 from src.importing.upload_confirmation import (
     MAX_UPLOAD_BYTES,
@@ -29,6 +30,11 @@ from src.importing.upload_confirmation import (
     pending_upload_operation,
     stage_pdf_upload,
     validate_import_metadata,
+)
+from src.processing.pdf_page_renderer import (
+    PageRenderError,
+    claim_render_job,
+    run_claimed_render,
 )
 
 
@@ -42,6 +48,19 @@ STATUS_NAMES = {
     "needs_review": "待人工审核",
     "completed": "已完成",
     "failed": "处理失败",
+}
+RENDER_STATUS_NAMES = {
+    "pending": "等待开始",
+    "processing": "页面处理中",
+    "completed": "页面处理完成",
+    "failed": "页面处理失败",
+}
+SAFE_RENDER_ERRORS = {
+    "归档 PDF 校验失败，请重新导入后重试",
+    "确认页码范围无效，请重新导入后重试",
+    "PDF 页数或页面尺寸超过安全处理限制",
+    "页面处理失败，请重试",
+    "现有页面结果校验失败，请点击重试",
 }
 AUDIT_STATUSES = ("auto_pass", "disputed", "human_required")
 FILTER_STATUSES = (*AUDIT_STATUSES, "all")
@@ -60,6 +79,7 @@ CANDIDATE_DELETE_FORM_FIELDS = {"csrf_token", "version", "reason", "note", "conf
 CANDIDATE_RESTORE_FORM_FIELDS = {"csrf_token", "version"}
 MAX_DELETE_FORM_BYTES = 4_096
 MAX_PREVIEW_REQUEST_BYTES = MAX_UPLOAD_BYTES + 1024 * 1024
+MAX_RENDER_START_FORM_BYTES = 64 * 1024
 REVIEW_FORM_FIELDS = {
     "csrf_token", "version", "action", "stem_markdown", "question_type_code",
     "primary_knowledge_point_code", "related_knowledge_point_codes", "review_notes",
@@ -113,18 +133,22 @@ class _PreviewRequestBodyTooLarge(Exception):
 
 
 class PreviewUploadBodyLimitMiddleware:
-    """Enforce the preview request cap while ASGI body messages are received."""
+    """Enforce route-specific import caps while ASGI body messages are received."""
 
     def __init__(self, app, max_body_bytes=MAX_PREVIEW_REQUEST_BYTES):
         self.app = app
         self.max_body_bytes = max_body_bytes
 
     async def __call__(self, scope, receive, send):
-        if not (
-            scope["type"] == "http"
-            and scope.get("method") == "POST"
-            and scope.get("path") == "/imports/preview"
-        ):
+        path = scope.get("path", "")
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        if path == "/imports/preview":
+            request_limit = self.max_body_bytes
+        elif re.fullmatch(r"/imports/[^/]+/render", path):
+            request_limit = min(self.max_body_bytes, MAX_RENDER_START_FORM_BYTES)
+        else:
             await self.app(scope, receive, send)
             return
 
@@ -138,7 +162,7 @@ class PreviewUploadBodyLimitMiddleware:
                 declared_length = int(content_lengths[-1])
             except ValueError:
                 declared_length = 0
-            if declared_length > self.max_body_bytes:
+            if declared_length > request_limit:
                 await self._send_413(send)
                 return
 
@@ -150,7 +174,7 @@ class PreviewUploadBodyLimitMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
-                if received > self.max_body_bytes:
+                if received > request_limit:
                     raise _PreviewRequestBodyTooLarge
             return message
 
@@ -900,12 +924,20 @@ def create_app(
     database_path=DEFAULT_DATABASE_PATH,
     private_root=DEFAULT_PRIVATE_ROOT,
     preview_request_max_bytes=MAX_PREVIEW_REQUEST_BYTES,
+    _initialize_schema=True,
 ):
     database_path = Path(database_path)
     private_root = Path(private_root)
+    if _initialize_schema:
+        initialize_database(database_path).close()
     application = FastAPI(title="AI 数学题库", docs_url=None, redoc_url=None)
     application.state.database_path = database_path
     application.state.private_root = private_root
+    if not _initialize_schema:
+        @application.on_event("startup")
+        def initialize_schema_on_server_start():
+            """Migrate the production database before serving any request."""
+            initialize_database(database_path).close()
     def common_context(request):
         try:
             with _connect(database_path) as connection:
@@ -974,12 +1006,15 @@ def create_app(
                     """SELECT j.id, j.page_start, j.page_end, j.status,
                               s.paper_name, s.original_filename, s.exam_year,
                               r.name AS region_name, e.name AS exam_type_name,
+                              pr.status AS render_status,
+                              pr.rendered_pages, pr.total_pages, pr.dpi,
                               (SELECT COUNT(*) FROM candidate_review_drafts d
                                WHERE d.import_job_id=j.id AND d.deleted_at IS NOT NULL) AS deleted_count
                        FROM import_jobs j
                        JOIN source_papers s ON s.id = j.source_paper_id
                        JOIN regions r ON r.code = s.region_code
                        JOIN exam_types e ON e.code = s.exam_type_code
+                       LEFT JOIN import_page_render_runs pr ON pr.import_job_id = j.id
                        ORDER BY j.created_at DESC, j.id DESC"""
                 ).fetchall()
         except sqlite3.Error:
@@ -1013,6 +1048,68 @@ def create_app(
             jobs.append(item)
         return templates.TemplateResponse(
             request=request, name="papers.html", context={"jobs": jobs}
+        )
+
+    @application.post("/imports/{job_id}/render")
+    async def start_page_render(
+        request: Request, job_id: int, background_tasks: BackgroundTasks
+    ):
+        """Claim one user-authorized render and enqueue at most one worker."""
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"}:
+            return _error(request, templates, "页面处理请求参数无效", 400)
+        try:
+            claim = claim_render_job(database_path, private_root, job_id)
+        except PageRenderError as error:
+            message = str(error)
+            if message == "未找到导入任务":
+                return _error(request, templates, message, 404)
+            if message == "该历史任务不能启动页面处理":
+                return _error(request, templates, message, 409)
+            return _error(request, templates, "页面处理任务暂时无法启动", 500)
+        if claim is not None:
+            background_tasks.add_task(run_claimed_render, claim)
+        return RedirectResponse(
+            f"/imports/{job_id}/processing", status_code=303
+        )
+
+    @application.get("/imports/{job_id}/processing", response_class=HTMLResponse)
+    def page_render_status(request: Request, job_id: int):
+        """Show safe render progress and explicit retry/validation controls."""
+        try:
+            with _connect(database_path) as connection:
+                row = connection.execute(
+                    """SELECT j.id, j.status AS import_status, j.page_start, j.page_end,
+                              s.paper_name, s.original_filename,
+                              r.status, r.dpi, r.total_pages, r.rendered_pages,
+                              r.error_message
+                       FROM import_jobs j
+                       JOIN source_papers s ON s.id=j.source_paper_id
+                       LEFT JOIN import_page_render_runs r ON r.import_job_id=j.id
+                       WHERE j.id=?""",
+                    (job_id,),
+                ).fetchone()
+        except sqlite3.Error:
+            return _error(request, templates, "页面处理状态暂时无法读取", 500)
+        if row is None:
+            return _error(request, templates, "未找到导入任务", 404)
+        if row["status"] is None and row["import_status"] != "pending":
+            return _error(request, templates, "该历史任务没有页面处理记录", 409)
+        run = dict(row)
+        run["status"] = run["status"] or "pending"
+        run["dpi"] = run["dpi"] or 300
+        run["rendered_pages"] = run["rendered_pages"] or 0
+        if run["total_pages"] is None and run["page_start"] is not None:
+            run["total_pages"] = run["page_end"] - run["page_start"] + 1
+        run["status_name"] = RENDER_STATUS_NAMES[run["status"]]
+        if run["error_message"] not in SAFE_RENDER_ERRORS:
+            run["error_message"] = "页面处理失败，请重试" if run["status"] == "failed" else None
+        return templates.TemplateResponse(
+            request=request,
+            name="import_processing.html",
+            context={"run": run},
         )
 
     @application.get("/imports/new", response_class=HTMLResponse)
@@ -2145,4 +2242,4 @@ def create_app(
     return application
 
 
-app = create_app()
+app = create_app(_initialize_schema=False)

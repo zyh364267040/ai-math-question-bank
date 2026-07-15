@@ -76,6 +76,21 @@ CREATE TABLE IF NOT EXISTS import_jobs (
     )
 );
 
+CREATE TABLE IF NOT EXISTS import_page_render_runs (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'processing', 'completed', 'failed')
+    ),
+    dpi INTEGER NOT NULL DEFAULT 300 CHECK (dpi = 300),
+    total_pages INTEGER CHECK (total_pages IS NULL OR total_pages > 0),
+    rendered_pages INTEGER NOT NULL DEFAULT 0 CHECK (rendered_pages >= 0),
+    error_message TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (total_pages IS NULL OR rendered_pages <= total_pages)
+);
+
 CREATE TABLE IF NOT EXISTS import_upload_receipts (
     token TEXT PRIMARY KEY CHECK (
         length(trim(token)) BETWEEN 1 AND 200

@@ -17,7 +17,7 @@ from src.web.app import PreviewUploadBodyLimitMiddleware, create_app
 
 
 class PreviewUploadBodyLimitMiddlewareTests(unittest.IsolatedAsyncioTestCase):
-    async def invoke(self, headers, chunks, limit=10):
+    async def invoke(self, headers, chunks, limit=10, path="/imports/preview"):
         state = {"downstream_called": False, "parsed": False, "receive_calls": 0}
         messages = [
             {
@@ -52,7 +52,7 @@ class PreviewUploadBodyLimitMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "http",
                 "method": "POST",
-                "path": "/imports/preview",
+                "path": path,
                 "headers": headers,
             },
             receive,
@@ -80,6 +80,15 @@ class PreviewUploadBodyLimitMiddlewareTests(unittest.IsolatedAsyncioTestCase):
                     if message["type"] == "http.response.body"
                 )
                 self.assertNotIn(str(Path.home()).encode(), body)
+
+    async def test_render_start_form_has_a_small_streaming_request_limit(self):
+        state, sent = await self.invoke(
+            [], [b"123456", b"78901"], limit=10, path="/imports/123/render"
+        )
+
+        self.assertTrue(state["downstream_called"])
+        self.assertFalse(state["parsed"])
+        self.assertEqual(413, sent[0]["status"])
 
 
 class UploadConfirmationWebTests(unittest.TestCase):
@@ -363,6 +372,14 @@ class UploadConfirmationWebTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(("和平区月考.pdf", "和平区高一月考"), paper)
         self.assertEqual((1, 2, "pending"), job)
+        with sqlite3.connect(self.database_path) as connection:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM import_page_render_runs"
+                ).fetchone()[0],
+            )
+        self.assertFalse((self.private_root / "processing").exists())
         self.assertFalse((self.private_root / "pending_uploads" / token).exists())
 
     def test_concurrent_confirm_requests_create_at_most_one_job(self):

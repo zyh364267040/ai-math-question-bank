@@ -47,3 +47,46 @@ form > button {
 .metadata dd {
   overflow-wrap: anywhere;
 }
+
+.processing-card {
+  display: grid;
+  gap: 16px;
+  max-width: 760px;
+}
+
+.processing-card dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.processing-card dl > div {
+  min-width: 0;
+  padding: 12px;
+  background: var(--paper);
+}
+
+.processing-card dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .processing-card {
+    padding: 18px;
+  }
+
+  .processing-card dl {
+    grid-template-columns: 1fr;
+  }
+
+  .processing-card form,
+  .processing-card .button {
+    width: 100%;
+  }
+
+  .processing-card button {
+    width: 100%;
+  }
+}

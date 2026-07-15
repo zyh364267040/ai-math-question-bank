@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}页面处理进度 · AI 数学题库{% endblock %}
+{% block head_extra %}{% if run.status == 'processing' %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">PAGE RENDER</p>
+  <h1>{{ run.paper_name }}</h1>
+  <p>来源文件：{{ run.original_filename }}</p>
+</section>
+<section class="paper-card processing-card">
+  <p><span class="status {{ run.status }}">{{ run.status_name }}</span></p>
+  <dl>
+    <div><dt>确认页码</dt><dd>{% if run.page_start %}{{ run.page_start }}–{{ run.page_end }}{% else %}全部{% endif %}</dd></div>
+    <div><dt>渲染精度</dt><dd>{{ run.dpi }} DPI</dd></div>
+    <div><dt>处理进度</dt><dd>{{ run.rendered_pages }} / {{ run.total_pages or '待确认' }} 页</dd></div>
+  </dl>
+  {% if run.status == 'failed' %}
+    <p class="form-error">{{ run.error_message }}</p>
+    {% if run.import_status == 'pending' %}
+      <form method="post" action="/imports/{{ run.id }}/render">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="button" type="submit">重试页面处理</button>
+      </form>
+    {% endif %}
+  {% elif run.status == 'completed' %}
+    <form method="post" action="/imports/{{ run.id }}/render">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">校验或重新处理</button>
+    </form>
+    <a class="button" href="/papers">返回试卷列表</a>
+  {% elif run.status == 'pending' and run.import_status == 'pending' %}
+    <form method="post" action="/imports/{{ run.id }}/render">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">开始页面处理</button>
+    </form>
+  {% else %}
+    <p>页面处理在后台进行，本页会自动刷新。</p>
+  {% endif %}
+</section>
+{% endblock %}
