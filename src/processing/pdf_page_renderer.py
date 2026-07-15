@@ -520,6 +520,8 @@ def _load_valid_existing(
             raise PageRenderError(SAFE_EXISTING_ERROR)
         pages_fd = _open_child_directory(job_fd, "pages")
         expected_names = set()
+        cumulative_output_bytes = 0
+        validated_pages = []
         for entry, (number, width, height) in zip(pages, dimensions):
             relative_path = f"pages/page_{number:03d}.png"
             name = f"page_{number:03d}.png"
@@ -532,20 +534,38 @@ def _load_valid_existing(
             ):
                 raise PageRenderError(SAFE_EXISTING_ERROR)
             try:
+                declared_size = entry.get("byte_size")
+                if type(declared_size) is not int or declared_size <= 0:
+                    raise PageRenderError(SAFE_EXISTING_ERROR)
+                details = os.stat(name, dir_fd=pages_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(details.st_mode)
+                    or details.st_nlink != 1
+                    or details.st_size != declared_size
+                ):
+                    raise PageRenderError(SAFE_EXISTING_ERROR)
+                cumulative_output_bytes += details.st_size
+                if cumulative_output_bytes > MAX_RENDER_OUTPUT_BYTES:
+                    raise PageRenderError(SAFE_EXISTING_ERROR)
+                validated_pages.append(
+                    (entry, name, width, height, details.st_size)
+                )
+            except (OSError, PageRenderError) as error:
+                raise PageRenderError(SAFE_EXISTING_ERROR) from error
+        actual_names = set(os.listdir(pages_fd))
+        if actual_names != expected_names:
+            raise PageRenderError(SAFE_EXISTING_ERROR)
+
+        for entry, name, width, height, expected_size in validated_pages:
+            try:
                 content = _read_regular_at(
-                    pages_fd, name, max_bytes=200 * 1024 * 1024
+                    pages_fd, name, max_bytes=200 * 1024 * 1024,
+                    expected_size=expected_size,
                 )
                 byte_size, digest = _verify_png_bytes(content, width, height)
             except (OSError, PageRenderError, UnidentifiedImageError) as error:
                 raise PageRenderError(SAFE_EXISTING_ERROR) from error
             if entry.get("byte_size") != byte_size or entry.get("sha256") != digest:
-                raise PageRenderError(SAFE_EXISTING_ERROR)
-        actual_names = set(os.listdir(pages_fd))
-        if actual_names != expected_names:
-            raise PageRenderError(SAFE_EXISTING_ERROR)
-        for name in actual_names:
-            details = os.stat(name, dir_fd=pages_fd, follow_symlinks=False)
-            if not stat.S_ISREG(details.st_mode):
                 raise PageRenderError(SAFE_EXISTING_ERROR)
         return manifest
     except PageRenderError:

@@ -914,6 +914,39 @@ class PdfPageRendererTests(unittest.TestCase):
                 with self.assertRaisesRegex(PageRenderError, "现有页面结果校验失败"):
                     render_import_job(self.database_path, self.private_root, job_id)
 
+    def test_completed_validation_rejects_cumulative_output_before_over_budget_png_read(self):
+        job_id, _ = self.create_job(page_count=2, page_start=1, page_end=2)
+        manifest = render_import_job(self.database_path, self.private_root, job_id)
+        from src.processing import pdf_page_renderer as renderer
+
+        page_sizes = [entry["byte_size"] for entry in manifest["pages"]]
+        budget = sum(page_sizes) - 1
+        real_read_regular = renderer._read_regular_at
+        png_reads = []
+
+        def track_reads(parent_fd, name, **kwargs):
+            if name.endswith(".png"):
+                png_reads.append(name)
+            return real_read_regular(parent_fd, name, **kwargs)
+
+        with (
+            patch.object(renderer, "MAX_RENDER_OUTPUT_BYTES", budget),
+            patch.object(renderer, "_read_regular_at", side_effect=track_reads),
+        ):
+            with self.assertRaisesRegex(PageRenderError, "现有页面结果校验失败"):
+                render_import_job(self.database_path, self.private_root, job_id)
+
+        self.assertEqual([], png_reads)
+        with sqlite3.connect(self.database_path) as connection:
+            self.assertEqual(
+                ("failed", "现有页面结果校验失败，请点击重试"),
+                connection.execute(
+                    """SELECT status, error_message FROM import_page_render_runs
+                       WHERE import_job_id=?""",
+                    (job_id,),
+                ).fetchone(),
+            )
+
     def test_completed_validation_reads_manifest_and_png_from_nofollow_descriptors(self):
         job_id, _ = self.create_job(page_count=1, page_start=1, page_end=1)
         expected = render_import_job(self.database_path, self.private_root, job_id)
