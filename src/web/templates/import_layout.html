@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}版面分析 · AI 数学题库{% endblock %}
+{% block head_extra %}{% if run.status == 'processing' %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">PAGE LAYOUT</p>
+  <h1>{{ run.paper_name }}</h1>
+  <p>来源文件：{{ run.original_filename }}</p>
+  <p>题号候选只使用 PDF 嵌入文本层，不是 OCR；无文本层不猜题号，并明确进入人工复核。</p>
+</section>
+<section class="paper-card processing-card">
+  <p><span class="status {{ run.status }}">{{ run.status_name }}</span></p>
+  <dl>
+    <div><dt>分析进度</dt><dd>{{ run.analyzed_pages }} / {{ run.total_pages or '待确认' }} 页</dd></div>
+    <div><dt>题目边界候选</dt><dd>{{ run.detected_questions }} 道</dd></div>
+  </dl>
+  {% if run.status == 'failed' %}<p class="form-error">{{ run.error_message }}</p>{% endif %}
+  {% if run.status in ('pending', 'failed') %}
+    <form method="post" action="/imports/{{ run.id }}/layout">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">{% if run.status == 'failed' %}重试版面分析{% else %}开始版面分析{% endif %}</button>
+    </form>
+  {% elif run.status == 'processing' %}
+    <p>版面分析在后台进行；若服务曾重启，可显式继续。</p>
+    <form method="post" action="/imports/{{ run.id }}/layout">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">继续或检查版面分析</button>
+    </form>
+  {% elif run.status == 'completed' %}
+    <p>版面分析已完成。候选仅供审核，不会自动切题或修改题库。</p>
+  {% endif %}
+</section>
+{% if manifest %}
+<section class="layout-review">
+  {% for page in manifest.pages %}
+  <article class="paper-card layout-page">
+    <h2>第 {{ page.page_number }} 页</h2>
+    <p>{{ page.column_count }} 栏 · 文本层：{{ '可用' if page.text_layer_available else '不可用' }} · 置信度 {{ page.confidence }}</p>
+    {% for warning in page.warnings %}<p class="form-error">{{ warning }}</p>{% endfor %}
+    <img src="/imports/{{ run.id }}/layout-overlays/{{ page.page_number }}.png" alt="第 {{ page.page_number }} 页版面候选预览">
+  </article>
+  {% endfor %}
+  <article class="paper-card">
+    <h2>题目边界候选</h2>
+    {% for question in manifest.questions %}
+      <section class="layout-question">
+        <h3>题号 {{ question.question_no }}</h3>
+        <p>置信度：{{ question.confidence }}</p>
+        {% for warning in question.warnings %}<p class="form-error">{{ warning }}</p>{% endfor %}
+        <ul>{% for region in question.regions %}<li>第 {{ region.page_number }} 页：{{ region.bbox }}</li>{% endfor %}</ul>
+      </section>
+    {% else %}<p>未生成题号边界候选，请人工复核。</p>{% endfor %}
+  </article>
+</section>
+{% endif %}
+{% endblock %}

@@ -24,6 +24,14 @@
     {% elif job.render_status %}
       <a class="button" href="/imports/{{ job.id }}/processing">查看处理进度</a>
     {% endif %}
+    {% if job.status == 'pending' and job.render_status == 'completed' and not job.layout_status %}
+      <form method="post" action="/imports/{{ job.id }}/layout">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="button" type="submit">开始版面分析</button>
+      </form>
+    {% elif job.layout_status %}
+      <a class="button" href="/imports/{{ job.id }}/layout">查看版面分析</a>
+    {% endif %}
     {% if job.audit %}
       <section class="paper-audit">
         <b>AI已复核</b>

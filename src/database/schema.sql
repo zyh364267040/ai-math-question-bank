@@ -91,6 +91,44 @@ CREATE TABLE IF NOT EXISTS import_page_render_runs (
     CHECK (total_pages IS NULL OR rendered_pages <= total_pages)
 );
 
+CREATE TABLE IF NOT EXISTS import_layout_analysis_runs (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'processing', 'completed', 'failed')
+    ),
+    total_pages INTEGER CHECK (total_pages IS NULL OR total_pages > 0),
+    analyzed_pages INTEGER NOT NULL DEFAULT 0 CHECK (analyzed_pages >= 0),
+    detected_questions INTEGER NOT NULL DEFAULT 0 CHECK (detected_questions >= 0),
+    manifest_sha256 TEXT CHECK (
+        manifest_sha256 IS NULL OR length(manifest_sha256) = 64
+    ),
+    manifest_byte_size INTEGER CHECK (
+        manifest_byte_size IS NULL OR manifest_byte_size > 0
+    ),
+    published_batch_id TEXT CHECK (
+        published_batch_id IS NULL OR length(published_batch_id) BETWEEN 1 AND 64
+    ),
+    source_pdf_sha256 TEXT CHECK (
+        source_pdf_sha256 IS NULL OR length(source_pdf_sha256) = 64
+    ),
+    render_manifest_sha256 TEXT CHECK (
+        render_manifest_sha256 IS NULL OR length(render_manifest_sha256) = 64
+    ),
+    error_message TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (total_pages IS NULL OR analyzed_pages <= total_pages),
+    CHECK (
+        status != 'completed' OR (
+            total_pages IS NOT NULL AND analyzed_pages = total_pages AND
+            manifest_sha256 IS NOT NULL AND manifest_byte_size IS NOT NULL AND
+            published_batch_id IS NOT NULL AND source_pdf_sha256 IS NOT NULL AND
+            render_manifest_sha256 IS NOT NULL
+        )
+    )
+);
+
 CREATE TABLE IF NOT EXISTS import_upload_receipts (
     token TEXT PRIMARY KEY CHECK (
         length(trim(token)) BETWEEN 1 AND 200

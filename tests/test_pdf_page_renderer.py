@@ -82,6 +82,21 @@ class PdfPageRendererTests(unittest.TestCase):
             for path in root.rglob("*")
         }
 
+    def test_fd_reader_rejects_hardlinked_regular_file(self):
+        from src.processing.pdf_page_renderer import _read_regular_at
+
+        directory = self.root / "fd-reader"
+        directory.mkdir()
+        source = directory / "page.png"
+        source.write_bytes(b"synthetic")
+        os.link(source, self.root / "second-link.png")
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.assertRaises(OSError):
+                _read_regular_at(descriptor, "page.png", max_bytes=100)
+        finally:
+            os.close(descriptor)
+
     def test_renders_confirmed_range_at_300_dpi_with_verified_manifest(self):
         job_id, source_digest = self.create_job()
 

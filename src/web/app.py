@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import quote, unquote, urlsplit
 
 from fastapi import BackgroundTasks, FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from PIL import Image, UnidentifiedImageError
@@ -36,6 +36,13 @@ from src.processing.pdf_page_renderer import (
     claim_render_job,
     run_claimed_render,
 )
+from src.processing.page_layout_analyzer import (
+    PageLayoutError,
+    claim_layout_job,
+    load_completed_layout,
+    read_layout_overlay,
+    run_claimed_layout,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -54,6 +61,18 @@ RENDER_STATUS_NAMES = {
     "processing": "页面处理中",
     "completed": "页面处理完成",
     "failed": "页面处理失败",
+}
+LAYOUT_STATUS_NAMES = {
+    "pending": "等待开始",
+    "processing": "版面分析中",
+    "completed": "版面分析完成",
+    "failed": "版面分析失败",
+}
+SAFE_LAYOUT_ERRORS = {
+    "页面分析输入校验失败，请重新处理页面后重试",
+    "页面数量或分析结果超过安全处理限制",
+    "版面分析失败，请重试",
+    "现有版面分析结果校验失败，请点击重试",
 }
 SAFE_RENDER_ERRORS = {
     "归档 PDF 校验失败，请重新导入后重试",
@@ -146,7 +165,7 @@ class PreviewUploadBodyLimitMiddleware:
             return
         if path == "/imports/preview":
             request_limit = self.max_body_bytes
-        elif re.fullmatch(r"/imports/[^/]+/render", path):
+        elif re.fullmatch(r"/imports/[^/]+/(?:render|layout)", path):
             request_limit = min(self.max_body_bytes, MAX_RENDER_START_FORM_BYTES)
         else:
             await self.app(scope, receive, send)
@@ -955,6 +974,11 @@ def create_app(
         request.state.csrf_token = token
         response = await call_next(request)
         response.headers["X-AI-Math-Question-Bank"] = "1"
+        if (
+            request.method == "GET"
+            and re.fullmatch(r"/imports/[^/]+/layout", request.url.path)
+        ):
+            response.headers["Cache-Control"] = "no-store"
         if cookie_token != token:
             response.set_cookie("basket_csrf", token, httponly=True, samesite="strict", secure=False)
         return response
@@ -1008,6 +1032,8 @@ def create_app(
                               r.name AS region_name, e.name AS exam_type_name,
                               pr.status AS render_status,
                               pr.rendered_pages, pr.total_pages, pr.dpi,
+                              la.status AS layout_status,
+                              la.analyzed_pages, la.detected_questions,
                               (SELECT COUNT(*) FROM candidate_review_drafts d
                                WHERE d.import_job_id=j.id AND d.deleted_at IS NOT NULL) AS deleted_count
                        FROM import_jobs j
@@ -1015,6 +1041,7 @@ def create_app(
                        JOIN regions r ON r.code = s.region_code
                        JOIN exam_types e ON e.code = s.exam_type_code
                        LEFT JOIN import_page_render_runs pr ON pr.import_job_id = j.id
+                       LEFT JOIN import_layout_analysis_runs la ON la.import_job_id = j.id
                        ORDER BY j.created_at DESC, j.id DESC"""
                 ).fetchall()
         except sqlite3.Error:
@@ -1110,6 +1137,101 @@ def create_app(
             request=request,
             name="import_processing.html",
             context={"run": run},
+        )
+
+    @application.post("/imports/{job_id}/layout")
+    async def start_layout_analysis(
+        request: Request, job_id: int, background_tasks: BackgroundTasks
+    ):
+        """Start analysis only after this explicit CSRF-protected request."""
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if (
+            set(form.keys()) != {"csrf_token"}
+            or len(list(form.multi_items())) != 1
+        ):
+            return _error(request, templates, "版面分析请求参数无效", 400)
+        try:
+            claim = claim_layout_job(database_path, private_root, job_id)
+        except PageLayoutError as error:
+            if str(error) == "未找到导入任务":
+                return _error(request, templates, str(error), 404)
+            if str(error) == "页面处理完成后才能开始版面分析":
+                return _error(request, templates, str(error), 409)
+            return _error(request, templates, "版面分析任务暂时无法启动", 500)
+        if claim is not None:
+            background_tasks.add_task(run_claimed_layout, claim)
+        return RedirectResponse(f"/imports/{job_id}/layout", status_code=303)
+
+    @application.get("/imports/{job_id}/layout", response_class=HTMLResponse)
+    def layout_analysis_status(request: Request, job_id: int):
+        """Show progress without ever implicitly starting analysis."""
+        try:
+            with _connect(database_path) as connection:
+                row = connection.execute(
+                    """SELECT j.id,j.status AS import_status,j.page_start,j.page_end,
+                              s.paper_name,s.original_filename,
+                              pr.status AS render_status,
+                              pr.total_pages AS render_total_pages,
+                              la.status,la.total_pages,la.analyzed_pages,
+                              la.detected_questions,la.error_message
+                       FROM import_jobs j
+                       JOIN source_papers s ON s.id=j.source_paper_id
+                       LEFT JOIN import_page_render_runs pr ON pr.import_job_id=j.id
+                       LEFT JOIN import_layout_analysis_runs la ON la.import_job_id=j.id
+                       WHERE j.id=?""", (job_id,)
+                ).fetchone()
+        except sqlite3.Error:
+            return _error(request, templates, "版面分析状态暂时无法读取", 500)
+        if row is None:
+            return _error(request, templates, "未找到导入任务", 404)
+        if row["import_status"] != "pending" or row["render_status"] != "completed":
+            return _error(request, templates, "页面处理完成后才能查看版面分析", 409)
+        run = dict(row)
+        run["status"] = run["status"] or "pending"
+        run["analyzed_pages"] = run["analyzed_pages"] or 0
+        if run["total_pages"] is None:
+            if run["render_total_pages"] is not None:
+                run["total_pages"] = run["render_total_pages"]
+            elif run["page_start"] is not None and run["page_end"] is not None:
+                run["total_pages"] = run["page_end"] - run["page_start"] + 1
+        run["detected_questions"] = run["detected_questions"] or 0
+        run["status_name"] = LAYOUT_STATUS_NAMES[run["status"]]
+        if run["error_message"] not in SAFE_LAYOUT_ERRORS:
+            run["error_message"] = "版面分析失败，请重试" if run["status"] == "failed" else None
+        manifest = None
+        if run["status"] == "completed":
+            try:
+                manifest = load_completed_layout(database_path, private_root, job_id)
+            except PageLayoutError:
+                run["status"] = "failed"
+                run["status_name"] = "结果校验失败"
+                run["error_message"] = "现有版面分析结果校验失败，请点击重试"
+        return templates.TemplateResponse(
+            request=request, name="import_layout.html", context={"run": run, "manifest": manifest}
+        )
+
+    @application.get("/imports/{job_id}/layout-overlays/{page_number}.png")
+    def layout_overlay(job_id: int, page_number: int):
+        try:
+            content = read_layout_overlay(
+                database_path, private_root, job_id, page_number
+            )
+        except PageLayoutError as error:
+            status = 404 if str(error) in {"未找到导入任务", "未找到版面预览"} else 409
+            return Response(
+                content=("未找到版面预览" if status == 404 else "版面预览校验失败"),
+                status_code=status,
+                media_type="text/plain; charset=utf-8",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        return Response(
+            content=content, media_type="image/png",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
 
     @application.get("/imports/new", response_class=HTMLResponse)

@@ -354,7 +354,47 @@ class DatabaseSchemaTests(unittest.TestCase):
                     "SELECT id,stem_markdown FROM questions WHERE id=?", (question_id,)
                 ).fetchone(),
             )
-            self.assertEqual([], connection.execute("PRAGMA foreign_key_check").fetchall())
+            self.assertEqual(
+                [], connection.execute("PRAGMA foreign_key_check").fetchall()
+            )
+
+    def test_existing_layout_run_table_gains_trust_anchor_columns_idempotently(self):
+        self.connection.close()
+        self.db_path.unlink()
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """CREATE TABLE import_layout_analysis_runs (
+                    import_job_id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    total_pages INTEGER,
+                    analyzed_pages INTEGER NOT NULL DEFAULT 0,
+                    detected_questions INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT,started_at TEXT,completed_at TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+
+        initialize_database(self.db_path).close()
+        initialize_database(self.db_path).close()
+
+        with sqlite3.connect(self.db_path) as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(import_layout_analysis_runs)"
+                )
+            }
+        self.assertTrue(
+            {
+                "manifest_sha256",
+                "manifest_byte_size",
+                "published_batch_id",
+                "source_pdf_sha256",
+                "render_manifest_sha256",
+            }
+            <= columns
+        )
+        self.connection = sqlite3.connect(self.db_path)
 
     def test_approval_source_is_constrained_and_migrated(self):
         columns = {

@@ -90,6 +90,15 @@ class PreviewUploadBodyLimitMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state["parsed"])
         self.assertEqual(413, sent[0]["status"])
 
+    async def test_layout_start_chunked_form_without_content_length_is_limited(self):
+        state, sent = await self.invoke(
+            [], [b"a" * 8, b"b" * 8], limit=10, path="/imports/123/layout"
+        )
+
+        self.assertTrue(state["downstream_called"])
+        self.assertFalse(state["parsed"])
+        self.assertEqual(413, sent[0]["status"])
+
 
 class UploadConfirmationWebTests(unittest.TestCase):
     def setUp(self):

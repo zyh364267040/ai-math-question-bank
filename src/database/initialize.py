@@ -68,6 +68,25 @@ def _ensure_schema_migrations(connection):
         connection.execute(
             "ALTER TABLE knowledge_points ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 1 CHECK (sort_order > 0)"
         )
+    layout_columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(import_layout_analysis_runs)"
+        )
+    }
+    layout_anchor_columns = {
+        "manifest_sha256": "TEXT CHECK (manifest_sha256 IS NULL OR length(manifest_sha256) = 64)",
+        "manifest_byte_size": "INTEGER CHECK (manifest_byte_size IS NULL OR manifest_byte_size > 0)",
+        "published_batch_id": "TEXT CHECK (published_batch_id IS NULL OR length(published_batch_id) BETWEEN 1 AND 64)",
+        "source_pdf_sha256": "TEXT CHECK (source_pdf_sha256 IS NULL OR length(source_pdf_sha256) = 64)",
+        "render_manifest_sha256": "TEXT CHECK (render_manifest_sha256 IS NULL OR length(render_manifest_sha256) = 64)",
+    }
+    for name, declaration in layout_anchor_columns.items():
+        if name not in layout_columns:
+            connection.execute(
+                f"ALTER TABLE import_layout_analysis_runs "
+                f"ADD COLUMN {name} {declaration}"
+            )
     question_columns = {row[1] for row in connection.execute("PRAGMA table_info(questions)")}
     if "answer_status" not in question_columns:
         # SQLite cannot drop the historic non-empty-answer CHECK in place.  This

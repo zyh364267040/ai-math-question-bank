@@ -27,6 +27,12 @@
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button class="button" type="submit">校验或重新处理</button>
     </form>
+    {% if run.import_status == 'pending' %}
+    <form method="post" action="/imports/{{ run.id }}/layout">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">开始版面分析</button>
+    </form>
+    {% endif %}
     <a class="button" href="/papers">返回试卷列表</a>
   {% elif run.status == 'pending' and run.import_status == 'pending' %}
     <form method="post" action="/imports/{{ run.id }}/render">

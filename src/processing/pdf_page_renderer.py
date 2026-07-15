@@ -119,7 +119,7 @@ def _read_regular_at(
     descriptor = os.open(name, flags, dir_fd=parent_fd)
     try:
         details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode):
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
             raise OSError("not a regular file")
         if expected_size is not None and details.st_size != expected_size:
             raise OSError("size mismatch")
