@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}导入新试卷 · AI 数学题库{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">IMPORT</p>
+  <h1>导入新试卷</h1>
+  <p><strong>上传预览不会入库，点击确认后才创建任务。</strong></p>
+</section>
+<form class="panel" method="post" action="/imports/preview" enctype="multipart/form-data">
+  {% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label>选择 PDF 文件 <input type="file" name="pdf_file" accept=".pdf,application/pdf" required></label>
+  <p>仅接受不超过 50 MiB 的 PDF。系统不会扫描桌面、下载目录或其他本地文件。</p>
+  <button type="submit">上传并预览</button>
+</form>
+{% endblock %}

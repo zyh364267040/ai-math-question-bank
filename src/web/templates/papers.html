@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}试卷与审核 · AI 数学题库{% endblock %}
 {% block content %}
-<section class="page-heading"><p class="eyebrow">PAPERS</p><h1>试卷与审核</h1><p>这里展示数据库中的真实导入任务。</p></section>
+<section class="page-heading"><p class="eyebrow">PAPERS</p><h1>试卷与审核</h1><p>这里展示数据库中的真实导入任务。上传预览不会入库，确认后也不会自动启动识别。</p><a class="button" href="/imports/new">导入新试卷</a></section>
 <section class="paper-list">
 {% for job in jobs %}
   <article class="paper-card">

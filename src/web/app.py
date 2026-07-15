@@ -20,6 +20,14 @@ from fastapi.templating import Jinja2Templates
 from PIL import Image, UnidentifiedImageError
 
 from src.database import baskets as basket_store
+from src.importing.pdf_intake import PdfIntakeError, intake_pdf
+from src.importing.upload_confirmation import (
+    UploadConfirmationError,
+    discard_staged_upload,
+    load_verified_upload,
+    stage_pdf_upload,
+    validate_import_metadata,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -843,6 +851,9 @@ def create_app(database_path=DEFAULT_DATABASE_PATH, private_root=DEFAULT_PRIVATE
         supplied = form.get("csrf_token", "")
         cookie = request.cookies.get("basket_csrf", "")
         if not supplied or not cookie or not hmac.compare_digest(str(supplied), cookie):
+            for _, value in form.multi_items():
+                if hasattr(value, "filename") and hasattr(value, "close"):
+                    await value.close()
             return None
         return form
 
@@ -917,6 +928,125 @@ def create_app(database_path=DEFAULT_DATABASE_PATH, private_root=DEFAULT_PRIVATE
         return templates.TemplateResponse(
             request=request, name="papers.html", context={"jobs": jobs}
         )
+
+    @application.get("/imports/new", response_class=HTMLResponse)
+    def new_import(request: Request):
+        return templates.TemplateResponse(request=request, name="import_upload.html")
+
+    @application.post("/imports/preview", response_class=HTMLResponse)
+    async def preview_import(request: Request):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        upload = form.get("pdf_file")
+        if upload is None or not hasattr(upload, "read"):
+            return templates.TemplateResponse(
+                request=request,
+                name="import_upload.html",
+                context={"error": "请选择 PDF 文件"},
+                status_code=400,
+            )
+        try:
+            try:
+                manifest = await stage_pdf_upload(upload, private_root)
+            except UploadConfirmationError as error:
+                return templates.TemplateResponse(
+                    request=request,
+                    name="import_upload.html",
+                    context={"error": str(error)},
+                    status_code=400,
+                )
+        finally:
+            await upload.close()
+        try:
+            with _connect(database_path) as connection:
+                regions = connection.execute(
+                    "SELECT code, name FROM regions WHERE is_active = 1 ORDER BY code"
+                ).fetchall()
+                exam_types = connection.execute(
+                    "SELECT code, name FROM exam_types WHERE is_active = 1 ORDER BY code"
+                ).fetchall()
+        except sqlite3.Error:
+            discard_staged_upload(private_root, manifest.token)
+            return _error(request, templates, "基础数据暂时无法读取", 500)
+        return templates.TemplateResponse(
+            request=request,
+            name="import_confirm.html",
+            context={
+                "manifest": manifest,
+                "regions": regions,
+                "exam_types": exam_types,
+                "paper_name": Path(manifest.original_filename).stem,
+                "page_range": f"1-{manifest.page_count}",
+            },
+        )
+
+    @application.post("/imports/{token}/confirm", response_class=HTMLResponse)
+    async def confirm_import(request: Request, token: str):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        try:
+            manifest, stored_path = load_verified_upload(private_root, token)
+            metadata = validate_import_metadata(form, manifest.page_count)
+            intake_pdf(
+                pdf_path=stored_path,
+                region_code=metadata.region_code,
+                exam_year=metadata.exam_year,
+                exam_type_code=metadata.exam_type_code,
+                paper_name=metadata.paper_name,
+                page_range=metadata.page_range,
+                database_path=database_path,
+                private_storage_root=private_root,
+            )
+        except (UploadConfirmationError, PdfIntakeError) as error:
+            error_message = str(error)
+            if isinstance(error, PdfIntakeError) and error_message.startswith(
+                "PDF 导入失败："
+            ):
+                error_message = "PDF 导入失败，请检查信息后重试"
+            try:
+                with _connect(database_path) as connection:
+                    regions = connection.execute(
+                        "SELECT code, name FROM regions WHERE is_active = 1 ORDER BY code"
+                    ).fetchall()
+                    exam_types = connection.execute(
+                        "SELECT code, name FROM exam_types WHERE is_active = 1 ORDER BY code"
+                    ).fetchall()
+            except sqlite3.Error:
+                return _error(request, templates, "基础数据暂时无法读取", 500)
+            context = {
+                "error": error_message,
+                "manifest": locals().get("manifest"),
+                "regions": regions,
+                "exam_types": exam_types,
+                "paper_name": str(form.get("paper_name", "")),
+                "exam_year": str(form.get("exam_year", "")),
+                "region_code": str(form.get("region_code", "")),
+                "exam_type_code": str(form.get("exam_type_code", "")),
+                "page_range": str(form.get("page_range", "")),
+            }
+            if context["manifest"] is None:
+                return _error(request, templates, str(error), 400)
+            return templates.TemplateResponse(
+                request=request,
+                name="import_confirm.html",
+                context=context,
+                status_code=400,
+            )
+        discard_staged_upload(private_root, token)
+        return RedirectResponse("/papers", status_code=303)
+
+    @application.post("/imports/{token}/cancel", response_class=HTMLResponse)
+    async def cancel_import(request: Request, token: str):
+        if await require_csrf(request) is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        try:
+            load_verified_upload(private_root, token)
+            discard_staged_upload(private_root, token)
+        except UploadConfirmationError as error:
+            return _error(request, templates, str(error), 400)
+        return RedirectResponse("/papers", status_code=303)
 
     def workbench_data(request, job_id, question_no):
         try:

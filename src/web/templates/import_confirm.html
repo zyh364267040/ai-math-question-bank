@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}确认导入 · AI 数学题库{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">CONFIRM IMPORT</p>
+  <h1>确认导入</h1>
+  <p><strong>上传预览不会入库，点击确认后才创建任务。</strong></p>
+</section>
+<section class="paper-card">
+  {% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
+  <h2>文件信息</h2>
+  <dl class="metadata">
+    <div><dt>原始文件名</dt><dd>{{ manifest.original_filename }}</dd></div>
+    <div><dt>文件大小</dt><dd>{{ '%.2f'|format(manifest.size / 1048576) }} MiB（{{ manifest.size }} 字节）</dd></div>
+    <div><dt>实际页数</dt><dd>{{ manifest.page_count }} 页</dd></div>
+    <div><dt>SHA-256</dt><dd>{{ manifest.sha256 }}</dd></div>
+  </dl>
+</section>
+<form class="panel" method="post" action="/imports/{{ manifest.token }}/confirm">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label>试卷名称 <input name="paper_name" value="{{ paper_name }}" required></label>
+  <label>地区 <select name="region_code">{% for item in regions %}<option value="{{ item.code }}"{% if item.code == region_code %} selected{% endif %}>{{ item.name }}</option>{% endfor %}</select></label>
+  <label>年份（可空） <input name="exam_year" value="{{ exam_year or '' }}" inputmode="numeric"></label>
+  <label>考试类型 <select name="exam_type_code">{% for item in exam_types %}<option value="{{ item.code }}"{% if item.code == exam_type_code %} selected{% endif %}>{{ item.name }}</option>{% endfor %}</select></label>
+  <label>页码范围 <input name="page_range" value="{{ page_range }}" required></label>
+  <button type="submit">确认导入</button>
+</form>
+<form method="post" action="/imports/{{ manifest.token }}/cancel">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit">取消</button>
+</form>
+{% endblock %}
