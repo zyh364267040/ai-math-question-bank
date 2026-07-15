@@ -14,6 +14,7 @@ from PIL import Image
 
 from src.database.initialize import initialize_database
 from src.processing.pdf_page_renderer import (
+    MIN_FREE_BYTES_AFTER_PAGE,
     PageRenderError,
     claim_render_job,
     render_import_job,
@@ -271,17 +272,17 @@ class PdfPageRendererTests(unittest.TestCase):
 
         from src.processing import pdf_page_renderer as renderer
 
-        real_verify = renderer._verify_png
+        real_verify = renderer._verify_png_at
         calls = 0
 
-        def fail_second(path, width, height):
+        def fail_second(parent_fd, name, width, height):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise RuntimeError(f"sensitive path: {self.root}")
-            return real_verify(path, width, height)
+            return real_verify(parent_fd, name, width, height)
 
-        with patch.object(renderer, "_verify_png", side_effect=fail_second):
+        with patch.object(renderer, "_verify_png_at", side_effect=fail_second):
             with self.assertRaisesRegex(PageRenderError, "页面处理失败，请重试"):
                 render_import_job(self.database_path, self.private_root, job_id)
 
@@ -384,6 +385,128 @@ class PdfPageRendererTests(unittest.TestCase):
         self.assertFalse((job_dir / "render_manifest.json").exists())
         self.assertEqual([], list(job_dir.glob(".render_batch.*")))
 
+    def test_job_directory_swap_after_workspace_open_never_writes_external(self):
+        job_id, _ = self.create_job(page_count=1, page_start=1, page_end=1)
+        job_dir = self.private_root / "processing" / f"import_job_{job_id}"
+        moved_job = job_dir.with_name(f"{job_dir.name}.moved")
+        external = self.root / "external-render-target"
+        external.mkdir()
+        (external / "sentinel").write_bytes(b"unchanged")
+        before = self.tree_snapshot(external)
+        from src.processing import pdf_page_renderer as renderer
+
+        real_set_total = renderer._set_total
+
+        def swap_after_workspace_open(connection, claimed_job_id, total):
+            real_set_total(connection, claimed_job_id, total)
+            job_dir.rename(moved_job)
+            job_dir.symlink_to(external, target_is_directory=True)
+
+        with patch.object(renderer, "_set_total", side_effect=swap_after_workspace_open):
+            with self.assertRaisesRegex(PageRenderError, "页面处理失败，请重试"):
+                render_import_job(self.database_path, self.private_root, job_id)
+
+        self.assertEqual(before, self.tree_snapshot(external))
+        self.assertFalse((external / "pages").exists())
+        self.assertFalse((external / "render_manifest.json").exists())
+        self.assertFalse((moved_job / "pages").exists())
+        self.assertFalse((moved_job / "render_manifest.json").exists())
+        self.assertEqual([], list(moved_job.glob(".render_batch.*")))
+        self.assertEqual([], list(moved_job.glob(".*backup*")))
+        with sqlite3.connect(self.database_path) as connection:
+            self.assertEqual(
+                ("failed", "页面处理失败，请重试"),
+                connection.execute(
+                    """SELECT status, error_message FROM import_page_render_runs
+                       WHERE import_job_id=?""",
+                    (job_id,),
+                ).fetchone(),
+            )
+
+    def test_job_directory_swap_at_each_batch_publish_rename_is_contained(self):
+        from src.processing import pdf_page_renderer as renderer
+
+        for boundary in (1, 2):
+            with self.subTest(boundary=boundary):
+                job_id, _ = self.create_job(
+                    page_count=1, page_start=1, page_end=1,
+                    name=f"publish-swap-{boundary}",
+                )
+                job_dir = self.private_root / "processing" / f"import_job_{job_id}"
+                moved_job = job_dir.with_name(f"{job_dir.name}.moved")
+                external = self.root / f"external-publish-{boundary}"
+                external.mkdir()
+                (external / "sentinel").write_bytes(b"unchanged")
+                before = self.tree_snapshot(external)
+                real_replace = renderer.os.replace
+                batch_renames = 0
+
+                def swap_on_boundary(source, destination, *args, **kwargs):
+                    nonlocal batch_renames
+                    if (
+                        source == destination
+                        and kwargs.get("src_dir_fd") != kwargs.get("dst_dir_fd")
+                    ):
+                        batch_renames += 1
+                        if batch_renames == boundary:
+                            job_dir.rename(moved_job)
+                            job_dir.symlink_to(external, target_is_directory=True)
+                    return real_replace(source, destination, *args, **kwargs)
+
+                with patch.object(renderer.os, "replace", side_effect=swap_on_boundary):
+                    with self.assertRaisesRegex(PageRenderError, "页面处理失败，请重试"):
+                        render_import_job(
+                            self.database_path, self.private_root, job_id
+                        )
+
+                self.assertEqual(before, self.tree_snapshot(external))
+                self.assertFalse((external / "pages").exists())
+                self.assertFalse((external / "render_manifest.json").exists())
+                self.assertFalse((moved_job / "pages").exists())
+                self.assertFalse((moved_job / "render_manifest.json").exists())
+                self.assertEqual([], list(moved_job.glob(".render_batch.*")))
+                self.assertEqual([], list(moved_job.glob(".*backup*")))
+
+    def test_job_directory_swap_after_database_completion_is_rolled_back(self):
+        job_id, _ = self.create_job(page_count=1, page_start=1, page_end=1)
+        job_dir = self.private_root / "processing" / f"import_job_{job_id}"
+        moved_job = job_dir.with_name(f"{job_dir.name}.moved-after-commit")
+        external = self.root / "external-after-db-completion"
+        external.mkdir()
+        (external / "sentinel").write_bytes(b"unchanged")
+        before = self.tree_snapshot(external)
+        from src.processing import pdf_page_renderer as renderer
+
+        real_mark_completed = renderer._mark_completed
+
+        def commit_then_swap(connection, claimed_job_id, total):
+            real_mark_completed(connection, claimed_job_id, total)
+            job_dir.rename(moved_job)
+            job_dir.symlink_to(external, target_is_directory=True)
+
+        with patch.object(
+            renderer, "_mark_completed", side_effect=commit_then_swap
+        ):
+            with self.assertRaisesRegex(PageRenderError, "页面处理失败，请重试"):
+                render_import_job(self.database_path, self.private_root, job_id)
+
+        self.assertEqual(before, self.tree_snapshot(external))
+        self.assertFalse((external / "pages").exists())
+        self.assertFalse((external / "render_manifest.json").exists())
+        self.assertFalse((moved_job / "pages").exists())
+        self.assertFalse((moved_job / "render_manifest.json").exists())
+        self.assertEqual([], list(moved_job.glob(".render_batch.*")))
+        self.assertEqual([], list(moved_job.glob(".*backup*")))
+        with sqlite3.connect(self.database_path) as connection:
+            self.assertEqual(
+                ("failed", "页面处理失败，请重试"),
+                connection.execute(
+                    """SELECT status, error_message FROM import_page_render_runs
+                       WHERE import_job_id=?""",
+                    (job_id,),
+                ).fetchone(),
+            )
+
     def test_publish_replace_failure_rolls_back_old_complete_result(self):
         job_id, _ = self.create_job(page_count=1, page_start=1, page_end=1)
         render_import_job(self.database_path, self.private_root, job_id)
@@ -404,13 +527,13 @@ class PdfPageRendererTests(unittest.TestCase):
 
         real_replace = renderer.os.replace
 
-        def fail_new_pages(source, destination):
-            source_path = Path(source)
-            if source_path.name == "pages" and source_path.parent.name.startswith(
-                ".render_batch."
+        def fail_new_pages(source, destination, *args, **kwargs):
+            if (
+                source == destination == "pages"
+                and kwargs.get("src_dir_fd") != kwargs.get("dst_dir_fd")
             ):
                 raise OSError("publish failure")
-            return real_replace(source, destination)
+            return real_replace(source, destination, *args, **kwargs)
 
         with patch.object(renderer.os, "replace", side_effect=fail_new_pages):
             with self.assertRaisesRegex(PageRenderError, "页面处理失败，请重试"):
@@ -466,9 +589,108 @@ class PdfPageRendererTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(("processing", 300, 0), run)
 
+    def test_global_render_lock_allows_only_one_job_then_retry(self):
+        first_id, _ = self.create_job(
+            page_count=1, page_start=1, page_end=1, name="global-first"
+        )
+        second_id, _ = self.create_job(
+            page_count=1, page_start=1, page_end=1, name="global-second"
+        )
+
+        first = claim_render_job(
+            self.database_path, self.private_root, first_id
+        )
+        self.assertIsNotNone(first)
+        second = claim_render_job(
+            self.database_path, self.private_root, second_id
+        )
+        if second is not None:
+            second.close()
+        self.assertIsNone(second)
+        first.close()
+
+        retried = claim_render_job(
+            self.database_path, self.private_root, second_id
+        )
+        self.assertIsNotNone(retried)
+        retried.close()
+
+    def test_low_disk_space_at_start_or_before_page_cleans_all_output(self):
+        from src.processing import pdf_page_renderer as renderer
+
+        for index, available in enumerate(
+            (
+                [MIN_FREE_BYTES_AFTER_PAGE - 1],
+                [MIN_FREE_BYTES_AFTER_PAGE + 1024 * 1024, MIN_FREE_BYTES_AFTER_PAGE],
+            ),
+            start=1,
+        ):
+            with self.subTest(index=index):
+                job_id, _ = self.create_job(
+                    page_count=1, page_start=1, page_end=1,
+                    name=f"disk-space-{index}",
+                )
+                with patch.object(renderer, "_available_bytes", side_effect=available):
+                    with self.assertRaisesRegex(PageRenderError, "超过安全处理限制"):
+                        render_import_job(
+                            self.database_path, self.private_root, job_id
+                        )
+                job_dir = self.private_root / "processing" / f"import_job_{job_id}"
+                self.assertFalse((job_dir / "pages").exists())
+                self.assertFalse((job_dir / "render_manifest.json").exists())
+                self.assertEqual([], list(job_dir.glob(".render_batch.*")))
+                with sqlite3.connect(self.database_path) as connection:
+                    self.assertEqual(
+                        ("failed", "PDF 页数或页面尺寸超过安全处理限制"),
+                        connection.execute(
+                            """SELECT status, error_message
+                               FROM import_page_render_runs WHERE import_job_id=?""",
+                            (job_id,),
+                        ).fetchone(),
+                    )
+
+    def test_claim_sqlite_error_is_fixed_and_releases_every_lock(self):
+        job_id, _ = self.create_job(
+            page_count=1, page_start=1, page_end=1, name="claim-sqlite"
+        )
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "DELETE FROM import_page_render_runs WHERE import_job_id=?", (job_id,)
+            )
+        from src.processing import pdf_page_renderer as renderer
+
+        real_connect = renderer.sqlite3.connect
+        calls = 0
+
+        def fail_claim_transaction(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise sqlite3.OperationalError(f"secret database {self.root}")
+            return real_connect(*args, **kwargs)
+
+        with patch.object(
+            renderer.sqlite3, "connect", side_effect=fail_claim_transaction
+        ):
+            with self.assertRaisesRegex(
+                PageRenderError, "页面处理任务暂时无法启动"
+            ) as raised:
+                claim_render_job(self.database_path, self.private_root, job_id)
+        self.assertNotIn(str(self.root), str(raised.exception))
+
+        retry = claim_render_job(
+            self.database_path, self.private_root, job_id
+        )
+        self.assertIsNotNone(retry)
+        retry.close()
+
     def test_claim_rejects_symlinked_output_roots_and_lock_files(self):
         for index, case in enumerate(
-            ("private_root", "processing", "lock_dir", "lock_file"), start=1
+            (
+                "private_root", "processing", "lock_dir", "global_lock",
+                "lock_file", "hardlinked_lock",
+            ),
+            start=1,
         ):
             with self.subTest(case=case):
                 actual_root = self.root / f"safe-root-{index}"
@@ -492,11 +714,21 @@ class PdfPageRendererTests(unittest.TestCase):
                         lock_dir = processing / ".render_locks"
                         if case == "lock_dir":
                             lock_dir.symlink_to(external, target_is_directory=True)
-                        else:
+                        elif case == "global_lock":
+                            lock_dir.mkdir()
+                            (lock_dir / "global.lock").symlink_to(
+                                external / "sentinel"
+                            )
+                        elif case == "lock_file":
                             lock_dir.mkdir()
                             (lock_dir / f"import_job_{job_id}.lock").symlink_to(
                                 external / "sentinel"
                             )
+                        else:
+                            lock_dir.mkdir()
+                            unsafe = lock_dir / f"import_job_{job_id}.lock"
+                            unsafe.write_bytes(b"lock")
+                            os.link(unsafe, external / "second-link")
                 before = self.tree_snapshot(external)
 
                 with self.assertRaisesRegex(PageRenderError, "暂时无法启动"):

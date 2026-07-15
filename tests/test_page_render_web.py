@@ -138,6 +138,8 @@ class PageRenderWebTests(unittest.TestCase):
         processing = self.client.get(f"/imports/{self.job_id}/processing")
         self.assertIn("页面处理中", processing.text)
         self.assertIn('http-equiv="refresh"', processing.text)
+        self.assertIn("继续或检查页面处理", processing.text)
+        self.assertIn(f'action="/imports/{self.job_id}/render"', processing.text)
 
         with sqlite3.connect(self.database_path) as connection:
             connection.execute(
@@ -166,6 +168,80 @@ class PageRenderWebTests(unittest.TestCase):
         self.assertNotIn(
             f'action="/imports/{self.job_id}/render"', papers.text
         )
+
+    def test_stale_processing_post_starts_one_worker_and_completes(self):
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                """INSERT INTO import_page_render_runs
+                   (import_job_id,status,dpi,total_pages,rendered_pages)
+                   VALUES (?,'processing',300,1,0)""",
+                (self.job_id,),
+            )
+
+        response = self.client.post(
+            f"/imports/{self.job_id}/render",
+            data={"csrf_token": self.csrf},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, response.status_code)
+        self.assertEqual(
+            f"/imports/{self.job_id}/processing", response.headers["location"]
+        )
+        with sqlite3.connect(self.database_path) as connection:
+            self.assertEqual(
+                ("completed", 1),
+                connection.execute(
+                    """SELECT status, rendered_pages FROM import_page_render_runs
+                       WHERE import_job_id=?""",
+                    (self.job_id,),
+                ).fetchone(),
+            )
+
+    def test_processing_post_does_not_start_worker_while_claim_lock_is_active(self):
+        from src.processing.pdf_page_renderer import claim_render_job
+
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                """INSERT INTO import_page_render_runs
+                   (import_job_id,status,dpi,total_pages,rendered_pages)
+                   VALUES (?,'processing',300,1,0)""",
+                (self.job_id,),
+            )
+        active = claim_render_job(
+            self.database_path, self.private_root, self.job_id
+        )
+        self.assertIsNotNone(active)
+        try:
+            with patch("src.web.app.run_claimed_render") as worker:
+                response = self.client.post(
+                    f"/imports/{self.job_id}/render",
+                    data={"csrf_token": self.csrf},
+                    follow_redirects=False,
+                )
+            self.assertEqual(303, response.status_code)
+            worker.assert_not_called()
+        finally:
+            active.close()
+
+    def test_processing_recovery_post_still_requires_csrf(self):
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                """INSERT INTO import_page_render_runs
+                   (import_job_id,status,dpi,total_pages,rendered_pages)
+                   VALUES (?,'processing',300,1,0)""",
+                (self.job_id,),
+            )
+
+        with patch("src.web.app.run_claimed_render") as worker:
+            response = self.client.post(
+                f"/imports/{self.job_id}/render",
+                data={"csrf_token": "invalid"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(403, response.status_code)
+        worker.assert_not_called()
 
     def test_unknown_processing_page_is_404(self):
         response = self.client.get("/imports/999999/processing")

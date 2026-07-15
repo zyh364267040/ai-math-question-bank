@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import io
 import json
 import math
 import os
-import shutil
+import secrets
 import sqlite3
 import stat
-import tempfile
-import fcntl
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -27,6 +26,7 @@ MAX_PAGE_PIXELS = 40_000_000
 MAX_TOTAL_RENDER_PIXELS = 400_000_000
 MAX_RENDER_OUTPUT_BYTES = 1024 * 1024 * 1024
 MAX_SOURCE_BYTES = 100 * 1024 * 1024
+MIN_FREE_BYTES_AFTER_PAGE = 512 * 1024 * 1024
 MANIFEST_VERSION = 1
 
 SAFE_SOURCE_ERROR = "归档 PDF 校验失败，请重新导入后重试"
@@ -49,15 +49,28 @@ class RenderClaim:
     job_id: int
     dpi: int
     lock_stream: object
+    global_lock_stream: object
 
     def close(self) -> None:
         """Release the process lock; safe to call repeatedly."""
-        if self.lock_stream is not None:
-            try:
-                fcntl.flock(self.lock_stream.fileno(), fcntl.LOCK_UN)
-            finally:
-                self.lock_stream.close()
-                self.lock_stream = None
+        streams = (self.lock_stream, self.global_lock_stream)
+        self.lock_stream = self.global_lock_stream = None
+        _close_lock_streams(*streams)
+
+
+def _close_lock_streams(*streams) -> None:
+    """Best-effort unlock and close for partially or fully acquired claims."""
+    for stream in streams:
+        if stream is None:
+            continue
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            stream.close()
+        except OSError:
+            pass
 
 
 def _open_safe_directory(path: Path) -> int:
@@ -129,60 +142,172 @@ def _read_regular_at(
         os.close(descriptor)
 
 
-def _prepare_lock_stream(private_root: Path, job_id: int):
-    """Open the fixed lock as a single-link regular file beneath safe directories."""
+def _prepare_lock_streams(private_root: Path, job_id: int):
+    """Open global and per-job single-link regular locks beneath safe directories."""
     root_fd = processing_fd = locks_fd = None
-    lock_fd = None
+    streams = []
     try:
         root_fd = _open_safe_directory(private_root)
         processing_fd = _open_or_create_directory(root_fd, "processing")
         locks_fd = _open_or_create_directory(processing_fd, ".render_locks")
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        lock_name = f"import_job_{job_id}.lock"
-        try:
-            lock_fd = os.open(lock_name, flags, 0o600, dir_fd=locks_fd)
-        except FileNotFoundError:
-            # macOS can transiently report ENOENT when two threads create the
-            # same parent/file at once.  Retry only against the still-open,
-            # O_NOFOLLOW-verified directory descriptor.
-            lock_fd = os.open(lock_name, flags, 0o600, dir_fd=locks_fd)
-        details = os.fstat(lock_fd)
-        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
-            raise OSError("unsafe lock")
-        stream = os.fdopen(lock_fd, "a+b")
-        lock_fd = None
-        return stream
+        for lock_name in ("global.lock", f"import_job_{job_id}.lock"):
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                lock_fd = os.open(lock_name, flags, 0o600, dir_fd=locks_fd)
+            except FileNotFoundError:
+                lock_fd = os.open(lock_name, flags, 0o600, dir_fd=locks_fd)
+            details = os.fstat(lock_fd)
+            if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+                os.close(lock_fd)
+                raise OSError("unsafe lock")
+            streams.append(os.fdopen(lock_fd, "a+b"))
+        return tuple(streams)
+    except Exception:
+        for stream in streams:
+            stream.close()
+        raise
     finally:
-        if lock_fd is not None:
-            os.close(lock_fd)
         for descriptor in (locks_fd, processing_fd, root_fd):
             if descriptor is not None:
                 os.close(descriptor)
 
 
-def _prepare_job_directory(private_root: Path, job_id: int) -> Path:
-    """Create/open the fixed job directory and reject linked formal outputs."""
-    root_fd = processing_fd = job_fd = None
+def _remove_tree_at(parent_fd: int, name: str) -> None:
+    """Remove one child tree without ever following a symlink."""
     try:
-        root_fd = _open_safe_directory(private_root)
-        processing_fd = _open_or_create_directory(root_fd, "processing")
-        job_name = f"import_job_{job_id}"
-        job_fd = _open_or_create_directory(processing_fd, job_name)
-        for name, expected in (
-            ("pages", stat.S_ISDIR), ("render_manifest.json", stat.S_ISREG)
-        ):
-            try:
-                details = os.stat(name, dir_fd=job_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            if stat.S_ISLNK(details.st_mode) or not expected(details.st_mode):
-                raise OSError("unsafe formal output")
-        return private_root / "processing" / job_name
+        details = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(details.st_mode):
+        os.unlink(name, dir_fd=parent_fd)
+        return
+    child_fd = _open_child_directory(parent_fd, name)
+    try:
+        for child_name in os.listdir(child_fd):
+            _remove_tree_at(child_fd, child_name)
     finally:
-        for descriptor in (job_fd, processing_fd, root_fd):
+        os.close(child_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _write_new_regular_at(parent_fd: int, name: str, content: bytes) -> None:
+    """Create, fully write, and sync one new regular file beneath a pinned fd."""
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
+        os.fsync(descriptor)
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            raise OSError("unsafe output")
+    finally:
+        os.close(descriptor)
+
+
+def _available_bytes(descriptor: int) -> int:
+    """Return bytes available to an unprivileged writer on the pinned filesystem."""
+    details = os.fstatvfs(descriptor)
+    return details.f_bavail * details.f_frsize
+
+
+@dataclass
+class RenderWorkspace:
+    """Pinned render workspace whose operations never re-resolve configured paths."""
+
+    root_fd: int
+    processing_fd: int
+    job_fd: int
+    job_name: str
+    device: int
+    inode: int
+    batch_name: str | None = None
+    batch_fd: int | None = None
+    pages_fd: int | None = None
+
+    @classmethod
+    def open(cls, private_root: Path, job_id: int) -> RenderWorkspace:
+        root_fd = processing_fd = job_fd = None
+        try:
+            root_fd = _open_safe_directory(private_root)
+            processing_fd = _open_or_create_directory(root_fd, "processing")
+            job_name = f"import_job_{job_id}"
+            job_fd = _open_or_create_directory(processing_fd, job_name)
+            for name, expected in (
+                ("pages", stat.S_ISDIR), ("render_manifest.json", stat.S_ISREG)
+            ):
+                try:
+                    details = os.stat(name, dir_fd=job_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(details.st_mode) or not expected(details.st_mode):
+                    raise OSError("unsafe formal output")
+            details = os.fstat(job_fd)
+            workspace = cls(
+                root_fd, processing_fd, job_fd, job_name,
+                details.st_dev, details.st_ino,
+            )
+            workspace.assert_attached()
+            root_fd = processing_fd = job_fd = None
+            return workspace
+        finally:
+            for descriptor in (job_fd, processing_fd, root_fd):
+                if descriptor is not None:
+                    os.close(descriptor)
+
+    def assert_attached(self) -> None:
+        """Require the fixed processing entry to remain the pinned job inode."""
+        current = os.stat(
+            self.job_name, dir_fd=self.processing_fd, follow_symlinks=False
+        )
+        pinned = os.fstat(self.job_fd)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (self.device, self.inode)
+            or (pinned.st_dev, pinned.st_ino) != (self.device, self.inode)
+        ):
+            raise OSError("job directory replaced")
+
+    def create_batch(self) -> None:
+        """Create one unpredictable fixed-name batch beneath the pinned job fd."""
+        for _ in range(8):
+            name = f".render_batch.{secrets.token_hex(16)}"
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=self.job_fd)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError("unable to allocate batch")
+        self.batch_name = name
+        self.batch_fd = _open_child_directory(self.job_fd, name)
+        os.mkdir("pages", mode=0o700, dir_fd=self.batch_fd)
+        self.pages_fd = _open_child_directory(self.batch_fd, "pages")
+
+    def close(self) -> None:
+        """Close descriptors and remove only this fixed batch through the job fd."""
+        for attribute in ("pages_fd", "batch_fd"):
+            descriptor = getattr(self, attribute)
             if descriptor is not None:
                 os.close(descriptor)
+                setattr(self, attribute, None)
+        if self.batch_name is not None:
+            try:
+                _remove_tree_at(self.job_fd, self.batch_name)
+            except OSError:
+                pass
+            self.batch_name = None
+        for attribute in ("job_fd", "processing_fd", "root_fd"):
+            descriptor = getattr(self, attribute)
+            if descriptor is not None:
+                os.close(descriptor)
+                setattr(self, attribute, None)
 
 
 def _pending_job_exists(database_path: Path, job_id: int) -> bool:
@@ -210,14 +335,23 @@ def claim_render_job(
     database_path = Path(database_path)
     private_root = Path(private_root)
     _pending_job_exists(database_path, job_id)
+    global_lock_stream = lock_stream = None
     try:
-        lock_stream = _prepare_lock_stream(private_root, job_id)
+        global_lock_stream, lock_stream = _prepare_lock_streams(private_root, job_id)
+        try:
+            fcntl.flock(
+                global_lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+            )
+        except BlockingIOError:
+            _close_lock_streams(lock_stream, global_lock_stream)
+            return None
         try:
             fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            lock_stream.close()
+            _close_lock_streams(lock_stream, global_lock_stream)
             return None
     except OSError as error:
+        _close_lock_streams(lock_stream, global_lock_stream)
         _mark_failed(database_path, job_id, SAFE_RENDER_ERROR)
         raise PageRenderError("页面处理任务暂时无法启动") from error
 
@@ -252,10 +386,15 @@ def claim_render_job(
                        WHERE import_job_id=?""",
                     (dpi, now, now, job_id),
                 )
+    except sqlite3.Error as error:
+        _close_lock_streams(lock_stream, global_lock_stream)
+        raise PageRenderError("页面处理任务暂时无法启动") from error
     except Exception:
-        lock_stream.close()
+        _close_lock_streams(lock_stream, global_lock_stream)
         raise
-    return RenderClaim(database_path, private_root, job_id, dpi, lock_stream)
+    return RenderClaim(
+        database_path, private_root, job_id, dpi, lock_stream, global_lock_stream
+    )
 
 
 def run_claimed_render(claim: RenderClaim):
@@ -490,29 +629,26 @@ def _verify_png_bytes(content: bytes, width: int, height: int) -> tuple[int, str
     return len(content), _sha256_bytes(content)
 
 
-def _verify_png(path: Path, width: int, height: int) -> tuple[int, str]:
-    """Open a generated temporary PNG without following a replaced symlink."""
-    parent_fd = None
+def _verify_png_at(
+    parent_fd: int, name: str, width: int, height: int
+) -> tuple[int, str]:
+    """Verify a generated PNG by reading it from an already pinned directory."""
     try:
-        parent_fd = _open_safe_directory(path.parent)
         content = _read_regular_at(
-            parent_fd, path.name, max_bytes=200 * 1024 * 1024
+            parent_fd, name, max_bytes=200 * 1024 * 1024
         )
         return _verify_png_bytes(content, width, height)
     except PageRenderError:
         raise
     except OSError as error:
         raise PageRenderError(SAFE_RENDER_ERROR) from error
-    finally:
-        if parent_fd is not None:
-            os.close(parent_fd)
 
 
 @dataclass
 class _PublishHandle:
-    job_dir: Path
-    backup_pages: Path
-    backup_manifest: Path
+    workspace: RenderWorkspace
+    backup_pages: str
+    backup_manifest: str
     had_pages: bool
     had_manifest: bool
     pages_installed: bool = False
@@ -521,44 +657,70 @@ class _PublishHandle:
 
 def _rollback_publish(handle: _PublishHandle) -> None:
     """Remove the new pair and restore every previous formal output."""
-    pages = handle.job_dir / "pages"
-    manifest = handle.job_dir / "render_manifest.json"
-    if handle.pages_installed and pages.exists():
-        shutil.rmtree(pages)
-    if handle.manifest_installed and manifest.exists():
-        manifest.unlink()
-    if handle.backup_pages.exists():
-        os.replace(handle.backup_pages, pages)
-    if handle.backup_manifest.exists():
-        os.replace(handle.backup_manifest, manifest)
-    shutil.rmtree(handle.backup_pages, ignore_errors=True)
-    handle.backup_manifest.unlink(missing_ok=True)
+    job_fd = handle.workspace.job_fd
+    if handle.pages_installed:
+        _remove_tree_at(job_fd, "pages")
+    if handle.manifest_installed:
+        _remove_tree_at(job_fd, "render_manifest.json")
+    if _exists_at(job_fd, handle.backup_pages):
+        os.replace(
+            handle.backup_pages, "pages", src_dir_fd=job_fd, dst_dir_fd=job_fd
+        )
+    if _exists_at(job_fd, handle.backup_manifest):
+        os.replace(
+            handle.backup_manifest, "render_manifest.json",
+            src_dir_fd=job_fd, dst_dir_fd=job_fd,
+        )
+    _remove_tree_at(job_fd, handle.backup_pages)
+    _remove_tree_at(job_fd, handle.backup_manifest)
 
 
 def _finalize_publish(handle: _PublishHandle) -> None:
     """Delete retained backups after the database completion commit succeeds."""
-    if handle.backup_pages.exists():
-        shutil.rmtree(handle.backup_pages, ignore_errors=False)
-    handle.backup_manifest.unlink(missing_ok=True)
+    _remove_tree_at(handle.workspace.job_fd, handle.backup_pages)
+    _remove_tree_at(handle.workspace.job_fd, handle.backup_manifest)
 
 
-def _publish(job_dir: Path, batch: Path) -> _PublishHandle:
+def _exists_at(parent_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _publish(workspace: RenderWorkspace) -> _PublishHandle:
     """Install a new pair while retaining old files for a later DB rollback."""
-    pages = job_dir / "pages"
-    manifest = job_dir / "render_manifest.json"
-    backup_pages = job_dir / f".pages.backup.{batch.name}"
-    backup_manifest = job_dir / f".manifest.backup.{batch.name}"
+    if workspace.batch_fd is None or workspace.batch_name is None:
+        raise PageRenderError(SAFE_RENDER_ERROR)
+    job_fd = workspace.job_fd
+    batch_fd = workspace.batch_fd
+    backup_pages = f".pages.backup.{workspace.batch_name}"
+    backup_manifest = f".manifest.backup.{workspace.batch_name}"
     handle = _PublishHandle(
-        job_dir, backup_pages, backup_manifest, pages.exists(), manifest.exists()
+        workspace, backup_pages, backup_manifest,
+        _exists_at(job_fd, "pages"), _exists_at(job_fd, "render_manifest.json")
     )
     try:
         if handle.had_pages:
-            os.replace(pages, backup_pages)
+            workspace.assert_attached()
+            os.replace(
+                "pages", backup_pages, src_dir_fd=job_fd, dst_dir_fd=job_fd
+            )
         if handle.had_manifest:
-            os.replace(manifest, backup_manifest)
-        os.replace(batch / "pages", pages)
+            workspace.assert_attached()
+            os.replace(
+                "render_manifest.json", backup_manifest,
+                src_dir_fd=job_fd, dst_dir_fd=job_fd,
+            )
+        workspace.assert_attached()
+        os.replace("pages", "pages", src_dir_fd=batch_fd, dst_dir_fd=job_fd)
         handle.pages_installed = True
-        os.replace(batch / "render_manifest.json", manifest)
+        workspace.assert_attached()
+        os.replace(
+            "render_manifest.json", "render_manifest.json",
+            src_dir_fd=batch_fd, dst_dir_fd=job_fd,
+        )
         handle.manifest_installed = True
     except OSError as error:
         try:
@@ -575,7 +737,7 @@ def render_import_job(database_path, private_root, job_id: int, dpi: int = DEFAU
         raise PageRenderError("页面处理参数无效")
     database_path = Path(database_path)
     private_root = Path(private_root)
-    batch = None
+    workspace = None
     document = None
     try:
         with sqlite3.connect(database_path) as connection:
@@ -621,13 +783,16 @@ def render_import_job(database_path, private_root, job_id: int, dpi: int = DEFAU
                 )
 
             try:
-                job_dir = _prepare_job_directory(private_root, job_id)
+                workspace = RenderWorkspace.open(private_root, job_id)
+                if _available_bytes(workspace.job_fd) < MIN_FREE_BYTES_AFTER_PAGE:
+                    raise PageRenderError(SAFE_LIMIT_ERROR)
+            except PageRenderError:
+                raise
             except OSError as error:
                 raise PageRenderError(SAFE_RENDER_ERROR) from error
             _set_total(connection, job_id, total)
-            batch = Path(tempfile.mkdtemp(prefix=".render_batch.", dir=job_dir))
-            pages_dir = batch / "pages"
-            pages_dir.mkdir()
+            workspace.assert_attached()
+            workspace.create_batch()
             entries = []
             output_bytes = 0
             matrix = pymupdf.Matrix(dpi / 72, dpi / 72)
@@ -637,13 +802,20 @@ def render_import_job(database_path, private_root, job_id: int, dpi: int = DEFAU
                 )
                 if (pixmap.width, pixmap.height) != (width, height):
                     raise PageRenderError(SAFE_RENDER_ERROR)
-                path = pages_dir / f"page_{number:03d}.png"
+                name = f"page_{number:03d}.png"
                 png_content = pixmap.tobytes("png")
                 output_bytes += len(png_content)
                 if output_bytes > MAX_RENDER_OUTPUT_BYTES:
                     raise PageRenderError(SAFE_LIMIT_ERROR)
-                path.write_bytes(png_content)
-                byte_size, digest = _verify_png(path, width, height)
+                if (
+                    _available_bytes(workspace.job_fd) - len(png_content)
+                    < MIN_FREE_BYTES_AFTER_PAGE
+                ):
+                    raise PageRenderError(SAFE_LIMIT_ERROR)
+                _write_new_regular_at(workspace.pages_fd, name, png_content)
+                byte_size, digest = _verify_png_at(
+                    workspace.pages_fd, name, width, height
+                )
                 entries.append(
                     {
                         "page_number": number,
@@ -666,16 +838,22 @@ def render_import_job(database_path, private_root, job_id: int, dpi: int = DEFAU
                 "page_count": total,
                 "pages": entries,
             }
-            manifest_path = batch / "render_manifest.json"
-            manifest_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
+            manifest_content = (
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+            ).encode("utf-8")
+            _write_new_regular_at(
+                workspace.batch_fd, "render_manifest.json", manifest_content
             )
-            if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:
+            saved_manifest = _read_regular_at(
+                workspace.batch_fd, "render_manifest.json", max_bytes=10 * 1024 * 1024
+            )
+            if json.loads(saved_manifest.decode("utf-8")) != manifest:
                 raise PageRenderError(SAFE_RENDER_ERROR)
-            publish = _publish(job_dir, batch)
+            publish = _publish(workspace)
             try:
+                workspace.assert_attached()
                 _mark_completed(connection, job_id, total)
+                workspace.assert_attached()
             except Exception:
                 try:
                     _rollback_publish(publish)
@@ -696,5 +874,5 @@ def render_import_job(database_path, private_root, job_id: int, dpi: int = DEFAU
     finally:
         if document is not None:
             document.close()
-        if batch is not None:
-            shutil.rmtree(batch, ignore_errors=True)
+        if workspace is not None:
+            workspace.close()
