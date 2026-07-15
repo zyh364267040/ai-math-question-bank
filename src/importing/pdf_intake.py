@@ -105,8 +105,15 @@ def intake_pdf(
     page_range=None,
     database_path=DEFAULT_DATABASE_PATH,
     private_storage_root=DEFAULT_PRIVATE_STORAGE_ROOT,
+    idempotency_key=None,
 ):
     """Archive one PDF and create a pending import job; return a JSON-safe dict."""
+    if idempotency_key is not None and (
+        not isinstance(idempotency_key, str)
+        or not idempotency_key.strip()
+        or len(idempotency_key) > 200
+    ):
+        raise PdfIntakeError("幂等键必须是 1 至 200 个字符的字符串")
     source_path = Path(pdf_path).expanduser()
     file_size = _validate_source(source_path)
     if exam_year is not None and (
@@ -129,6 +136,26 @@ def intake_pdf(
         _validate_dictionary(connection, "regions", region_code, "地区")
         _validate_dictionary(connection, "exam_types", exam_type_code, "考试类型")
         connection.execute("BEGIN IMMEDIATE")
+        if idempotency_key is not None:
+            receipt = connection.execute(
+                """SELECT r.source_paper_id, r.import_job_id, p.stored_path,
+                          p.sha256, j.status
+                   FROM import_upload_receipts AS r
+                   JOIN source_papers AS p ON p.id = r.source_paper_id
+                   JOIN import_jobs AS j ON j.id = r.import_job_id
+                   WHERE r.token = ?""",
+                (idempotency_key,),
+            ).fetchone()
+            if receipt is not None:
+                connection.commit()
+                return {
+                    "source_paper_id": receipt[0],
+                    "import_job_id": receipt[1],
+                    "stored_path": receipt[2],
+                    "sha256": receipt[3],
+                    "deduplicated": True,
+                    "status": receipt[4],
+                }
         existing = connection.execute(
             "SELECT id, stored_path FROM source_papers WHERE sha256 = ?", (digest,)
         ).fetchone()
@@ -177,6 +204,12 @@ def intake_pdf(
                VALUES (?, ?, ?, 'pending')""",
             (source_paper_id, page_start, page_end),
         ).lastrowid
+        if idempotency_key is not None:
+            connection.execute(
+                """INSERT INTO import_upload_receipts
+                   (token, source_paper_id, import_job_id) VALUES (?, ?, ?)""",
+                (idempotency_key, source_paper_id, import_job_id),
+            )
         connection.commit()
         return {
             "source_paper_id": source_paper_id,
@@ -199,6 +232,18 @@ def intake_pdf(
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+        connection.close()
+
+
+def has_intake_receipt(database_path, idempotency_key):
+    """Return whether a committed intake exists for an upload token."""
+    connection = initialize_database(database_path)
+    try:
+        return connection.execute(
+            "SELECT 1 FROM import_upload_receipts WHERE token = ?",
+            (idempotency_key,),
+        ).fetchone() is not None
+    finally:
         connection.close()
 
 

@@ -70,6 +70,23 @@ class PdfIntakeTests(unittest.TestCase):
         self.assertEqual(2, len(self.rows("import_jobs")))
         self.assertEqual(1, len(list(self.storage_root.rglob("*.pdf"))))
 
+    def test_same_idempotency_key_returns_original_job(self):
+        first = self.intake(idempotency_key="upload-token-1")
+        second = self.intake(page_range="3", idempotency_key="upload-token-1")
+
+        self.assertEqual(first["source_paper_id"], second["source_paper_id"])
+        self.assertEqual(first["import_job_id"], second["import_job_id"])
+        self.assertEqual(1, len(self.rows("source_papers")))
+        self.assertEqual(1, len(self.rows("import_jobs")))
+
+    def test_different_idempotency_keys_keep_existing_duplicate_semantics(self):
+        first = self.intake(idempotency_key="upload-token-1")
+        second = self.intake(page_range="3", idempotency_key="upload-token-2")
+
+        self.assertEqual(first["source_paper_id"], second["source_paper_id"])
+        self.assertNotEqual(first["import_job_id"], second["import_job_id"])
+        self.assertEqual(2, len(self.rows("import_jobs")))
+
     def test_duplicate_with_missing_archive_is_rejected_without_new_job(self):
         first = self.intake()
         (self.storage_root / first["stored_path"]).unlink()

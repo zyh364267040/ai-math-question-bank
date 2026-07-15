@@ -1,11 +1,15 @@
 """Private, atomic staging for user-selected PDF import confirmation."""
 
 import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
 import shutil
+import fcntl
+import stat
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 
@@ -16,6 +20,16 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 PDF_HEADER = b"%PDF-"
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 MANIFEST_FILENAME = "manifest.json"
+MANIFEST_HMAC_KEY_FILENAME = ".upload_manifest_hmac.key"
+SIGNED_MANIFEST_FIELDS = (
+    "token",
+    "original_filename",
+    "stored_filename",
+    "size",
+    "sha256",
+    "page_count",
+)
+MANIFEST_FIELDS = {*SIGNED_MANIFEST_FIELDS, "signature"}
 PAGE_RANGE_PATTERN = re.compile(r"([1-9]\d*)(?:-([1-9]\d*))?\Z")
 
 
@@ -39,6 +53,7 @@ class UploadManifest:
     size: int
     sha256: str
     page_count: int
+    signature: str
 
 
 @dataclass(frozen=True)
@@ -64,12 +79,154 @@ def _pending_root(private_root):
     return Path(private_root) / "pending_uploads"
 
 
+def _ensure_real_directory(path, *, create=False, parents=False):
+    path = Path(path)
+    try:
+        if create:
+            path.mkdir(parents=parents, exist_ok=True)
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise UploadConfirmationError("暂存目录不可用，请重试") from error
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise UploadConfirmationError("暂存目录不可用，请重试")
+    return path
+
+
+def _read_regular_file(path, *, max_bytes=None):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise OSError("not a regular file")
+            if max_bytes is not None and file_stat.st_size > max_bytes:
+                raise OSError("file too large")
+            chunks = []
+            remaining = max_bytes
+            while True:
+                chunk_size = 1024 * 1024 if remaining is None else min(1024 * 1024, remaining + 1)
+                chunk = os.read(descriptor, chunk_size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
+                    if remaining < 0:
+                        raise OSError("file too large")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise StagedUploadChanged("暂存文件校验失败，请重新上传") from error
+
+
+def _load_or_create_hmac_key(private_root):
+    root = _ensure_real_directory(private_root, create=True, parents=True)
+    key_path = root / MANIFEST_HMAC_KEY_FILENAME
+
+    def read_existing():
+        try:
+            mode = key_path.lstat().st_mode
+        except OSError as error:
+            raise UploadConfirmationError("上传签名密钥不可用") from error
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+            raise UploadConfirmationError("上传签名密钥不可用")
+        try:
+            key = _read_regular_file(key_path, max_bytes=4096)
+        except StagedUploadChanged as error:
+            raise UploadConfirmationError("上传签名密钥不可用") from error
+        if len(key) < 32:
+            raise UploadConfirmationError("上传签名密钥不可用")
+        return key
+
+    try:
+        key_path.lstat()
+    except FileNotFoundError:
+        temporary = root / f".{MANIFEST_HMAC_KEY_FILENAME}.{secrets.token_hex(16)}.tmp"
+        descriptor = None
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            key = secrets.token_bytes(32)
+            os.write(descriptor, key)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            try:
+                os.link(temporary, key_path, follow_symlinks=False)
+            except FileExistsError:
+                pass
+            directory_descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError as error:
+            raise UploadConfirmationError("上传签名密钥不可用") from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            temporary.unlink(missing_ok=True)
+    except OSError as error:
+        raise UploadConfirmationError("上传签名密钥不可用") from error
+    return read_existing()
+
+
+def _canonical_manifest(data):
+    payload = {field: data[field] for field in SIGNED_MANIFEST_FIELDS}
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _manifest_signature(key, data):
+    return hmac.new(key, _canonical_manifest(data), hashlib.sha256).hexdigest()
+
+
+@contextmanager
+def pending_upload_operation(private_root, token):
+    """Serialize confirm/cancel for one token; OS locks recover on process exit."""
+    if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):
+        raise InvalidUploadToken("无效或已失效的确认令牌")
+    private_root = Path(private_root)
+    lock_root = private_root / ".pending_upload_locks"
+    try:
+        private_root.mkdir(parents=True, exist_ok=True)
+        lock_root.mkdir(exist_ok=True)
+        if stat.S_ISLNK(lock_root.lstat().st_mode):
+            raise OSError("symbolic link lock directory")
+        descriptor = os.open(
+            lock_root / f"{token}.lock",
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as error:
+        raise InvalidUploadToken("无效或已失效的确认令牌") from error
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _token_directory(private_root, token):
     if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):
         raise InvalidUploadToken("无效或已失效的确认令牌")
-    root = _pending_root(private_root).resolve()
-    directory = (root / token).resolve()
-    if directory.parent != root:
+    root = _ensure_real_directory(_pending_root(private_root))
+    directory = root / token
+    try:
+        mode = directory.lstat().st_mode
+    except OSError as error:
+        raise InvalidUploadToken("无效或已失效的确认令牌") from error
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
         raise InvalidUploadToken("无效或已失效的确认令牌")
     return directory
 
@@ -114,7 +271,10 @@ async def stage_pdf_upload(upload, private_root):
     """Stream one explicit browser upload into a private pending directory."""
     original_filename = _safe_original_filename(getattr(upload, "filename", ""))
     token = secrets.token_hex(32)
-    pending_root = _pending_root(private_root)
+    key = _load_or_create_hmac_key(private_root)
+    pending_root = _ensure_real_directory(
+        _pending_root(private_root), create=True, parents=True
+    )
     directory = pending_root / token
     temporary_path = directory / ".upload.tmp"
     stored_filename = original_filename
@@ -142,13 +302,17 @@ async def stage_pdf_upload(upload, private_root):
                 raise UploadConfirmationError("文件内容不是 PDF")
         os.replace(temporary_path, stored_path)
         page_count = _pdf_page_count(stored_path)
+        manifest_values = {
+            "token": token,
+            "original_filename": original_filename,
+            "stored_filename": stored_filename,
+            "size": size,
+            "sha256": digest.hexdigest(),
+            "page_count": page_count,
+        }
         manifest = UploadManifest(
-            token=token,
-            original_filename=original_filename,
-            stored_filename=stored_filename,
-            size=size,
-            sha256=digest.hexdigest(),
-            page_count=page_count,
+            **manifest_values,
+            signature=_manifest_signature(key, manifest_values),
         )
         _atomic_json(directory / MANIFEST_FILENAME, asdict(manifest))
         return manifest
@@ -164,22 +328,30 @@ def load_verified_upload(private_root, token):
     """Load a manifest and re-check its fixed-name file before confirmation."""
     directory = _token_directory(private_root, token)
     try:
-        data = json.loads((directory / MANIFEST_FILENAME).read_text(encoding="utf-8"))
-        manifest = UploadManifest(**data)
-    except (OSError, json.JSONDecodeError, TypeError, KeyError) as error:
+        manifest_bytes = _read_regular_file(directory / MANIFEST_FILENAME, max_bytes=64 * 1024)
+        data = json.loads(manifest_bytes.decode("utf-8"))
+    except (StagedUploadChanged, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise InvalidUploadToken("无效或已失效的确认令牌") from error
+    if not isinstance(data, dict) or set(data) != MANIFEST_FIELDS:
+        raise StagedUploadChanged("暂存文件校验失败，请重新上传")
     fields_have_valid_types = (
-        isinstance(manifest.token, str)
-        and isinstance(manifest.original_filename, str)
-        and isinstance(manifest.stored_filename, str)
-        and isinstance(manifest.size, int)
-        and not isinstance(manifest.size, bool)
-        and isinstance(manifest.sha256, str)
-        and isinstance(manifest.page_count, int)
-        and not isinstance(manifest.page_count, bool)
+        isinstance(data["token"], str)
+        and isinstance(data["original_filename"], str)
+        and isinstance(data["stored_filename"], str)
+        and isinstance(data["size"], int)
+        and not isinstance(data["size"], bool)
+        and isinstance(data["sha256"], str)
+        and isinstance(data["page_count"], int)
+        and not isinstance(data["page_count"], bool)
+        and isinstance(data["signature"], str)
     )
     if not fields_have_valid_types:
         raise StagedUploadChanged("暂存文件校验失败，请重新上传")
+    key = _load_or_create_hmac_key(private_root)
+    expected_signature = _manifest_signature(key, data)
+    if not hmac.compare_digest(data["signature"], expected_signature):
+        raise StagedUploadChanged("暂存文件校验失败，请重新上传")
+    manifest = UploadManifest(**data)
     if (
         manifest.token != token
         or manifest.stored_filename != _safe_original_filename(manifest.original_filename)
@@ -190,12 +362,25 @@ def load_verified_upload(private_root, token):
         raise StagedUploadChanged("暂存文件校验失败，请重新上传")
     stored_path = directory / manifest.stored_filename
     try:
-        size, digest = _hash_file(stored_path)
-    except OSError as error:
-        raise StagedUploadChanged("暂存文件校验失败，请重新上传") from error
+        pdf_bytes = _read_regular_file(stored_path, max_bytes=MAX_UPLOAD_BYTES)
+        size = len(pdf_bytes)
+        digest = hashlib.sha256(pdf_bytes).hexdigest()
+    except StagedUploadChanged:
+        raise
     if size != manifest.size or digest != manifest.sha256:
         raise StagedUploadChanged("暂存文件已发生变化，请重新上传")
-    if _pdf_page_count(stored_path) != manifest.page_count:
+    try:
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
+            if not document.is_pdf or document.page_count < 1:
+                raise StagedUploadChanged("暂存文件页数校验失败，请重新上传")
+            page_count = document.page_count
+            for page_number in range(page_count):
+                document.load_page(page_number)
+    except StagedUploadChanged:
+        raise
+    except Exception as error:
+        raise StagedUploadChanged("暂存文件页数校验失败，请重新上传") from error
+    if page_count != manifest.page_count:
         raise StagedUploadChanged("暂存文件页数校验失败，请重新上传")
     return manifest, stored_path
 

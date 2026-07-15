@@ -33,6 +33,7 @@ CORE_TABLES = {
     "difficulty_levels",
     "source_papers",
     "import_jobs",
+    "import_upload_receipts",
 }
 
 
@@ -207,6 +208,64 @@ class DatabaseSchemaTests(unittest.TestCase):
         second = subprocess.run(command, cwd=PROJECT_ROOT, capture_output=True, text=True)
         self.assertEqual(0, first.returncode, first.stderr)
         self.assertEqual(0, second.returncode, second.stderr)
+
+    def test_existing_database_gets_upload_receipts_without_data_loss(self):
+        question_id, _ = self.insert_question()
+        source_id = self.connection.execute(
+            """INSERT INTO source_papers
+               (sha256, file_size, original_filename, stored_path,
+                region_code, exam_type_code, paper_name)
+               VALUES (?, 123, 'existing.pdf', 'raw_papers/TJ/unknown/existing.pdf',
+                       'TJ', 'GK', '既有试卷')""",
+            ("e" * 64,),
+        ).lastrowid
+        job_id = self.connection.execute(
+            "INSERT INTO import_jobs (source_paper_id, status) VALUES (?, 'pending')",
+            (source_id,),
+        ).lastrowid
+        self.connection.execute("DROP TABLE import_upload_receipts")
+        self.connection.commit()
+
+        initialize_database(self.db_path).close()
+
+        tables = {
+            row[0]
+            for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        self.assertIn("import_upload_receipts", tables)
+        self.assertEqual(
+            (source_id, "既有试卷"),
+            self.connection.execute(
+                "SELECT id, paper_name FROM source_papers WHERE id = ?", (source_id,)
+            ).fetchone(),
+        )
+        self.assertEqual(
+            (job_id, source_id, "pending"),
+            self.connection.execute(
+                "SELECT id, source_paper_id, status FROM import_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone(),
+        )
+        self.assertEqual(
+            (question_id, "已知函数 $f(x)$。"),
+            self.connection.execute(
+                "SELECT id, stem_markdown FROM questions WHERE id = ?", (question_id,)
+            ).fetchone(),
+        )
+
+        self.connection.execute(
+            """INSERT INTO import_upload_receipts
+               (token, source_paper_id, import_job_id) VALUES ('old-token', ?, ?)""",
+            (source_id, job_id),
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                """INSERT INTO import_upload_receipts
+                   (token, source_paper_id, import_job_id) VALUES ('other-token', ?, ?)""",
+                (source_id, job_id),
+            )
 
     def test_soft_delete_columns_are_migrated_idempotently_without_data_loss(self):
         question_id, _ = self.insert_question()

@@ -20,11 +20,13 @@ from fastapi.templating import Jinja2Templates
 from PIL import Image, UnidentifiedImageError
 
 from src.database import baskets as basket_store
-from src.importing.pdf_intake import PdfIntakeError, intake_pdf
+from src.importing.pdf_intake import PdfIntakeError, has_intake_receipt, intake_pdf
 from src.importing.upload_confirmation import (
+    MAX_UPLOAD_BYTES,
     UploadConfirmationError,
     discard_staged_upload,
     load_verified_upload,
+    pending_upload_operation,
     stage_pdf_upload,
     validate_import_metadata,
 )
@@ -57,6 +59,7 @@ RESTORE_FORM_FIELDS = {"csrf_token"}
 CANDIDATE_DELETE_FORM_FIELDS = {"csrf_token", "version", "reason", "note", "confirmed"}
 CANDIDATE_RESTORE_FORM_FIELDS = {"csrf_token", "version"}
 MAX_DELETE_FORM_BYTES = 4_096
+MAX_PREVIEW_REQUEST_BYTES = MAX_UPLOAD_BYTES + 1024 * 1024
 REVIEW_FORM_FIELDS = {
     "csrf_token", "version", "action", "stem_markdown", "question_type_code",
     "primary_knowledge_point_code", "related_knowledge_point_codes", "review_notes",
@@ -103,6 +106,80 @@ ROMAN_SUBQUESTION_ORDERS = {
     "①": 1, "②": 2, "③": 3, "④": 4, "⑤": 5,
     "⑥": 6, "⑦": 7, "⑧": 8, "⑨": 9, "⑩": 10,
 }
+
+
+class _PreviewRequestBodyTooLarge(Exception):
+    pass
+
+
+class PreviewUploadBodyLimitMiddleware:
+    """Enforce the preview request cap while ASGI body messages are received."""
+
+    def __init__(self, app, max_body_bytes=MAX_PREVIEW_REQUEST_BYTES):
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope, receive, send):
+        if not (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path") == "/imports/preview"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        content_lengths = [
+            value
+            for name, value in scope.get("headers", [])
+            if name.lower() == b"content-length"
+        ]
+        if content_lengths:
+            try:
+                declared_length = int(content_lengths[-1])
+            except ValueError:
+                declared_length = 0
+            if declared_length > self.max_body_bytes:
+                await self._send_413(send)
+                return
+
+        received = 0
+        response_started = False
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_body_bytes:
+                    raise _PreviewRequestBodyTooLarge
+            return message
+
+        async def tracked_send(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except _PreviewRequestBodyTooLarge:
+            if not response_started:
+                await self._send_413(send)
+
+    @staticmethod
+    async def _send_413(send):
+        body = b"Request body too large"
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
 
 
 class AuditDataError(ValueError):
@@ -819,7 +896,11 @@ def _safe_basket_next(value, question_code, default="/questions"):
     return default
 
 
-def create_app(database_path=DEFAULT_DATABASE_PATH, private_root=DEFAULT_PRIVATE_ROOT):
+def create_app(
+    database_path=DEFAULT_DATABASE_PATH,
+    private_root=DEFAULT_PRIVATE_ROOT,
+    preview_request_max_bytes=MAX_PREVIEW_REQUEST_BYTES,
+):
     database_path = Path(database_path)
     private_root = Path(private_root)
     application = FastAPI(title="AI 数学题库", docs_url=None, redoc_url=None)
@@ -845,6 +926,11 @@ def create_app(database_path=DEFAULT_DATABASE_PATH, private_root=DEFAULT_PRIVATE
         if cookie_token != token:
             response.set_cookie("basket_csrf", token, httponly=True, samesite="strict", secure=False)
         return response
+
+    application.add_middleware(
+        PreviewUploadBodyLimitMiddleware,
+        max_body_bytes=preview_request_max_bytes,
+    )
 
     async def require_csrf(request):
         form = await request.form()
@@ -989,16 +1075,25 @@ def create_app(database_path=DEFAULT_DATABASE_PATH, private_root=DEFAULT_PRIVATE
         try:
             manifest, stored_path = load_verified_upload(private_root, token)
             metadata = validate_import_metadata(form, manifest.page_count)
-            intake_pdf(
-                pdf_path=stored_path,
-                region_code=metadata.region_code,
-                exam_year=metadata.exam_year,
-                exam_type_code=metadata.exam_type_code,
-                paper_name=metadata.paper_name,
-                page_range=metadata.page_range,
-                database_path=database_path,
-                private_storage_root=private_root,
-            )
+            with pending_upload_operation(private_root, token):
+                try:
+                    manifest, stored_path = load_verified_upload(private_root, token)
+                except UploadConfirmationError:
+                    if has_intake_receipt(database_path, token):
+                        return RedirectResponse("/papers", status_code=303)
+                    raise
+                intake_pdf(
+                    pdf_path=stored_path,
+                    region_code=metadata.region_code,
+                    exam_year=metadata.exam_year,
+                    exam_type_code=metadata.exam_type_code,
+                    paper_name=metadata.paper_name,
+                    page_range=metadata.page_range,
+                    database_path=database_path,
+                    private_storage_root=private_root,
+                    idempotency_key=token,
+                )
+                discard_staged_upload(private_root, token)
         except (UploadConfirmationError, PdfIntakeError) as error:
             error_message = str(error)
             if isinstance(error, PdfIntakeError) and error_message.startswith(
@@ -1034,7 +1129,6 @@ def create_app(database_path=DEFAULT_DATABASE_PATH, private_root=DEFAULT_PRIVATE
                 context=context,
                 status_code=400,
             )
-        discard_staged_upload(private_root, token)
         return RedirectResponse("/papers", status_code=303)
 
     @application.post("/imports/{token}/cancel", response_class=HTMLResponse)
@@ -1042,8 +1136,9 @@ def create_app(database_path=DEFAULT_DATABASE_PATH, private_root=DEFAULT_PRIVATE
         if await require_csrf(request) is None:
             return _error(request, templates, "CSRF 校验失败", 403)
         try:
-            load_verified_upload(private_root, token)
-            discard_staged_upload(private_root, token)
+            with pending_upload_operation(private_root, token):
+                load_verified_upload(private_root, token)
+                discard_staged_upload(private_root, token)
         except UploadConfirmationError as error:
             return _error(request, templates, str(error), 400)
         return RedirectResponse("/papers", status_code=303)

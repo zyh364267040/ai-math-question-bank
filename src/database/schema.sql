@@ -76,6 +76,15 @@ CREATE TABLE IF NOT EXISTS import_jobs (
     )
 );
 
+CREATE TABLE IF NOT EXISTS import_upload_receipts (
+    token TEXT PRIMARY KEY CHECK (
+        length(trim(token)) BETWEEN 1 AND 200
+    ),
+    source_paper_id INTEGER NOT NULL REFERENCES source_papers(id) ON DELETE RESTRICT,
+    import_job_id INTEGER NOT NULL UNIQUE REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS tag_definitions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     category TEXT NOT NULL CHECK (category IN ('task', 'method', 'error', 'scenario')),
@@ -342,3 +351,4 @@ CREATE INDEX IF NOT EXISTS idx_usage_question_time ON question_usage_records(que
 CREATE INDEX IF NOT EXISTS idx_knowledge_parent ON knowledge_points(parent_id);
 CREATE INDEX IF NOT EXISTS idx_source_papers_source ON source_papers(region_code, exam_year, exam_type_code);
 CREATE INDEX IF NOT EXISTS idx_import_jobs_source_status ON import_jobs(source_paper_id, status);
+CREATE INDEX IF NOT EXISTS idx_import_upload_receipts_source ON import_upload_receipts(source_paper_id);
