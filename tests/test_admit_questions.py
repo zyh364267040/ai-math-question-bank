@@ -60,6 +60,26 @@ class AdmitQuestionsTests(unittest.TestCase):
             suggested_corrections=[],
         )
 
+    def _answer_analysis_sha256(self, question):
+        payload = {
+            "source_question_no": question["source_question_no"],
+            "answer_markdown": question.get("answer_markdown", ""),
+            "analysis_markdown": question.get("analysis_markdown", ""),
+            "subquestions": [
+                {
+                    "label": subquestion.get("label", ""),
+                    "stem_markdown": subquestion.get("stem_markdown", ""),
+                    "answer_markdown": subquestion.get("answer_markdown", ""),
+                    "analysis_markdown": subquestion.get("analysis_markdown", ""),
+                }
+                for subquestion in question.get("subquestions", [])
+            ],
+        }
+        canonical = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
     def test_assessment_finds_22_eligible_and_excludes_q12(self):
         report = assess_job(self.db, self.private, 1)
         self.assertEqual(22, len(report.eligible))
@@ -220,6 +240,239 @@ class AdmitQuestionsTests(unittest.TestCase):
             self.assertEqual(22, con.execute("SELECT count(*) FROM question_sources").fetchone()[0])
             self.assertEqual(22, con.execute("SELECT count(*) FROM question_reviews WHERE review_item='usability'").fetchone()[0])
             self.assertEqual((0, 22), con.execute("SELECT count(nullif(answer_markdown,'')), count(*) FROM questions WHERE answer_status='missing'").fetchone())
+            self.assertEqual((0, 22), con.execute(
+                "SELECT count(analysis_markdown),count(*) FROM questions WHERE analysis_review_status='not_applicable'"
+            ).fetchone())
+            self.assertEqual((0, 0), con.execute(
+                "SELECT count(nullif(answer_markdown,'')),count(analysis_markdown) FROM subquestions WHERE answer_status='missing'"
+            ).fetchone())
+
+    def test_answer_without_dedicated_audit_status_is_unsafe(self):
+        candidate_path, candidate = self._json("candidate_questions.json")
+        candidate["questions"][0]["answer_markdown"] = "$x=1$"
+        self._write(candidate_path, candidate)
+
+        report = assess_job(self.db, self.private, 1)
+
+        question = next(item for item in report.ineligible if item.question_no == "1")
+        self.assertIn("answer_status_not_passed", question.reasons)
+        with self.assertRaisesRegex(AdmissionError, "answer_status_not_passed"):
+            admit_questions(self.db, self.private, 1)
+        with sqlite3.connect(self.db) as con:
+            self.assertEqual(0, con.execute("SELECT count(*) FROM questions").fetchone()[0])
+
+    def test_analysis_without_dedicated_audit_status_is_unsafe(self):
+        candidate_path, candidate = self._json("candidate_questions.json")
+        question = candidate["questions"][0]
+        question["analysis_markdown"] = "原卷解析。"
+        self._write(candidate_path, candidate)
+        self._mutate_audits(
+            lambda by_no: by_no["1"].update(
+                answer_analysis_sha256=self._answer_analysis_sha256(question)
+            )
+        )
+
+        report = assess_job(self.db, self.private, 1)
+
+        assessed = next(item for item in report.ineligible if item.question_no == "1")
+        self.assertIn("analysis_status_not_passed", assessed.reasons)
+        with self.assertRaisesRegex(AdmissionError, "analysis_status_not_passed"):
+            admit_questions(self.db, self.private, 1)
+
+    def test_answer_changed_after_audit_is_unsafe_due_to_hash_mismatch(self):
+        candidate_path, candidate = self._json("candidate_questions.json")
+        question = candidate["questions"][0]
+        question["answer_markdown"] = "$x=1$"
+        reviewed_hash = self._answer_analysis_sha256(question)
+        self._mutate_audits(
+            lambda by_no: by_no["1"].update(
+                answer_status="passed", answer_analysis_sha256=reviewed_hash
+            )
+        )
+        question["answer_markdown"] = "$x=2$"
+        self._write(candidate_path, candidate)
+
+        report = assess_job(self.db, self.private, 1)
+
+        assessed = next(item for item in report.ineligible if item.question_no == "1")
+        self.assertIn("answer_analysis_sha256_mismatch", assessed.reasons)
+        with self.assertRaisesRegex(AdmissionError, "answer_analysis_sha256_mismatch"):
+            admit_questions(self.db, self.private, 1)
+
+    def test_subquestion_changed_after_audit_is_unsafe_due_to_hash_mismatch(self):
+        candidate_path, candidate = self._json("candidate_questions.json")
+        question = next(q for q in candidate["questions"] if q["source_question_no"] == "22")
+        question["subquestions"][0]["answer_markdown"] = "$2$"
+        reviewed_hash = self._answer_analysis_sha256(question)
+        self._mutate_audits(
+            lambda by_no: by_no["22"].update(
+                answer_status="passed", answer_analysis_sha256=reviewed_hash
+            )
+        )
+        question["subquestions"][0]["stem_markdown"] = "审核后被篡改的小问题干"
+        self._write(candidate_path, candidate)
+
+        report = assess_job(self.db, self.private, 1)
+
+        assessed = next(item for item in report.ineligible if item.question_no == "22")
+        self.assertIn("answer_analysis_sha256_mismatch", assessed.reasons)
+        with self.assertRaisesRegex(AdmissionError, "answer_analysis_sha256_mismatch"):
+            admit_questions(self.db, self.private, 1)
+
+    def test_subquestion_reorder_after_audit_is_unsafe_due_to_hash_mismatch(self):
+        candidate_path, candidate = self._json("candidate_questions.json")
+        question = next(q for q in candidate["questions"] if q["source_question_no"] == "22")
+        question["subquestions"][0]["answer_markdown"] = "$2$"
+        reviewed_hash = self._answer_analysis_sha256(question)
+        self._mutate_audits(
+            lambda by_no: by_no["22"].update(
+                answer_status="passed", answer_analysis_sha256=reviewed_hash
+            )
+        )
+        question["subquestions"][0], question["subquestions"][1] = (
+            question["subquestions"][1], question["subquestions"][0]
+        )
+        self._write(candidate_path, candidate)
+
+        report = assess_job(self.db, self.private, 1)
+
+        assessed = next(item for item in report.ineligible if item.question_no == "22")
+        self.assertIn("answer_analysis_sha256_mismatch", assessed.reasons)
+        with self.assertRaisesRegex(AdmissionError, "answer_analysis_sha256_mismatch"):
+            admit_questions(self.db, self.private, 1)
+
+    def test_admits_parent_answer_and_analysis_as_reviewed_content(self):
+        candidate_path, candidate = self._json("candidate_questions.json")
+        candidate["questions"][0].update(
+            answer_markdown="$x=1$",
+            analysis_markdown="由题意直接计算。",
+        )
+        self._write(candidate_path, candidate)
+        reviewed_hash = self._answer_analysis_sha256(candidate["questions"][0])
+        self._mutate_audits(
+            lambda by_no: by_no["1"].update(
+                answer_status="passed",
+                analysis_status="passed",
+                answer_analysis_sha256=reviewed_hash,
+            )
+        )
+
+        admit_questions(self.db, self.private, 1)
+
+        with sqlite3.connect(self.db) as con:
+            row = con.execute(
+                """SELECT answer_markdown,answer_status,answer_review_status,
+                          analysis_markdown,analysis_review_status
+                   FROM questions WHERE source_question_no='1'"""
+            ).fetchone()
+        self.assertEqual(
+            ("$x=1$", "provided", "passed", "由题意直接计算。", "passed"),
+            row,
+        )
+        with sqlite3.connect(self.db) as con:
+            review_note = con.execute(
+                """SELECT r.notes FROM question_reviews r JOIN questions q ON q.id=r.question_id
+                   WHERE q.source_question_no='1' AND r.review_item='usability'"""
+            ).fetchone()[0]
+        self.assertIn("原卷答案已通过审核", review_note)
+
+    def test_admits_subquestion_answer_and_analysis(self):
+        candidate_path, candidate = self._json("candidate_questions.json")
+        question = next(q for q in candidate["questions"] if q["source_question_no"] == "22")
+        question["subquestions"][0].update(
+            answer_markdown="$2$",
+            analysis_markdown="先化简，再求值。",
+        )
+        self._write(candidate_path, candidate)
+        reviewed_hash = self._answer_analysis_sha256(question)
+        self._mutate_audits(
+            lambda by_no: by_no["22"].update(
+                answer_status="passed",
+                analysis_status="passed",
+                answer_analysis_sha256=reviewed_hash,
+            )
+        )
+
+        admit_questions(self.db, self.private, 1)
+
+        with sqlite3.connect(self.db) as con:
+            row = con.execute(
+                """SELECT s.answer_markdown,s.answer_status,s.analysis_markdown
+                   FROM subquestions s JOIN questions q ON q.id=s.question_id
+                   WHERE q.source_question_no='22' AND s.display_order=1"""
+            ).fetchone()
+            review_note = con.execute(
+                """SELECT r.notes FROM question_reviews r JOIN questions q ON q.id=r.question_id
+                   WHERE q.source_question_no='22' AND r.review_item='usability'"""
+            ).fetchone()[0]
+            parent_statuses = con.execute(
+                """SELECT q.answer_status,q.answer_review_status,q.analysis_review_status
+                   FROM questions q WHERE q.source_question_no='22'"""
+            ).fetchone()
+        self.assertEqual(("$2$", "provided", "先化简，再求值。"), row)
+        self.assertEqual(("missing", "not_applicable", "not_applicable"), parent_statuses)
+        self.assertNotIn("未提供答案", review_note)
+        self.assertIn("答案已通过审核", review_note)
+
+    def test_non_string_answer_or_analysis_rejects_and_rolls_back_batch(self):
+        candidate_path, original = self._json("candidate_questions.json")
+        mutations = (
+            lambda data: data["questions"][0].__setitem__("answer_markdown", 123),
+            lambda data: data["questions"][0].__setitem__("analysis_markdown", None),
+            lambda data: next(q for q in data["questions"] if q["source_question_no"] == "22")["subquestions"][0].__setitem__("answer_markdown", ["2"]),
+            lambda data: next(q for q in data["questions"] if q["source_question_no"] == "22")["subquestions"][0].__setitem__("analysis_markdown", {"text": "解析"}),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                changed = copy.deepcopy(original)
+                mutate(changed)
+                self._write(candidate_path, changed)
+                try:
+                    with self.assertRaises(AdmissionError):
+                        admit_questions(self.db, self.private, 1)
+
+                    with sqlite3.connect(self.db) as con:
+                        self.assertEqual(0, con.execute("SELECT count(*) FROM questions").fetchone()[0])
+                finally:
+                    with sqlite3.connect(self.db) as con:
+                        con.execute("DELETE FROM questions")
+        self._write(candidate_path, original)
+
+    def test_explicit_non_list_subquestions_raise_controlled_admission_error(self):
+        candidate_path, original = self._json("candidate_questions.json")
+        for invalid in (None, {}, "not-a-list"):
+            with self.subTest(invalid=invalid):
+                changed = copy.deepcopy(original)
+                changed["questions"][0]["subquestions"] = invalid
+                self._write(candidate_path, changed)
+
+                with self.assertRaisesRegex(AdmissionError, "subquestions必须为列表"):
+                    admit_questions(self.db, self.private, 1)
+
+        self._write(candidate_path, original)
+
+    def test_empty_answer_and_analysis_keep_missing_semantics(self):
+        candidate_path, candidate = self._json("candidate_questions.json")
+        candidate["questions"][0].update(answer_markdown="", analysis_markdown="   ")
+        question = next(q for q in candidate["questions"] if q["source_question_no"] == "22")
+        question["subquestions"][0].update(answer_markdown="   ", analysis_markdown="")
+        self._write(candidate_path, candidate)
+
+        admit_questions(self.db, self.private, 1)
+
+        with sqlite3.connect(self.db) as con:
+            parent = con.execute(
+                """SELECT answer_markdown,answer_status,answer_review_status,
+                          analysis_markdown,analysis_review_status
+                   FROM questions WHERE source_question_no='1'"""
+            ).fetchone()
+            child = con.execute(
+                """SELECT s.answer_markdown,s.answer_status,s.analysis_markdown
+                   FROM subquestions s JOIN questions q ON q.id=s.question_id
+                   WHERE q.source_question_no='22' AND s.display_order=1"""
+            ).fetchone()
+        self.assertEqual(("", "missing", "not_applicable", None, "not_applicable"), parent)
+        self.assertEqual(("", "missing", None), child)
 
     def test_manifest_failures_abort_batch_without_partial_rows(self):
         mutations = [
@@ -245,6 +498,26 @@ class AdmitQuestionsTests(unittest.TestCase):
                 admit_questions(self.db, self.private, 1)
         with sqlite3.connect(self.db) as con:
             self.assertEqual(0, con.execute("SELECT count(*) FROM questions").fetchone()[0])
+
+    def test_later_sqlite_error_rolls_back_previously_inserted_answer(self):
+        candidate_path, candidate = self._json("candidate_questions.json")
+        first = candidate["questions"][0]
+        first["answer_markdown"] = "$x=1$"
+        candidate["questions"][1]["options"][1]["code"] = "A"
+        self._write(candidate_path, candidate)
+        self._mutate_audits(
+            lambda by_no: by_no["1"].update(
+                answer_status="passed",
+                answer_analysis_sha256=self._answer_analysis_sha256(first),
+            )
+        )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            admit_questions(self.db, self.private, 1)
+
+        with sqlite3.connect(self.db) as con:
+            self.assertEqual(0, con.execute("SELECT count(*) FROM questions").fetchone()[0])
+            self.assertEqual(0, con.execute("SELECT count(*) FROM question_options").fetchone()[0])
 
     def test_question_code_is_stable_and_paths_are_safe(self):
         report = admit_questions(self.db, self.private, 1)

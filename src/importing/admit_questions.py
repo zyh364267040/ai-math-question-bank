@@ -77,6 +77,53 @@ def _safe_png(job_dir: Path, relative: object, entry: dict) -> Path:
     return target
 
 
+def _validate_optional_markdown_fields(questions):
+    for question in questions:
+        for field in ("answer_markdown", "analysis_markdown"):
+            if field in question and not isinstance(question[field], str):
+                raise AdmissionError(f"{field}必须为字符串")
+        subquestions = question.get("subquestions", [])
+        if not isinstance(subquestions, list):
+            raise AdmissionError("subquestions必须为列表")
+        for subquestion in subquestions:
+            if not isinstance(subquestion, dict):
+                raise AdmissionError("小题格式非法")
+            for field in ("answer_markdown", "analysis_markdown"):
+                if field in subquestion and not isinstance(subquestion[field], str):
+                    raise AdmissionError(f"小题{field}必须为字符串")
+
+
+def _has_markdown(question: dict, field: str) -> bool:
+    parent = question.get(field, "")
+    if isinstance(parent, str) and parent.strip():
+        return True
+    return any(
+        isinstance(subquestion.get(field, ""), str) and subquestion.get(field, "").strip()
+        for subquestion in question.get("subquestions", [])
+    )
+
+
+def _answer_analysis_sha256(question: dict) -> str:
+    payload = {
+        "source_question_no": question["source_question_no"],
+        "answer_markdown": question.get("answer_markdown", ""),
+        "analysis_markdown": question.get("analysis_markdown", ""),
+        "subquestions": [
+            {
+                "label": subquestion.get("label", ""),
+                "stem_markdown": subquestion.get("stem_markdown", ""),
+                "answer_markdown": subquestion.get("answer_markdown", ""),
+                "analysis_markdown": subquestion.get("analysis_markdown", ""),
+            }
+            for subquestion in question.get("subquestions", [])
+        ],
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _load_context(connection, private_root: Path, job_id: int):
     job = connection.execute(
         """SELECT j.id,j.source_paper_id,s.sha256,s.region_code,s.exam_year,
@@ -96,6 +143,7 @@ def _load_context(connection, private_root: Path, job_id: int):
     numbers = [q.get("source_question_no") for q in questions if isinstance(q, dict)]
     if len(numbers) != len(questions) or any(not isinstance(n, str) or not n.isdigit() for n in numbers) or len(set(numbers)) != len(numbers):
         raise AdmissionError("候选题号非法或重复")
+    _validate_optional_markdown_fields(questions)
     try:
         _, audits = _load_valid_audit(job_dir / "ai_audit.json", job_id, questions)
     except AuditDataError as exc:
@@ -161,6 +209,15 @@ def _assess(connection, context):
         if any(code not in knowledge for code in codes): reasons.append("missing_knowledge_point")
         if number not in crops: reasons.append("missing_question_crop")
         if question.get("figure_required") is True and number not in figures: reasons.append("missing_approved_figure")
+        answer_provided = _has_markdown(question, "answer_markdown")
+        analysis_provided = _has_markdown(question, "analysis_markdown")
+        if answer_provided and audit.get("answer_status") != "passed":
+            reasons.append("answer_status_not_passed")
+        if analysis_provided and audit.get("analysis_status") != "passed":
+            reasons.append("analysis_status_not_passed")
+        if ((answer_provided or analysis_provided)
+                and audit.get("answer_analysis_sha256") != _answer_analysis_sha256(question)):
+            reasons.append("answer_analysis_sha256_mismatch")
         item = AssessmentItem(number, tuple(reasons))
         (ineligible if reasons else eligible).append(item)
     return AssessmentReport(tuple(eligible), tuple(ineligible))
@@ -185,16 +242,26 @@ def _insert_one(connection, context, question, code):
     number = question["source_question_no"]
     primary_id = connection.execute("SELECT id FROM knowledge_points WHERE code=?", (question["primary_knowledge_point_code"],)).fetchone()[0]
     content_hash = hashlib.sha256(json.dumps(question, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    answer = question.get("answer_markdown", "")
+    answer_provided = isinstance(answer, str) and bool(answer.strip())
+    analysis = question.get("analysis_markdown")
+    analysis_provided = isinstance(analysis, str) and bool(analysis.strip())
     qid = connection.execute(
         """INSERT INTO questions
-           (question_code,stem_markdown,answer_markdown,answer_status,region_code,exam_year,
+           (question_code,stem_markdown,answer_markdown,answer_status,analysis_markdown,region_code,exam_year,
             exam_type_code,paper_name,source_question_no,source_page,source_file_path,
             question_type_code,primary_knowledge_point_id,ocr_review_status,formula_review_status,
-            figure_review_status,answer_review_status,tag_review_status,usability_status,content_hash)
-           VALUES (?,?,?,'missing',?,?,?,?,?,?,?,?,?,'passed','passed',?,'not_applicable','passed','pending_review',?)""",
-        (code, question["stem_markdown"], "", job["region_code"], job["exam_year"], job["exam_type_code"],
+            figure_review_status,answer_review_status,analysis_review_status,tag_review_status,
+            usability_status,content_hash)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (code, question["stem_markdown"], answer if answer_provided else "",
+         "provided" if answer_provided else "missing", analysis if analysis_provided else None,
+         job["region_code"], job["exam_year"], job["exam_type_code"],
          job["paper_name"], number, json.dumps(question.get("source_pages", [])), job["stored_path"],
-         question["question_type_code"], primary_id, 'passed' if question.get("figure_required") else 'not_applicable', content_hash),
+         question["question_type_code"], primary_id, "passed", "passed",
+         "passed" if question.get("figure_required") else "not_applicable",
+         "passed" if answer_provided else "not_applicable",
+         "passed" if analysis_provided else "not_applicable", "passed", "pending_review", content_hash),
     ).lastrowid
     for index, option in enumerate(question.get("options", []), 1):
         content = option.get("content", "")
@@ -203,7 +270,18 @@ def _insert_one(connection, context, question, code):
         connection.execute("INSERT INTO question_options(question_id,option_code,content_markdown,display_order) VALUES(?,?,?,?)", (qid, option["code"], content, index))
     for index, sub in enumerate(question.get("subquestions", []), 1):
         stem = " ".join(filter(None, [sub.get("label", ""), sub.get("stem_markdown", "")])).strip()
-        connection.execute("INSERT INTO subquestions(question_id,display_order,stem_markdown,answer_markdown,answer_status) VALUES(?,?,?,'','missing')", (qid, index, stem))
+        sub_answer = sub.get("answer_markdown", "")
+        sub_answer_provided = isinstance(sub_answer, str) and bool(sub_answer.strip())
+        sub_analysis = sub.get("analysis_markdown")
+        sub_analysis_provided = isinstance(sub_analysis, str) and bool(sub_analysis.strip())
+        connection.execute(
+            """INSERT INTO subquestions
+               (question_id,display_order,stem_markdown,answer_markdown,answer_status,analysis_markdown)
+               VALUES(?,?,?,?,?,?)""",
+            (qid, index, stem, sub_answer if sub_answer_provided else "",
+             "provided" if sub_answer_provided else "missing",
+             sub_analysis if sub_analysis_provided else None),
+        )
     for related in question.get("related_knowledge_point_codes", []):
         kid = connection.execute("SELECT id FROM knowledge_points WHERE code=?", (related,)).fetchone()[0]
         connection.execute("INSERT OR IGNORE INTO question_related_knowledge_points VALUES(?,?)", (qid, kid))
@@ -218,10 +296,15 @@ def _insert_one(connection, context, question, code):
                VALUES(?,?,?,?,?,?,?,'ai_review_passed',1,?)""",
             (qid, kind, asset["output_relative_path"], asset["width"], asset["height"], asset["byte_size"], asset["sha256"], job["id"]),
         )
+    any_answer_provided = _has_markdown(question, "answer_markdown")
+    review_note = (
+        "AI审核auto_pass；原卷答案已通过审核"
+        if any_answer_provided else "AI审核auto_pass；原卷未提供答案"
+    )
     connection.execute(
         """INSERT INTO question_reviews(question_id,review_item,previous_status,new_status,reviewer,reviewed_at,notes)
            VALUES(?,'usability','pending','passed',?,?,?)""",
-        (qid, audits[number].get("auditor", "ai_audit"), datetime.now(timezone.utc).isoformat(), "AI审核auto_pass；原卷未提供答案"),
+        (qid, audits[number].get("auditor", "ai_audit"), datetime.now(timezone.utc).isoformat(), review_note),
     )
     return qid
 
@@ -239,6 +322,8 @@ def admit_questions(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_
         manifest_reasons = {
             "empty_stem", "invalid_question_type", "missing_knowledge_point",
             "missing_question_crop", "missing_approved_figure",
+            "answer_status_not_passed", "analysis_status_not_passed",
+            "answer_analysis_sha256_mismatch",
         }
         unsafe = [item for item in assessment.ineligible if manifest_reasons.intersection(item.reasons)]
         if unsafe:
