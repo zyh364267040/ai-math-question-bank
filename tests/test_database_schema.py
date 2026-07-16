@@ -35,6 +35,7 @@ CORE_TABLES = {
     "import_jobs",
     "import_upload_receipts",
     "import_page_render_runs",
+    "import_question_split_runs",
 }
 
 
@@ -316,11 +317,49 @@ class DatabaseSchemaTests(unittest.TestCase):
         self.assertTrue(
             {
                 "import_job_id", "status", "dpi", "total_pages",
-                "rendered_pages", "error_message", "started_at",
-                "completed_at", "updated_at",
+                "rendered_pages", "manifest_sha256", "manifest_byte_size",
+                "published_batch_id", "source_pdf_sha256", "error_message",
+                "started_at", "completed_at", "updated_at",
             }
             <= columns
         )
+
+    def test_existing_render_run_table_gains_anchor_columns_without_backfill(self):
+        self.connection.close()
+        self.db_path.unlink()
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """CREATE TABLE import_page_render_runs (
+                    import_job_id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'pending',dpi INTEGER NOT NULL DEFAULT 300,
+                    total_pages INTEGER,rendered_pages INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT,started_at TEXT,completed_at TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO import_page_render_runs
+                   (import_job_id,status,total_pages,rendered_pages)
+                   VALUES (99,'completed',1,1)"""
+            )
+        initialize_database(self.db_path).close()
+        initialize_database(self.db_path).close()
+        with sqlite3.connect(self.db_path) as connection:
+            columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(import_page_render_runs)"
+                )
+            }
+            row = connection.execute(
+                """SELECT status,manifest_sha256,manifest_byte_size,
+                          published_batch_id,source_pdf_sha256
+                   FROM import_page_render_runs WHERE import_job_id=99"""
+            ).fetchone()
+        self.assertTrue({
+            "manifest_sha256", "manifest_byte_size", "published_batch_id",
+            "source_pdf_sha256",
+        } <= columns)
+        self.assertEqual(("completed", None, None, None, None), row)
 
     def test_soft_delete_columns_are_migrated_idempotently_without_data_loss(self):
         question_id, _ = self.insert_question()

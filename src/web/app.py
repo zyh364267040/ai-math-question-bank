@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import tempfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -23,6 +24,7 @@ from src.database import baskets as basket_store
 from src.database.initialize import initialize_database
 from src.importing.pdf_intake import PdfIntakeError, has_intake_receipt, intake_pdf
 from src.importing.upload_confirmation import (
+    MANIFEST_HMAC_KEY_FILENAME,
     MAX_UPLOAD_BYTES,
     UploadConfirmationError,
     discard_staged_upload,
@@ -42,6 +44,21 @@ from src.processing.page_layout_analyzer import (
     load_completed_layout,
     read_layout_overlay,
     run_claimed_layout,
+)
+from src.processing.question_splitter import (
+    SAFE_CODEX_MISSING,
+    SAFE_EXISTING_ERROR as SAFE_SPLIT_EXISTING_ERROR,
+    SAFE_RENDER_REQUIRED,
+    SAFE_SPLIT_ERROR,
+    QuestionSplitError,
+    claim_split_job,
+    completed_split_result_valid,
+    read_completed_split_image,
+    run_claimed_split,
+)
+from src.processing.secure_crop_artifacts import (
+    SecureCropArtifactError,
+    validate_signed_manifest,
 )
 
 
@@ -68,6 +85,13 @@ LAYOUT_STATUS_NAMES = {
     "completed": "版面分析完成",
     "failed": "版面分析失败",
 }
+SPLIT_STATUS_NAMES = {
+    "pending": "等待调用",
+    "processing": "Codex 正在自动切题",
+    "completed": "自动切题完成",
+    "failed": "自动切题失败",
+}
+SAFE_SPLIT_ERRORS = {SAFE_SPLIT_ERROR, SAFE_CODEX_MISSING}
 SAFE_LAYOUT_ERRORS = {
     "页面分析输入校验失败，请重新处理页面后重试",
     "页面数量或分析结果超过安全处理限制",
@@ -165,7 +189,7 @@ class PreviewUploadBodyLimitMiddleware:
             return
         if path == "/imports/preview":
             request_limit = self.max_body_bytes
-        elif re.fullmatch(r"/imports/[^/]+/(?:render|layout)", path):
+        elif re.fullmatch(r"/imports/[^/]+/(?:render|layout|split)", path):
             request_limit = min(self.max_body_bytes, MAX_RENDER_START_FORM_BYTES)
         else:
             await self.app(scope, receive, send)
@@ -671,13 +695,23 @@ def _review_error(request, templates, message, status_code):
     return _error(request, templates, message, status_code)
 
 
-def _load_question_crops(job_dir, job_id, expected_question_nos=None):
+def _load_question_crops(
+    job_dir, job_id, expected_question_nos=None, *, require_signature=False
+):
     """Load an all-or-nothing, file-verified complete-question crop manifest."""
     path = job_dir / "question_crops.json"
     if not path.is_file():
         return []
     try:
         payload = _load_json(path, "单题原图清单")
+        if require_signature:
+            payload = validate_signed_manifest(
+                payload, _read_existing_crop_key(job_dir), expected_job_id=job_id,
+                expected_question_nos=(
+                    sorted(int(number) for number in expected_question_nos)
+                    if expected_question_nos is not None else None
+                ),
+            )
         entries = payload["questions"]
         if (not isinstance(payload, dict) or payload.get("import_job_id") != job_id
                 or not isinstance(entries, list) or payload.get("question_count") != len(entries)):
@@ -713,8 +747,31 @@ def _load_question_crops(job_dir, job_id, expected_question_nos=None):
                     return []
             safe.append(entry)
         return safe
-    except (ValueError, KeyError, TypeError, OSError, UnidentifiedImageError):
+    except (ValueError, KeyError, TypeError, OSError, UnidentifiedImageError,
+            SecureCropArtifactError):
         return []
+
+
+def _read_existing_crop_key(job_dir):
+    """Read the existing signing key without allowing a GET path to create it."""
+    key_path = Path(job_dir).parent.parent / MANIFEST_HMAC_KEY_FILENAME
+    descriptor = None
+    try:
+        descriptor = os.open(key_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        details = os.fstat(descriptor)
+        if (not stat.S_ISREG(details.st_mode) or details.st_nlink != 1
+                or stat.S_IMODE(details.st_mode) != 0o600
+                or not 32 <= details.st_size <= 4096):
+            raise OSError
+        content = os.read(descriptor, 4097)
+        if len(content) != details.st_size:
+            raise OSError
+        return content
+    except OSError as error:
+        raise SecureCropArtifactError("裁图签名密钥不可用") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _get_job(connection, job_id):
@@ -951,6 +1008,7 @@ def create_app(
     database_path=DEFAULT_DATABASE_PATH,
     private_root=DEFAULT_PRIVATE_ROOT,
     preview_request_max_bytes=MAX_PREVIEW_REQUEST_BYTES,
+    split_runner=None,
     _initialize_schema=True,
 ):
     database_path = Path(database_path)
@@ -960,6 +1018,7 @@ def create_app(
     application = FastAPI(title="AI 数学题库", docs_url=None, redoc_url=None)
     application.state.database_path = database_path
     application.state.private_root = private_root
+    application.state.split_runner = split_runner
     if not _initialize_schema:
         @application.on_event("startup")
         def initialize_schema_on_server_start():
@@ -1042,6 +1101,8 @@ def create_app(
                               pr.rendered_pages, pr.total_pages, pr.dpi,
                               la.status AS layout_status,
                               la.analyzed_pages, la.detected_questions,
+                              qs.status AS split_status,
+                              qs.question_count AS split_question_count,
                               (SELECT COUNT(*) FROM candidate_review_drafts d
                                WHERE d.import_job_id=j.id AND d.deleted_at IS NOT NULL) AS deleted_count
                        FROM import_jobs j
@@ -1050,6 +1111,7 @@ def create_app(
                        JOIN exam_types e ON e.code = s.exam_type_code
                        LEFT JOIN import_page_render_runs pr ON pr.import_job_id = j.id
                        LEFT JOIN import_layout_analysis_runs la ON la.import_job_id = j.id
+                       LEFT JOIN import_question_split_runs qs ON qs.import_job_id = j.id
                        ORDER BY j.created_at DESC, j.id DESC"""
                 ).fetchall()
         except sqlite3.Error:
@@ -1239,6 +1301,118 @@ def create_app(
             )
         return Response(
             content=content, media_type="image/png",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @application.post("/imports/{job_id}/split")
+    async def start_question_split(
+        request: Request, job_id: int, background_tasks: BackgroundTasks
+    ):
+        """Only an explicit, CSRF-protected POST may start Codex."""
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "自动切题请求参数无效", 400)
+        try:
+            claim = claim_split_job(
+                database_path, private_root, job_id,
+                runner=application.state.split_runner,
+            )
+        except QuestionSplitError as error:
+            message = str(error)
+            if message == "未找到导入任务":
+                return _error(request, templates, message, 404)
+            if message in {SAFE_RENDER_REQUIRED, SAFE_CODEX_MISSING}:
+                return _error(request, templates, message, 409)
+            return _error(request, templates, "自动切题任务暂时无法启动", 500)
+        if claim is not None:
+            background_tasks.add_task(run_claimed_split, claim)
+        return RedirectResponse(f"/imports/{job_id}/split", status_code=303)
+
+    @application.get("/imports/{job_id}/split", response_class=HTMLResponse)
+    def question_split_status(request: Request, job_id: int):
+        """Read-only status and verified crop thumbnails; never starts Codex."""
+        try:
+            with _connect(database_path) as connection:
+                row = connection.execute(
+                    """SELECT j.id,j.status AS import_status,s.paper_name,
+                              s.original_filename,r.status AS render_status,
+                              q.status,q.question_count,q.processed_pages,
+                              q.error_message,q.codex_run_id,q.updated_at,
+                              q.result_manifest_sha256,q.crop_manifest_sha256,
+                              q.crop_generation_id,q.crop_manifest_signature,
+                              q.render_manifest_sha256 AS split_render_sha256,
+                              q.source_pdf_sha256 AS split_source_sha256,
+                              r.manifest_sha256 AS current_render_sha256,
+                              r.source_pdf_sha256 AS current_source_sha256
+                       FROM import_jobs j JOIN source_papers s ON s.id=j.source_paper_id
+                       LEFT JOIN import_page_render_runs r ON r.import_job_id=j.id
+                       LEFT JOIN import_question_split_runs q ON q.import_job_id=j.id
+                       WHERE j.id=?""", (job_id,)
+                ).fetchone()
+        except sqlite3.Error:
+            return _error(request, templates, "自动切题状态暂时无法读取", 500)
+        if row is None:
+            return _error(request, templates, "未找到导入任务", 404)
+        if row["import_status"] != "pending" or row["render_status"] != "completed":
+            return _error(request, templates, SAFE_RENDER_REQUIRED, 409)
+        run = dict(row)
+        run["status"] = run["status"] or "pending"
+        run["processed_pages"] = run["processed_pages"] or 0
+        run["status_name"] = SPLIT_STATUS_NAMES[run["status"]]
+        if run["error_message"] not in SAFE_SPLIT_ERRORS:
+            run["error_message"] = SAFE_SPLIT_ERROR if run["status"] == "failed" else None
+        crops = []
+        retained_valid = bool(
+            run["question_count"]
+            and run["split_render_sha256"] == run["current_render_sha256"]
+            and run["split_source_sha256"] == run["current_source_sha256"]
+            and completed_split_result_valid(
+                private_root, job_id, run["question_count"],
+                run["result_manifest_sha256"], run["crop_manifest_sha256"],
+                run["crop_generation_id"], run["crop_manifest_signature"],
+            )
+        )
+        if retained_valid:
+            crops = _load_question_crops(
+                _job_dir(private_root, job_id), job_id,
+                range(1, run["question_count"] + 1),
+                require_signature=True,
+            )
+        elif run["status"] == "completed":
+            run["status"] = "failed"
+            run["status_name"] = "结果校验失败"
+            run["error_message"] = SAFE_SPLIT_EXISTING_ERROR
+        return templates.TemplateResponse(
+            request=request, name="import_split.html",
+            context={"run": run, "crops": crops},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @application.get("/imports/{job_id}/split-images/{question_no}.png")
+    def question_split_image(job_id: int, question_no: int):
+        try:
+            with _connect(database_path) as connection:
+                row = connection.execute(
+                    """SELECT question_count,crop_manifest_sha256,
+                              crop_generation_id,crop_manifest_signature
+                       FROM import_question_split_runs WHERE import_job_id=?""", (job_id,)
+                ).fetchone()
+            if row is None:
+                raise ValueError
+            content = read_completed_split_image(
+                private_root, job_id, row[0], row[1], row[2], row[3], question_no
+            )
+        except (sqlite3.Error, OSError, ValueError, StopIteration, TypeError,
+                QuestionSplitError):
+            return Response(
+                "未找到已登记的单题图片", status_code=404,
+                media_type="text/plain; charset=utf-8",
+                headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+            )
+        return Response(
+            content, media_type="image/png",
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
 

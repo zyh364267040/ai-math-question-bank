@@ -84,6 +84,24 @@ CREATE TABLE IF NOT EXISTS import_page_render_runs (
     dpi INTEGER NOT NULL DEFAULT 300 CHECK (dpi = 300),
     total_pages INTEGER CHECK (total_pages IS NULL OR total_pages > 0),
     rendered_pages INTEGER NOT NULL DEFAULT 0 CHECK (rendered_pages >= 0),
+    manifest_sha256 TEXT CHECK (
+        manifest_sha256 IS NULL OR (
+            length(manifest_sha256) = 64 AND
+            manifest_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    manifest_byte_size INTEGER CHECK (
+        manifest_byte_size IS NULL OR manifest_byte_size > 0
+    ),
+    published_batch_id TEXT CHECK (
+        published_batch_id IS NULL OR length(published_batch_id) BETWEEN 1 AND 100
+    ),
+    source_pdf_sha256 TEXT CHECK (
+        source_pdf_sha256 IS NULL OR (
+            length(source_pdf_sha256) = 64 AND
+            source_pdf_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
     error_message TEXT,
     started_at TEXT,
     completed_at TEXT,
@@ -136,6 +154,53 @@ CREATE TABLE IF NOT EXISTS import_upload_receipts (
     source_paper_id INTEGER NOT NULL REFERENCES source_papers(id) ON DELETE RESTRICT,
     import_job_id INTEGER NOT NULL UNIQUE REFERENCES import_jobs(id) ON DELETE RESTRICT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS import_question_split_runs (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'processing', 'completed', 'failed')
+    ),
+    question_count INTEGER CHECK (question_count IS NULL OR question_count >= 0),
+    processed_pages INTEGER NOT NULL DEFAULT 0 CHECK (processed_pages >= 0),
+    error_message TEXT,
+    codex_run_id TEXT CHECK (
+        codex_run_id IS NULL OR length(codex_run_id) BETWEEN 1 AND 200
+    ),
+    result_manifest_sha256 TEXT CHECK (
+        result_manifest_sha256 IS NULL OR (
+            length(result_manifest_sha256) = 64 AND
+            result_manifest_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    render_manifest_sha256 TEXT CHECK (
+        render_manifest_sha256 IS NULL OR length(render_manifest_sha256) = 64
+    ),
+    source_pdf_sha256 TEXT CHECK (
+        source_pdf_sha256 IS NULL OR length(source_pdf_sha256) = 64
+    ),
+    crop_manifest_sha256 TEXT CHECK (
+        crop_manifest_sha256 IS NULL OR length(crop_manifest_sha256) = 64
+    ),
+    crop_generation_id TEXT CHECK (
+        crop_generation_id IS NULL OR length(crop_generation_id) = 32
+    ),
+    crop_manifest_signature TEXT CHECK (
+        crop_manifest_signature IS NULL OR length(crop_manifest_signature) = 64
+    ),
+    started_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (
+        status != 'completed' OR (
+            question_count IS NOT NULL AND question_count > 0 AND
+            processed_pages > 0 AND codex_run_id IS NOT NULL AND
+            result_manifest_sha256 IS NOT NULL AND render_manifest_sha256 IS NOT NULL AND
+            source_pdf_sha256 IS NOT NULL AND crop_manifest_sha256 IS NOT NULL AND
+            crop_generation_id IS NOT NULL AND crop_manifest_signature IS NOT NULL AND
+            completed_at IS NOT NULL
+        )
+    )
 );
 
 CREATE TABLE IF NOT EXISTS tag_definitions (
@@ -405,3 +470,4 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_parent ON knowledge_points(parent_id);
 CREATE INDEX IF NOT EXISTS idx_source_papers_source ON source_papers(region_code, exam_year, exam_type_code);
 CREATE INDEX IF NOT EXISTS idx_import_jobs_source_status ON import_jobs(source_paper_id, status);
 CREATE INDEX IF NOT EXISTS idx_import_upload_receipts_source ON import_upload_receipts(source_paper_id);
+CREATE INDEX IF NOT EXISTS idx_import_question_split_status ON import_question_split_runs(status, updated_at);

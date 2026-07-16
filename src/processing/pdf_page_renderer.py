@@ -366,7 +366,9 @@ def claim_render_job(
             if job[0] != "pending":
                 raise PageRenderError("该历史任务不能启动页面处理")
             run = connection.execute(
-                "SELECT status FROM import_page_render_runs WHERE import_job_id=?",
+                """SELECT status,manifest_sha256,manifest_byte_size,
+                          published_batch_id,source_pdf_sha256
+                   FROM import_page_render_runs WHERE import_job_id=?""",
                 (job_id,),
             ).fetchone()
             now = _utc_now()
@@ -377,11 +379,13 @@ def claim_render_job(
                        VALUES (?, 'processing', ?, 0, ?, ?)""",
                     (job_id, dpi, now, now),
                 )
-            elif run[0] != "completed":
+            elif run[0] != "completed" or any(value is None for value in run[1:]):
                 connection.execute(
                     """UPDATE import_page_render_runs
                        SET status='processing', dpi=?, total_pages=NULL,
-                           rendered_pages=0, error_message=NULL, started_at=?,
+                           rendered_pages=0, manifest_sha256=NULL,
+                           manifest_byte_size=NULL, published_batch_id=NULL,
+                           source_pdf_sha256=NULL, error_message=NULL, started_at=?,
                            completed_at=NULL, updated_at=?
                        WHERE import_job_id=?""",
                     (dpi, now, now, job_id),
@@ -469,7 +473,8 @@ def _load_job(connection: sqlite3.Connection, job_id: int) -> sqlite3.Row:
     row = connection.execute(
         """SELECT j.id, j.status AS import_status, j.page_start, j.page_end,
                   p.stored_path, p.sha256, p.file_size, r.status AS render_status,
-                  r.dpi AS render_dpi
+                  r.dpi AS render_dpi, r.manifest_sha256, r.manifest_byte_size,
+                  r.published_batch_id, r.source_pdf_sha256
            FROM import_jobs j
            JOIN source_papers p ON p.id = j.source_paper_id
            JOIN import_page_render_runs r ON r.import_job_id = j.id
@@ -490,8 +495,8 @@ def _load_valid_existing(
     page_start: int,
     page_end: int,
     dimensions: list[tuple[int, int, int]],
-) -> dict:
-    """Return an existing completed result only after validating every byte."""
+) -> tuple[dict, bytes]:
+    """Return an existing completed result and pinned manifest bytes after validation."""
     root_fd = processing_fd = job_fd = pages_fd = None
     try:
         root_fd = _open_safe_directory(private_root)
@@ -567,7 +572,7 @@ def _load_valid_existing(
                 raise PageRenderError(SAFE_EXISTING_ERROR) from error
             if entry.get("byte_size") != byte_size or entry.get("sha256") != digest:
                 raise PageRenderError(SAFE_EXISTING_ERROR)
-        return manifest
+        return manifest, manifest_bytes
     except PageRenderError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError, UnidentifiedImageError) as error:
@@ -606,15 +611,26 @@ def _set_progress(connection: sqlite3.Connection, job_id: int, rendered: int) ->
     connection.commit()
 
 
-def _mark_completed(connection: sqlite3.Connection, job_id: int, total: int) -> None:
-    """Commit completion only after the new formal pair is installed."""
+def _mark_completed(
+    connection: sqlite3.Connection,
+    job_id: int,
+    total: int,
+    manifest_content: bytes,
+    published_batch_id: str,
+    source_pdf_sha256: str,
+) -> None:
+    """Commit completion and immutable render trust anchors after publication."""
     now = _utc_now()
     result = connection.execute(
         """UPDATE import_page_render_runs
-           SET status='completed', rendered_pages=?, error_message=NULL,
-               completed_at=?, updated_at=?
+           SET status='completed', rendered_pages=?, manifest_sha256=?,
+               manifest_byte_size=?, published_batch_id=?, source_pdf_sha256=?,
+               error_message=NULL, completed_at=?, updated_at=?
            WHERE import_job_id=? AND status='processing'""",
-        (total, now, now, job_id),
+        (
+            total, _sha256_bytes(manifest_content), len(manifest_content),
+            published_batch_id, source_pdf_sha256, now, now, job_id,
+        ),
     )
     if result.rowcount != 1:
         raise PageRenderError(SAFE_RENDER_ERROR)
@@ -795,12 +811,23 @@ def render_import_job(database_path, private_root, job_id: int, dpi: int = DEFAU
                 dimensions.append((number, width, height))
 
             if job["render_status"] == "completed":
-                if job["render_dpi"] != dpi:
+                anchors = (
+                    job["manifest_sha256"], job["manifest_byte_size"],
+                    job["published_batch_id"], job["source_pdf_sha256"],
+                )
+                if job["render_dpi"] != dpi or any(value is None for value in anchors):
                     raise PageRenderError(SAFE_EXISTING_ERROR)
-                return _load_valid_existing(
+                existing, existing_bytes = _load_valid_existing(
                     private_root, job_id, dpi, job["sha256"], source_page_count,
                     page_start, page_end, dimensions,
                 )
+                if (
+                    len(existing_bytes) != job["manifest_byte_size"]
+                    or _sha256_bytes(existing_bytes) != job["manifest_sha256"]
+                    or job["source_pdf_sha256"] != job["sha256"]
+                ):
+                    raise PageRenderError(SAFE_EXISTING_ERROR)
+                return existing
 
             try:
                 workspace = RenderWorkspace.open(private_root, job_id)
@@ -872,7 +899,12 @@ def render_import_job(database_path, private_root, job_id: int, dpi: int = DEFAU
             publish = _publish(workspace)
             try:
                 workspace.assert_attached()
-                _mark_completed(connection, job_id, total)
+                if workspace.batch_name is None:
+                    raise PageRenderError(SAFE_RENDER_ERROR)
+                _mark_completed(
+                    connection, job_id, total, manifest_content,
+                    workspace.batch_name, job["sha256"],
+                )
                 workspace.assert_attached()
             except Exception:
                 try:

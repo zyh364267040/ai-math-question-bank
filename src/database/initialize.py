@@ -152,6 +152,37 @@ def _ensure_schema_migrations(connection):
         connection.execute(
             "ALTER TABLE knowledge_points ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 1 CHECK (sort_order > 0)"
         )
+    render_columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(import_page_render_runs)")
+    }
+    render_anchor_columns = (
+        ("manifest_sha256", "TEXT CHECK (manifest_sha256 IS NULL OR (length(manifest_sha256) = 64 AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'))"),
+        ("manifest_byte_size", "INTEGER CHECK (manifest_byte_size IS NULL OR manifest_byte_size > 0)"),
+        ("published_batch_id", "TEXT CHECK (published_batch_id IS NULL OR length(published_batch_id) BETWEEN 1 AND 100)"),
+        ("source_pdf_sha256", "TEXT CHECK (source_pdf_sha256 IS NULL OR (length(source_pdf_sha256) = 64 AND source_pdf_sha256 NOT GLOB '*[^0-9a-f]*'))"),
+    )
+    for name, declaration in render_anchor_columns:
+        if name not in render_columns:
+            connection.execute(
+                f"ALTER TABLE import_page_render_runs ADD COLUMN {name} {declaration}"
+            )
+    split_columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(import_question_split_runs)")
+    }
+    split_anchor_columns = (
+        ("render_manifest_sha256", "TEXT CHECK (render_manifest_sha256 IS NULL OR length(render_manifest_sha256) = 64)"),
+        ("source_pdf_sha256", "TEXT CHECK (source_pdf_sha256 IS NULL OR length(source_pdf_sha256) = 64)"),
+        ("crop_manifest_sha256", "TEXT CHECK (crop_manifest_sha256 IS NULL OR length(crop_manifest_sha256) = 64)"),
+        ("crop_generation_id", "TEXT CHECK (crop_generation_id IS NULL OR length(crop_generation_id) = 32)"),
+        ("crop_manifest_signature", "TEXT CHECK (crop_manifest_signature IS NULL OR length(crop_manifest_signature) = 64)"),
+    )
+    for name, declaration in split_anchor_columns:
+        if name not in split_columns:
+            connection.execute(
+                f"ALTER TABLE import_question_split_runs ADD COLUMN {name} {declaration}"
+            )
     layout_columns = {
         row[1]
         for row in connection.execute(

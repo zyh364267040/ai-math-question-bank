@@ -457,17 +457,34 @@ def _validate_plans(questions: Any, expected_question_nos: Any,
 
 
 def _load_sources(job_fd: int, pages: dict[int, dict[str, Any]], *,
-                  max_source_file_bytes: int) -> tuple[dict[int, PinnedBytes], dict[int, Image.Image]]:
+                  max_source_file_bytes: int,
+                  source_page_bytes: dict[int, bytes] | None = None
+                  ) -> tuple[dict[int, PinnedBytes], dict[int, Image.Image]]:
     descriptors: dict[int, int] = {}
     artifacts: dict[int, PinnedBytes] = {}
     images: dict[int, Image.Image] = {}
     succeeded = False
     try:
-        for number, page in pages.items():
-            descriptors[number] = open_pinned_file_at(
-                job_fd, page["relative_path"], max_bytes=max_source_file_bytes)
-        for number, descriptor in descriptors.items():
-            artifact = read_pinned_descriptor(descriptor, max_bytes=max_source_file_bytes)
+        if source_page_bytes is not None:
+            if set(source_page_bytes) != set(pages) or not all(
+                isinstance(value, bytes) and 0 < len(value) <= max_source_file_bytes
+                for value in source_page_bytes.values()
+            ):
+                raise QuestionCropError("已验证源页面快照不完整或超出预算")
+            for number, content in source_page_bytes.items():
+                artifacts[number] = PinnedBytes(
+                    content, hashlib.sha256(content).hexdigest(), len(content),
+                    stat.S_IFREG | 0o600, 0, (0, number, len(content), 0, 0),
+                )
+        else:
+            for number, page in pages.items():
+                descriptors[number] = open_pinned_file_at(
+                    job_fd, page["relative_path"], max_bytes=max_source_file_bytes)
+            for number, descriptor in descriptors.items():
+                artifacts[number] = read_pinned_descriptor(
+                    descriptor, max_bytes=max_source_file_bytes
+                )
+        for number, artifact in artifacts.items():
             page = pages[number]
             if artifact.sha256 != page["sha256"]:
                 raise QuestionCropError(f"第{number}页源页面哈希与render_manifest不一致")
@@ -560,7 +577,8 @@ def generate_question_crops_report(*, job_dir, questions, expected_question_nos,
                                    max_crop_pixels_per_question=MAX_CROP_PIXELS_PER_QUESTION,
                                    max_total_crop_pixels=MAX_TOTAL_CROP_PIXELS,
                                    max_total_output_bytes=MAX_TOTAL_OUTPUT_BYTES,
-                                   min_free_disk_bytes=MIN_FREE_DISK_BYTES):
+                                   min_free_disk_bytes=MIN_FREE_DISK_BYTES,
+                                   source_page_bytes=None):
     """Generate a signed complete batch and report its published generation."""
     min_width = _positive_integer(min_width, "最小宽度")
     min_height = _positive_integer(min_height, "最小高度")
@@ -604,6 +622,7 @@ def generate_question_crops_report(*, job_dir, questions, expected_question_nos,
             sources, source_images = _load_sources(
                 lock.descriptor, pages,
                 max_source_file_bytes=limits["max_source_file_bytes"],
+                source_page_bytes=source_page_bytes,
             )
             with ExitStack() as resources:
                 for image in source_images.values():

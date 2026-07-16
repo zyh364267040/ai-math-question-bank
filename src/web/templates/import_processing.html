@@ -22,6 +22,7 @@
         <button class="button" type="submit">重试页面处理</button>
       </form>
     {% endif %}
+    <a class="button" href="/imports/{{ run.id }}/split">前往 Codex 自动切题</a>
   {% elif run.status == 'completed' %}
     <form method="post" action="/imports/{{ run.id }}/render">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

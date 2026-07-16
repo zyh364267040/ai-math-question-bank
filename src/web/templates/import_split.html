@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Codex 自动切题 · AI 数学题库{% endblock %}
+{% block head_extra %}{% if run.status == 'processing' %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">QUESTION SPLIT</p>
+  <h1>{{ run.paper_name }}</h1>
+  <p>来源文件：{{ run.original_filename }}</p>
+</section>
+<section class="paper-card processing-card">
+  <p><span class="status {{ run.status }}">{{ run.status_name }}</span></p>
+  {% if run.status == 'failed' %}<p class="form-error">{{ run.error_message }}</p>{% endif %}
+  {% if run.status in ('pending', 'failed') %}
+    <p><strong>点击后，原卷页面图片会发送给 OpenAI Codex。</strong>GET 浏览本页绝不会启动调用。</p>
+    <form method="post" action="/imports/{{ run.id }}/split">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">{% if run.status == 'failed' %}重试调用 Codex 自动切题{% else %}调用 Codex 自动切题{% endif %}</button>
+    </form>
+  {% elif run.status == 'processing' %}
+    <p>Codex 正在识别题号与边界；若服务曾重启，可显式继续。</p>
+    <form method="post" action="/imports/{{ run.id }}/split">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">继续或恢复自动切题</button>
+    </form>
+  {% elif run.status == 'completed' %}
+    <h2>共切分 {{ run.question_count }} 题</h2>
+    <p>新裁图仅为 <code>pending_ai_review</code>，不会自动入库或标记审核通过。</p>
+  {% endif %}
+</section>
+{% if crops %}
+<section class="layout-review">
+  {% for crop in crops %}
+  <article class="paper-card layout-question">
+    <h2>Q{{ '%03d'|format(crop.question_no) }}</h2>
+    <p>来源页：{% for region in crop.regions %}{{ region.page_number }}{% if not loop.last %}、{% endif %}{% endfor %}</p>
+    {% for warning in crop.warnings %}<p class="form-error">{{ warning }}</p>{% endfor %}
+    <img src="/imports/{{ run.id }}/split-images/{{ crop.question_no }}.png" alt="Q{{ '%03d'|format(crop.question_no) }} 完整单题图片">
+  </article>
+  {% endfor %}
+</section>
+{% endif %}
+{% endblock %}
