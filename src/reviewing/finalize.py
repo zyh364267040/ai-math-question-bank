@@ -5,11 +5,22 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from src.database.initialize import DEFAULT_DATABASE_PATH, initialize_database
+from src.database.initialize import DEFAULT_DATABASE_PATH
+from src.processing.secure_crop_artifacts import (
+    JobLock,
+    SecureCropArtifactError,
+    locked_job,
+    read_file_at,
+)
+from src.web.app import AuditDataError, _validate_audit_payload
+
+
+MAX_JSON_ARTIFACT_BYTES = 16 * 1024 * 1024
 
 
 class FinalizationError(ValueError):
@@ -29,6 +40,14 @@ class FinalizationResult:
     backup_sha256: str | None = None
 
 
+@dataclass(frozen=True)
+class ArtifactSnapshot:
+    relative_path: str
+    label: str
+    identity: tuple[int, int, int, int, int]
+    sha256: str
+
+
 def _canonical(value) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -37,25 +56,83 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _load_audits(private_root: Path, job_id: int):
-    path = private_root / "processing" / f"import_job_{job_id}" / "ai_audit.json"
+def _load_json_bytes(artifact_lock: JobLock, relative_path: str, label: str):
     try:
-        raw = path.read_bytes()
-        payload = json.loads(raw)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise FinalizationError("AI审核文件缺失或损坏") from exc
+        pinned = read_file_at(
+            artifact_lock.descriptor, relative_path, max_bytes=MAX_JSON_ARTIFACT_BYTES
+        )
+        payload = json.loads(pinned.data)
+    except (SecureCropArtifactError, UnicodeError, json.JSONDecodeError) as exc:
+        raise FinalizationError(f"{label}缺失、不安全或损坏") from exc
+    if not isinstance(payload, dict):
+        raise FinalizationError(f"{label}结构无效")
+    return payload, pinned.data, ArtifactSnapshot(
+        relative_path, label, pinned.identity, pinned.sha256
+    )
+
+
+def _question_numbers(payload, job_id, label, key="source_question_no"):
     questions = payload.get("questions")
-    if payload.get("import_job_id") != job_id or not isinstance(questions, list):
-        raise FinalizationError("AI审核文件与导入任务不匹配")
-    audits = {}
+    count = payload.get("question_count")
+    if (
+        payload.get("import_job_id") != job_id
+        or not isinstance(questions, list)
+        or not questions
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != len(questions)
+    ):
+        raise FinalizationError(f"{label}批次数量不完整")
+    numbers = []
     for item in questions:
         if not isinstance(item, dict):
-            raise FinalizationError("AI审核题目结构无效")
-        number = str(item.get("source_question_no", "")).strip()
-        if not number or number in audits:
-            raise FinalizationError("AI审核题号缺失或重复")
-        audits[number] = item
-    return audits, _sha256(raw)
+            raise FinalizationError(f"{label}题目结构无效")
+        number = item.get(key)
+        if not isinstance(number, str) or not number or number != number.strip():
+            raise FinalizationError(f"{label}题号缺失或无效")
+        numbers.append(number)
+    if len(numbers) != len(set(numbers)):
+        raise FinalizationError(f"{label}题号重复")
+    return tuple(numbers)
+
+
+def _load_authoritative_batch(artifact_lock: JobLock, job_id: int):
+    candidate, candidate_raw, candidate_snapshot = _load_json_bytes(
+        artifact_lock, "candidate_questions.json", "候选题文件"
+    )
+    candidate_numbers = _question_numbers(candidate, job_id, "候选题")
+    audit, audit_raw, audit_snapshot = _load_json_bytes(
+        artifact_lock, "ai_audit.json", "AI审核文件"
+    )
+    try:
+        _, audits = _validate_audit_payload(audit, job_id, candidate["questions"])
+    except AuditDataError as exc:
+        raise FinalizationError("AI审核文件结构、数量或题号无效") from exc
+    return {
+        "numbers": frozenset(candidate_numbers),
+        "source_paper_id": candidate.get("source_paper_id"),
+        "candidate_sha": _sha256(candidate_raw),
+        "candidates": {
+            item["source_question_no"]: item for item in candidate["questions"]
+        },
+        "audits": audits,
+        "audit_sha": _sha256(audit_raw),
+        "snapshots": (candidate_snapshot, audit_snapshot),
+    }
+
+
+def _verify_artifact_snapshots(artifact_lock: JobLock, snapshots) -> None:
+    for expected in snapshots:
+        try:
+            current = read_file_at(
+                artifact_lock.descriptor,
+                expected.relative_path,
+                max_bytes=MAX_JSON_ARTIFACT_BYTES,
+            )
+        except SecureCropArtifactError as exc:
+            raise FinalizationError(f"{expected.label}在收口期间发生变化") from exc
+        if current.identity != expected.identity or current.sha256 != expected.sha256:
+            raise FinalizationError(f"{expected.label}在收口期间发生变化")
 
 
 def is_ai_second_pass_eligible(audit: dict | None) -> bool:
@@ -78,14 +155,53 @@ def _drafts(connection, job_id):
     source = "approval_source" if "approval_source" in columns else "NULL AS approval_source"
     evidence = "approval_evidence_json" if "approval_evidence_json" in columns else "NULL AS approval_evidence_json"
     return connection.execute(
-        f"""SELECT id,source_question_no,edited_json,status,version,reviewed_at,
-                   deleted_at,{source},{evidence}
+        f"""SELECT id,source_question_no,source_candidate_sha256,source_snapshot_json,
+                   edited_json,status,version,reviewed_at,deleted_at,{source},{evidence}
             FROM candidate_review_drafts WHERE import_job_id=? ORDER BY id""",
         (job_id,),
     ).fetchall()
 
 
-def _plan(drafts, audits, audit_sha):
+def _decoded_object(value, message):
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise FinalizationError(message) from exc
+    if not isinstance(payload, dict):
+        raise FinalizationError(message)
+    return payload
+
+
+def _valid_human_evidence(item) -> bool:
+    try:
+        evidence = json.loads(item["approval_evidence_json"])
+        reviewed_at = datetime.fromisoformat(item["reviewed_at"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        item["approval_source"] == "human"
+        and reviewed_at.tzinfo is not None
+        and reviewed_at.utcoffset() is not None
+        and reviewed_at.astimezone(timezone.utc)
+        <= datetime.now(timezone.utc) + timedelta(minutes=5)
+        and isinstance(evidence, dict)
+        and set(evidence) == {"method", "reviewed_at"}
+        and evidence.get("method") in {"workbench", "workbench_quick", "existing_approval"}
+        and evidence.get("reviewed_at") == item["reviewed_at"]
+    )
+
+
+def _ai_evidence(audit, audit_sha):
+    return {
+        "audit_file_sha256": audit_sha,
+        "audit_status": audit["audit_status"],
+        "audit_confidence": audit["audit_confidence"],
+        "issues": audit["issues"],
+        "suggested_corrections": audit["suggested_corrections"],
+    }
+
+
+def _plan(drafts, batch):
     planned = []
     for row in drafts:
         item = dict(row)
@@ -93,20 +209,39 @@ def _plan(drafts, audits, audit_sha):
         status = item["status"]
         source = item["approval_source"]
         evidence = item["approval_evidence_json"]
-        if status == "approved" and source is None:
-            source = "human"
-            evidence = _canonical({"method": "existing_approval", "reviewed_at": item["reviewed_at"]})
-        elif status == "pending" and is_ai_second_pass_eligible(audits.get(number)):
+        candidate = batch["candidates"].get(number)
+        source_snapshot = _decoded_object(item["source_snapshot_json"], "审核草稿来源快照损坏")
+        edited = _decoded_object(item["edited_json"], "审核草稿JSON损坏")
+        bound = bool(
+            candidate is not None
+            and item["source_candidate_sha256"] == batch["candidate_sha"]
+            and source_snapshot == candidate
+            and source_snapshot.get("source_question_no") == number
+            and edited.get("source_question_no") == number
+        )
+        unedited = bound and _canonical(edited) == _canonical(candidate)
+        audit = batch["audits"].get(number)
+        expected_ai_evidence = _ai_evidence(audit, batch["audit_sha"]) if audit else None
+        if status == "approved" and source == "human":
+            if not bound or not _valid_human_evidence(item):
+                raise FinalizationError(f"Q{number} 人工批准证据或候选绑定无效")
+        elif status == "approved" and source == "ai_second_pass":
+            try:
+                stored_evidence = json.loads(evidence)
+            except (TypeError, json.JSONDecodeError):
+                stored_evidence = None
+            if (
+                not unedited
+                or not is_ai_second_pass_eligible(audit)
+                or stored_evidence != expected_ai_evidence
+            ):
+                raise FinalizationError(f"Q{number} AI批准证据、内容或候选绑定无效")
+        elif status == "approved":
+            raise FinalizationError(f"Q{number} 人工批准证据或候选绑定无效")
+        elif status == "pending" and unedited and is_ai_second_pass_eligible(audit):
             status = "approved"
             source = "ai_second_pass"
-            audit = audits[number]
-            evidence = _canonical({
-                "audit_file_sha256": audit_sha,
-                "audit_status": audit["audit_status"],
-                "audit_confidence": audit["audit_confidence"],
-                "issues": audit["issues"],
-                "suggested_corrections": audit["suggested_corrections"],
-            })
+            evidence = _canonical(expected_ai_evidence)
         item.update(planned_status=status, planned_source=source, planned_evidence=evidence)
         planned.append(item)
     return planned
@@ -315,8 +450,9 @@ def _backup(database_path: Path):
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     target = directory / f"question-bank-before-finalize-{stamp}.db"
-    with sqlite3.connect(database_path) as source, sqlite3.connect(target) as destination:
-        source.backup(destination)
+    with closing(sqlite3.connect(database_path)) as source:
+        with closing(sqlite3.connect(target)) as destination:
+            source.backup(destination)
     return target, _sha256(target.read_bytes())
 
 
@@ -336,77 +472,167 @@ def _result(planned, changed, backup_path=None, backup_sha=None):
     )
 
 
+def _foreign_key_violations(connection):
+    return connection.execute("PRAGMA foreign_key_check").fetchall()
+
+
+def _validate_draft_batch(drafts, authoritative_numbers):
+    draft_numbers = [row["source_question_no"] for row in drafts]
+    if (
+        not authoritative_numbers
+        or len(draft_numbers) != len(set(draft_numbers))
+        or set(draft_numbers) != authoritative_numbers
+    ):
+        raise FinalizationError("审核草稿题号集合不完整或与权威批次不一致")
+
+
+def _completion_ready(planned, authoritative_numbers):
+    return bool(authoritative_numbers) and len(planned) == len(authoritative_numbers) and all(
+        item["deleted_at"] is None and item["planned_status"] == "approved"
+        for item in planned
+    )
+
+
+def _validate_completed_job(planned, predicted_changes, authoritative_numbers):
+    if not _completion_ready(planned, authoritative_numbers):
+        raise FinalizationError("已完成任务的审核草稿一致性已破坏")
+    if any(
+        item["status"] != "approved"
+        or (item["status"], item["approval_source"], item["approval_evidence_json"]) != (
+            item["planned_status"], item["planned_source"], item["planned_evidence"]
+        )
+        for item in planned
+    ):
+        raise FinalizationError("已完成任务不允许产生新的审核草稿写入")
+    if predicted_changes:
+        raise FinalizationError("已完成任务的正式题内容不一致")
+
+
+def _inspect_database(connection, job_id, batch):
+    job = connection.execute(
+        "SELECT status,source_paper_id FROM import_jobs WHERE id=?", (job_id,)
+    ).fetchone()
+    if job is None:
+        raise FinalizationError("导入任务不存在")
+    if job["status"] not in {"needs_review", "completed"}:
+        raise FinalizationError(f"导入任务状态不允许收口：{job['status']}")
+    if batch["source_paper_id"] != job["source_paper_id"]:
+        raise FinalizationError("候选题文件与导入任务来源不匹配")
+    drafts = _drafts(connection, job_id)
+    _validate_draft_batch(drafts, batch["numbers"])
+    planned = _plan(drafts, batch)
+    approved = [
+        item for item in planned
+        if item["planned_status"] == "approved" and item["deleted_at"] is None
+    ]
+    formal, desired_by_number, predicted_changes = _preflight(
+        connection, job_id, approved
+    )
+    if job["status"] == "completed":
+        _validate_completed_job(planned, predicted_changes, batch["numbers"])
+    return job, planned, approved, formal, desired_by_number, predicted_changes
+
+
 def finalize_review(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1, *, apply=False):
     """Plan, or transactionally apply, finalization for one import job."""
     database_path = Path(database_path).expanduser().resolve()
     private_root = Path(private_root or database_path.parent).expanduser().resolve()
-    audits, audit_sha = _load_audits(private_root, job_id)
-    with sqlite3.connect(database_path) as connection:
-        connection.row_factory = sqlite3.Row
-        if connection.execute("SELECT 1 FROM import_jobs WHERE id=?", (job_id,)).fetchone() is None:
-            raise FinalizationError("导入任务不存在")
-        planned = _plan(_drafts(connection, job_id), audits, audit_sha)
-        approved = [x for x in planned if x["planned_status"] == "approved" and x["deleted_at"] is None]
-        _, _, predicted_changes = _preflight(connection, job_id, approved)
-    if not apply:
-        return _result(planned, predicted_changes)
-
-    backup_path, backup_sha = _backup(database_path)
-    initialize_database(database_path).close()
-    connection = sqlite3.connect(database_path)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys=ON")
-    changed = 0
     try:
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            planned = _plan(_drafts(connection, job_id), audits, audit_sha)
-            approved = [x for x in planned if x["planned_status"] == "approved" and x["deleted_at"] is None]
-            formal, desired_by_number, _ = _preflight(connection, job_id, approved)
-            now = datetime.now(timezone.utc).isoformat()
-            for item in planned:
-                if (item["status"], item["approval_source"], item["approval_evidence_json"]) != (
-                    item["planned_status"], item["planned_source"], item["planned_evidence"]
-                ):
-                    cursor = connection.execute(
-                        """UPDATE candidate_review_drafts
-                           SET status=?,approval_source=?,approval_evidence_json=?,version=version+1,
-                               reviewed_at=COALESCE(reviewed_at,?),updated_at=? WHERE id=? AND version=?""",
-                        (item["planned_status"], item["planned_source"], item["planned_evidence"],
-                         now if item["planned_status"] == "approved" else None, now, item["id"], item["version"]),
-                    )
-                    if cursor.rowcount != 1:
-                        raise FinalizationError("审核草稿版本冲突，请重试")
-            for item in approved:
-                qid = formal[item["source_question_no"]]
-                desired = desired_by_number[item["source_question_no"]]
-                content_hash = connection.execute(
-                    "SELECT content_hash FROM questions WHERE id=?", (qid,)
-                ).fetchone()[0]
-                if not _matches(_current_editable(connection, qid), desired, content_hash):
-                    content_hash = _sync_question(connection, qid, desired)
-                    _write_version(connection, qid)
-                    changed += 1
-                marker = (
-                    f"finalize_review:job={job_id};question={item['source_question_no']};"
-                    f"source={item['planned_source']};content_hash={content_hash}"
+        job_dir = private_root / "processing" / f"import_job_{job_id}"
+        with locked_job(job_dir) as artifact_lock:
+            batch = _load_authoritative_batch(artifact_lock, job_id)
+            with closing(sqlite3.connect(database_path)) as connection:
+                connection.row_factory = sqlite3.Row
+                _, planned, _, _, _, predicted_changes = _inspect_database(
+                    connection, job_id, batch
                 )
-                if connection.execute(
-                    "SELECT 1 FROM question_reviews WHERE question_id=? AND notes=?", (qid, marker)
-                ).fetchone() is None:
-                    connection.execute(
-                        """INSERT INTO question_reviews
-                           (question_id,review_item,previous_status,new_status,reviewer,reviewed_at,notes)
-                           VALUES(?,'usability','pending','passed',?,?,?)""",
-                        (qid, item["planned_source"], now, marker),
-                    )
-            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
-            if violations:
-                raise sqlite3.IntegrityError(f"收口后外键检查失败：{violations[:3]}")
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        return _result(planned, changed, backup_path, backup_sha)
-    finally:
-        connection.close()
+            if not apply:
+                _verify_artifact_snapshots(artifact_lock, batch["snapshots"])
+                return _result(planned, predicted_changes)
+
+            backup_path, backup_sha = _backup(database_path)
+            connection = sqlite3.connect(database_path)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            changed = 0
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    (job, planned, approved, formal, desired_by_number,
+                     predicted_changes) = _inspect_database(connection, job_id, batch)
+                    should_complete = _completion_ready(planned, batch["numbers"])
+                    if job["status"] != "completed":
+                        now = datetime.now(timezone.utc).isoformat()
+                        for item in planned:
+                            current = (
+                                item["status"], item["approval_source"],
+                                item["approval_evidence_json"],
+                            )
+                            planned_values = (
+                                item["planned_status"], item["planned_source"],
+                                item["planned_evidence"],
+                            )
+                            if current != planned_values:
+                                cursor = connection.execute(
+                                    """UPDATE candidate_review_drafts
+                                       SET status=?,approval_source=?,approval_evidence_json=?,
+                                           version=version+1,reviewed_at=COALESCE(reviewed_at,?),
+                                           updated_at=? WHERE id=? AND version=?""",
+                                    (*planned_values,
+                                     now if item["planned_status"] == "approved" else None,
+                                     now, item["id"], item["version"]),
+                                )
+                                if cursor.rowcount != 1:
+                                    raise FinalizationError("审核草稿版本冲突，请重试")
+                        for item in approved:
+                            qid = formal[item["source_question_no"]]
+                            desired = desired_by_number[item["source_question_no"]]
+                            content_hash = connection.execute(
+                                "SELECT content_hash FROM questions WHERE id=?", (qid,)
+                            ).fetchone()[0]
+                            if not _matches(
+                                _current_editable(connection, qid), desired, content_hash
+                            ):
+                                content_hash = _sync_question(connection, qid, desired)
+                                _write_version(connection, qid)
+                                changed += 1
+                            marker = (
+                                f"finalize_review:job={job_id};"
+                                f"question={item['source_question_no']};"
+                                f"source={item['planned_source']};content_hash={content_hash}"
+                            )
+                            if connection.execute(
+                                "SELECT 1 FROM question_reviews "
+                                "WHERE question_id=? AND notes=?", (qid, marker)
+                            ).fetchone() is None:
+                                connection.execute(
+                                    """INSERT INTO question_reviews
+                                       (question_id,review_item,previous_status,new_status,
+                                        reviewer,reviewed_at,notes)
+                                       VALUES(?,'usability','pending','passed',?,?,?)""",
+                                    (qid, item["planned_source"], now, marker),
+                                )
+                        if should_complete:
+                            cursor = connection.execute(
+                                """UPDATE import_jobs
+                                   SET status='completed',error_message=NULL,updated_at=?
+                                   WHERE id=? AND status='needs_review'""",
+                                (now, job_id),
+                            )
+                            if cursor.rowcount != 1:
+                                raise FinalizationError("导入任务状态冲突，请重试")
+                    violations = _foreign_key_violations(connection)
+                    if violations:
+                        raise sqlite3.IntegrityError(
+                            f"收口后外键检查失败：{violations[:3]}"
+                        )
+                    _verify_artifact_snapshots(artifact_lock, batch["snapshots"])
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                return _result(planned, changed, backup_path, backup_sha)
+            finally:
+                connection.close()
+    except SecureCropArtifactError as exc:
+        raise FinalizationError("导入任务文件锁不安全或不可用") from exc

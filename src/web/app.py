@@ -390,10 +390,9 @@ def _load_json(path, label):
         raise ValueError(f"{label}损坏") from error
 
 
-def _load_valid_audit(path, job_id, candidate_questions):
-    """Load one fixed audit file and reject the entire audit on any mismatch."""
+def _validate_audit_payload(audit, job_id, candidate_questions):
+    """Validate already-decoded audit data without reopening its source file."""
     try:
-        audit = _load_json(path, "AI复核数据")
         entries = audit["questions"]
         counts = audit["counts"]
         if not isinstance(audit, dict) or not isinstance(entries, list) or not isinstance(counts, dict):
@@ -456,6 +455,15 @@ def _load_valid_audit(path, job_id, candidate_questions):
         return audit, entries_by_no
     except (ValueError, KeyError, TypeError) as error:
         raise AuditDataError("AI复核数据损坏或不完整") from error
+
+
+def _load_valid_audit(path, job_id, candidate_questions):
+    """Load one fixed audit file and reject the entire audit on any mismatch."""
+    try:
+        audit = _load_json(path, "AI复核数据")
+    except ValueError as error:
+        raise AuditDataError("AI复核数据损坏或不完整") from error
+    return _validate_audit_payload(audit, job_id, candidate_questions)
 
 
 def _load_figure_assets(job_dir):

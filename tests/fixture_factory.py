@@ -8,6 +8,8 @@ from pathlib import Path
 
 from PIL import Image
 
+from src.processing.secure_crop_artifacts import load_hmac_key, sign_manifest
+
 
 QUESTION_COUNT = 23
 SYNTHETIC_PAPER_NAME = "合成测试卷（非真实试卷）"
@@ -170,10 +172,33 @@ def create_import_job_fixture(
             **metadata, "crop_status": "generated",
             "review_status": "ai_review_passed", "warnings": [],
         })
-    _write_json(job_dir / "question_crops.json", {
-        "version": 1, "import_job_id": job_id, "question_count": QUESTION_COUNT,
-        "source_pages": page_entries, "questions": crop_entries,
-    })
+    crop_manifest = {
+        "version": 2,
+        "import_job_id": job_id,
+        "generation_id": f"{job_id:032x}",
+        "question_count": QUESTION_COUNT,
+        "source_pages": [
+            {
+                key: entry[key]
+                for key in (
+                    "page_number", "relative_path", "pixel_width", "pixel_height",
+                    "sha256",
+                )
+            }
+            for entry in page_entries
+        ],
+        "questions": [
+            {
+                **entry,
+                "composition": {"mode": "single", "region_count": 1},
+            }
+            for entry in crop_entries
+        ],
+    }
+    _write_json(
+        job_dir / "question_crops.json",
+        sign_manifest(load_hmac_key(job_dir), crop_manifest),
+    )
 
     figure_entries = []
     for number in (3, 16):

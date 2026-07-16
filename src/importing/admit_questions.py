@@ -4,17 +4,38 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
+import os
 import sqlite3
+import stat
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
 from PIL import Image, UnidentifiedImageError
 
 from src.database.initialize import DEFAULT_DATABASE_PATH, initialize_database
 from src.reviewing.finalize import is_ai_second_pass_eligible
-from src.web.app import AuditDataError, _load_valid_audit
+from src.processing.secure_crop_artifacts import (
+    LOCK_FILENAME,
+    SecureCropArtifactError,
+    load_hmac_key,
+    locked_job,
+    read_file_at,
+    validate_signed_manifest,
+)
+from src.web.app import (
+    AuditDataError,
+    CHOICE_TYPES,
+    OPTION_CODE_PATTERN,
+    _validate_audit_payload,
+)
+
+
+MAX_JSON_ARTIFACT_BYTES = 16 * 1024 * 1024
+MAX_PNG_ARTIFACT_BYTES = 64 * 1024 * 1024
 
 
 class AdmissionError(ValueError):
@@ -42,11 +63,73 @@ class AdmissionResult:
     question_codes: tuple[str, ...]
 
 
-def _json(path: Path, label: str):
+@dataclass(frozen=True)
+class ArtifactSnapshot:
+    relative_path: str
+    label: str
+    max_bytes: int
+    identity: tuple[int, int, int, int, int]
+    sha256: str
+
+
+def _read_stable_artifact(job_fd: int, relative_path: str,
+                          label: str, max_bytes: int):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        pinned = read_file_at(job_fd, relative_path, max_bytes=max_bytes)
+        return pinned.data, ArtifactSnapshot(
+            relative_path, label, max_bytes, pinned.identity, pinned.sha256
+        )
+    except SecureCropArtifactError as exc:
+        raise AdmissionError(f"输入文件{label}缺失、不安全或超出限制") from exc
+
+
+def _read_artifact_json(job_fd: int, relative_path: str, label: str,
+                        snapshots: list[ArtifactSnapshot]):
+    content, snapshot = _read_stable_artifact(
+        job_fd, relative_path, label, MAX_JSON_ARTIFACT_BYTES
+    )
+    snapshots.append(snapshot)
+    try:
+        return json.loads(content.decode("utf-8")), snapshot
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise AdmissionError(f"{label}缺失或损坏") from exc
+
+
+def _verify_artifact_snapshots(job_fd: int, snapshots) -> None:
+    for expected in snapshots:
+        try:
+            _, current = _read_stable_artifact(
+                job_fd, expected.relative_path, expected.label, expected.max_bytes
+            )
+        except AdmissionError as exc:
+            raise AdmissionError(f"输入文件{expected.label}在准入期间发生变化") from exc
+        if current.identity != expected.identity or current.sha256 != expected.sha256:
+            raise AdmissionError(f"输入文件{expected.label}在准入期间发生变化")
+
+
+@contextmanager
+def _job_artifact_lock(job_dir: Path):
+    descriptor = None
+    try:
+        supplied = Path(job_dir)
+        if supplied.is_symlink():
+            raise OSError("symbolic link job directory")
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(supplied / LOCK_FILENAME, flags, 0o600)
+        details = os.fstat(descriptor)
+        if (not stat.S_ISREG(details.st_mode) or details.st_nlink != 1
+                or stat.S_IMODE(details.st_mode) != 0o600):
+            raise OSError("unsafe shared lock")
+        os.close(descriptor)
+        descriptor = None
+        with locked_job(job_dir) as lock:
+            yield lock
+    except (OSError, SecureCropArtifactError) as exc:
+        raise AdmissionError("导入任务文件锁不安全或不可用") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _sha256(path: Path) -> str:
@@ -57,22 +140,28 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _safe_png(job_dir: Path, relative: object, entry: dict) -> Path:
+def _safe_png(job_dir: Path, job_fd: int, relative: object, entry: dict,
+              snapshots: list[ArtifactSnapshot]) -> Path:
     if not isinstance(relative, str):
         raise AdmissionError("图片路径非法")
     rel = PurePosixPath(relative)
     if rel.is_absolute() or ".." in rel.parts or "\\" in relative or rel.suffix.lower() != ".png":
         raise AdmissionError("图片路径非法")
-    target = (job_dir / rel.as_posix()).resolve()
-    if not target.is_relative_to(job_dir.resolve()) or not target.is_file():
-        raise AdmissionError("图片不存在")
+    target = job_dir / rel.as_posix()
+    content, snapshot = _read_stable_artifact(
+        job_fd, rel.as_posix(), f"PNG {relative}", MAX_PNG_ARTIFACT_BYTES
+    )
+    snapshots.append(snapshot)
     try:
-        with Image.open(target) as image:
+        with Image.open(io.BytesIO(content)) as image:
+            image.verify()
+        with Image.open(io.BytesIO(content)) as image:
             if image.format != "PNG" or image.size != (entry.get("width"), entry.get("height")):
                 raise AdmissionError("图片尺寸或格式不一致")
     except (OSError, UnidentifiedImageError) as exc:
         raise AdmissionError("图片无法读取") from exc
-    if entry.get("byte_size") != target.stat().st_size or entry.get("sha256") != _sha256(target):
+    if (entry.get("byte_size") != len(content)
+            or entry.get("sha256") != snapshot.sha256):
         raise AdmissionError("图片哈希或大小不一致")
     return target
 
@@ -124,7 +213,80 @@ def _answer_analysis_sha256(question: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _load_context(connection, private_root: Path, job_id: int):
+def _canonical_json_sha256(value: object) -> str:
+    canonical = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _is_timezone_aware_iso8601(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _is_not_obviously_future_time(value: str) -> bool:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return False
+    return parsed.astimezone(timezone.utc) <= datetime.now(timezone.utc) + timedelta(
+        minutes=5
+    )
+
+
+def _valid_edited_structure(question: dict) -> bool:
+    options = question.get("options")
+    related = question.get("related_knowledge_point_codes")
+    subquestions = question.get("subquestions")
+    if (not isinstance(options, list) or not isinstance(related, list)
+            or not all(isinstance(code, str) for code in related)
+            or not isinstance(subquestions, list)):
+        return False
+    option_codes = []
+    for option in options:
+        if (not isinstance(option, dict)
+                or not isinstance(option.get("code"), str)
+                or not option["code"].strip()
+                or not OPTION_CODE_PATTERN.fullmatch(option["code"].strip())
+                or not isinstance(option.get("content"), str)):
+            return False
+        option_codes.append(option["code"].strip().casefold())
+    if len(option_codes) != len(set(option_codes)):
+        return False
+    if question.get("question_type_code") in CHOICE_TYPES and len(options) < 2:
+        return False
+    for subquestion in subquestions:
+        if (not isinstance(subquestion, dict)
+                or not isinstance(subquestion.get("label", ""), str)
+                or not isinstance(subquestion.get("stem_markdown", ""), str)
+                or any(field in subquestion and not isinstance(subquestion[field], str)
+                       for field in ("answer_markdown", "analysis_markdown"))):
+            return False
+    return not any(
+        field in question and not isinstance(question[field], str)
+        for field in ("answer_markdown", "analysis_markdown")
+    )
+
+
+def _valid_question_number(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and 1 <= len(value) <= 3
+        and value[0] in "123456789"
+        and all("0" <= character <= "9" for character in value)
+        and int(value) <= 999
+    )
+
+
+def _load_context(connection, private_root: Path, job_id: int, artifact_lock=None):
     job = connection.execute(
         """SELECT j.id,j.source_paper_id,s.sha256,s.region_code,s.exam_year,
                   s.exam_type_code,s.paper_name,s.stored_path
@@ -133,27 +295,55 @@ def _load_context(connection, private_root: Path, job_id: int):
     ).fetchone()
     if job is None:
         raise AdmissionError("导入任务不存在")
-    job_dir = private_root / "processing" / f"import_job_{job_id}"
-    candidate = _json(job_dir / "candidate_questions.json", "候选题")
+    if artifact_lock is None:
+        job_dir = private_root / "processing" / f"import_job_{job_id}"
+        with _job_artifact_lock(job_dir) as acquired:
+            return _load_context(
+                connection, private_root, job_id, artifact_lock=acquired
+            )
+    job_dir = artifact_lock.path
+    job_fd = artifact_lock.descriptor
+    snapshots = []
+    candidate, candidate_snapshot = _read_artifact_json(
+        job_fd, "candidate_questions.json", "候选题", snapshots
+    )
     questions = candidate.get("questions")
     if (not isinstance(questions, list) or candidate.get("import_job_id") != job_id
             or candidate.get("source_paper_id") != job["source_paper_id"]
             or candidate.get("question_count") != len(questions)):
         raise AdmissionError("候选题与当前任务或试卷不匹配")
     numbers = [q.get("source_question_no") for q in questions if isinstance(q, dict)]
-    if len(numbers) != len(questions) or any(not isinstance(n, str) or not n.isdigit() for n in numbers) or len(set(numbers)) != len(numbers):
+    if (len(numbers) != len(questions)
+            or any(not _valid_question_number(number) for number in numbers)
+            or len(set(numbers)) != len(numbers)):
         raise AdmissionError("候选题号非法或重复")
     _validate_optional_markdown_fields(questions)
+    audit, _audit_snapshot = _read_artifact_json(
+        job_fd, "ai_audit.json", "AI审核清单", snapshots
+    )
     try:
-        _, audits = _load_valid_audit(job_dir / "ai_audit.json", job_id, questions)
+        _, audits = _validate_audit_payload(audit, job_id, questions)
     except AuditDataError as exc:
         raise AdmissionError("AI审核清单不完整") from exc
 
-    crops_data = _json(job_dir / "question_crops.json", "完整题图清单")
+    crops_data, _crops_snapshot = _read_artifact_json(
+        job_fd, "question_crops.json", "完整题图清单", snapshots
+    )
     crop_entries = crops_data.get("questions")
     if (crops_data.get("import_job_id") != job_id or crops_data.get("question_count") != len(questions)
             or not isinstance(crop_entries, list) or len(crop_entries) != len(questions)):
         raise AdmissionError("完整题图清单不完整")
+    try:
+        validate_signed_manifest(
+            crops_data,
+            load_hmac_key(job_dir),
+            expected_job_id=job_id,
+            expected_question_nos=[int(number) for number in numbers],
+        )
+    except SecureCropArtifactError as exc:
+        raise AdmissionError(
+            "完整题图清单签名或结构无效：必须使用v2签名工件，请先重新裁图迁移"
+        ) from exc
     crops = {}
     for entry in crop_entries:
         number = str(entry.get("question_no"))
@@ -162,26 +352,36 @@ def _load_context(connection, private_root: Path, job_id: int):
         expected = f"question_crops/Q{int(number):03d}.png"
         if entry.get("output_relative_path") != expected:
             raise AdmissionError("完整题图路径非法")
-        _safe_png(job_dir, expected, entry)
+        _safe_png(job_dir, job_fd, expected, entry, snapshots)
         crops[number] = entry
     if set(crops) != set(numbers):
         raise AdmissionError("完整题图清单不完整")
 
-    figures_data = _json(job_dir / "figure_assets.json", "配图清单")
+    figures_data, _figures_snapshot = _read_artifact_json(
+        job_fd, "figure_assets.json", "配图清单", snapshots
+    )
     figures = {}
-    for entry in figures_data.get("assets", []):
+    figure_entries = figures_data.get("assets", [])
+    if not isinstance(figure_entries, list):
+        raise AdmissionError("配图清单缺失或损坏")
+    for entry in figure_entries:
         if not isinstance(entry, dict) or entry.get("kind") != "question_figure":
             continue
         number = entry.get("question_no")
         if number in figures or number not in numbers or entry.get("review_status") != "ai_review_passed":
             raise AdmissionError("必要配图未通过审核")
-        _safe_png(job_dir, entry.get("output_relative_path"), entry)
+        _safe_png(
+            job_dir, job_fd, entry.get("output_relative_path"), entry, snapshots
+        )
         figures[number] = entry
-    return job, job_dir, questions, audits, crops, figures
+    return (
+        job, job_dir, questions, audits, crops, figures,
+        candidate_snapshot.sha256, tuple(snapshots),
+    )
 
 
-def _assess(connection, context):
-    job, _, questions, audits, crops, figures = context
+def _assess(connection, context, effective=None):
+    job, _, questions, audits, crops, figures = context[:6]
     types = {row[0] for row in connection.execute("SELECT code FROM question_types WHERE is_active=1")}
     knowledge = {row[0] for row in connection.execute("SELECT code FROM knowledge_points WHERE is_active=1")}
     deleted = {
@@ -192,11 +392,14 @@ def _assess(connection, context):
         )
     }
     eligible, ineligible = [], []
-    for question in questions:
-        number = question["source_question_no"]
-        reasons = []
+    if effective is None:
+        effective = _effective_questions(connection, context)
+    for source_question in questions:
+        number = source_question["source_question_no"]
+        question = effective[number][0]
+        reasons = list(effective[number][2])
         audit = audits[number]
-        if not is_ai_second_pass_eligible(audit):
+        if not is_ai_second_pass_eligible(audit) and effective[number][1] is None:
             status = audit.get("audit_status")
             if status != "auto_pass": reasons.append(str(status or "audit_missing"))
             if audit.get("audit_confidence") != "high": reasons.append("audit_confidence_not_high")
@@ -209,13 +412,19 @@ def _assess(connection, context):
         if any(code not in knowledge for code in codes): reasons.append("missing_knowledge_point")
         if number not in crops: reasons.append("missing_question_crop")
         if question.get("figure_required") is True and number not in figures: reasons.append("missing_approved_figure")
-        answer_provided = _has_markdown(question, "answer_markdown")
-        analysis_provided = _has_markdown(question, "analysis_markdown")
-        if answer_provided and audit.get("answer_status") != "passed":
+        answer_relevant = (
+            _has_markdown(source_question, "answer_markdown")
+            or _has_markdown(question, "answer_markdown")
+        )
+        analysis_relevant = (
+            _has_markdown(source_question, "analysis_markdown")
+            or _has_markdown(question, "analysis_markdown")
+        )
+        if answer_relevant and audit.get("answer_status") != "passed":
             reasons.append("answer_status_not_passed")
-        if analysis_provided and audit.get("analysis_status") != "passed":
+        if analysis_relevant and audit.get("analysis_status") != "passed":
             reasons.append("analysis_status_not_passed")
-        if ((answer_provided or analysis_provided)
+        if ((answer_relevant or analysis_relevant)
                 and audit.get("answer_analysis_sha256") != _answer_analysis_sha256(question)):
             reasons.append("answer_analysis_sha256_mismatch")
         item = AssessmentItem(number, tuple(reasons))
@@ -223,22 +432,144 @@ def _assess(connection, context):
     return AssessmentReport(tuple(eligible), tuple(ineligible))
 
 
+def _effective_questions(connection, context):
+    """Choose reviewed human content for candidates not eligible via AI review."""
+    job, _, questions, audits, _, _ = context[:6]
+    candidate_sha256 = context[6]
+    drafts = {
+        row["source_question_no"]: row
+        for row in connection.execute(
+            """SELECT source_question_no,source_candidate_sha256,source_snapshot_json,
+                      edited_json,status,version,reviewed_at,approval_source,
+                      approval_evidence_json,deleted_at
+               FROM candidate_review_drafts WHERE import_job_id=?""",
+            (job["id"],),
+        )
+    }
+    selected = {}
+    for question in questions:
+        number = question["source_question_no"]
+        draft = drafts.get(number)
+        ai_eligible = is_ai_second_pass_eligible(audits[number])
+        human_approved = bool(
+            draft is not None
+            and draft["status"] == "approved"
+            and draft["approval_source"] == "human"
+        )
+        if draft is None or (ai_eligible and not human_approved):
+            selected[number] = (question, None, (), False)
+            continue
+        if draft["status"] != "approved":
+            selected[number] = (
+                question, None, ("human_approval_status_invalid",), False
+            )
+            continue
+        if draft["approval_source"] != "human":
+            selected[number] = (
+                question, None, ("human_approval_source_invalid",), False
+            )
+            continue
+        try:
+            evidence = json.loads(draft["approval_evidence_json"])
+        except (TypeError, json.JSONDecodeError):
+            evidence = None
+        reviewed_at = draft["reviewed_at"]
+        evidence_method = evidence.get("method") if isinstance(evidence, dict) else None
+        workbench_evidence = evidence_method in {"workbench", "workbench_quick"}
+        legacy_evidence = evidence_method == "existing_approval"
+        valid_evidence = bool(
+            _is_timezone_aware_iso8601(reviewed_at)
+            and _is_not_obviously_future_time(reviewed_at)
+            and isinstance(evidence, dict)
+            and set(evidence) == {"method", "reviewed_at"}
+            and (workbench_evidence or legacy_evidence)
+            and isinstance(evidence.get("reviewed_at"), str)
+            and evidence["reviewed_at"]
+            and evidence["reviewed_at"] == reviewed_at
+        )
+        if not valid_evidence:
+            selected[number] = (
+                question, None, ("human_approval_evidence_invalid",), False
+            )
+            continue
+        try:
+            source_snapshot = json.loads(draft["source_snapshot_json"])
+        except (TypeError, json.JSONDecodeError):
+            source_snapshot = None
+        if (draft["source_candidate_sha256"] != candidate_sha256
+                or source_snapshot != question):
+            selected[number] = (
+                question, None, ("human_approval_source_binding_invalid",), False
+            )
+            continue
+        try:
+            edited = json.loads(draft["edited_json"])
+        except (TypeError, json.JSONDecodeError):
+            edited = None
+        if (isinstance(edited, dict)
+                and edited.get("source_question_no") != number):
+            selected[number] = (
+                question, None, ("human_approval_question_identity_invalid",), False
+            )
+            continue
+        if (isinstance(edited, dict)
+                and any(edited.get(field) != question.get(field)
+                        for field in ("source_pages", "figure_required"))):
+            selected[number] = (
+                question, None, ("human_approval_immutable_fields_invalid",), False
+            )
+            continue
+        if isinstance(edited, dict) and not _valid_edited_structure(edited):
+            selected[number] = (
+                question, None, ("human_approval_edited_json_invalid",), False
+            )
+            continue
+        legacy_present = legacy_evidence
+        if legacy_present:
+            formal = connection.execute(
+                """SELECT q.question_code,q.deleted_at
+                   FROM questions q JOIN question_sources s ON s.question_id=q.id
+                   WHERE s.import_job_id=? AND s.source_question_no=?""",
+                (job["id"], number),
+            ).fetchall()
+            expected_code = _code(job["sha256"], number)
+            if (len(formal) != 1 or formal[0]["question_code"] != expected_code
+                    or formal[0]["deleted_at"] is not None):
+                selected[number] = (
+                    question, None, ("legacy_existing_approval_invalid",), False
+                )
+                continue
+        selected[number] = (
+            (edited, draft, (), legacy_present) if isinstance(edited, dict)
+            else (
+                question, None, ("human_approval_edited_json_invalid",), False
+            )
+        )
+    return selected
+
+
 def assess_job(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1):
     database_path = Path(database_path)
     private_root = Path(private_root or database_path.parent)
-    with sqlite3.connect(database_path) as connection:
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        context = _load_context(connection, private_root, job_id)
-        return _assess(connection, context)
+    job_dir = private_root / "processing" / f"import_job_{job_id}"
+    with _job_artifact_lock(job_dir) as artifact_lock:
+        with sqlite3.connect(database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            context = _load_context(
+                connection, private_root, job_id, artifact_lock=artifact_lock
+            )
+            report = _assess(connection, context)
+            _verify_artifact_snapshots(artifact_lock.descriptor, context[7])
+            return report
 
 
 def _code(source_sha: str, number: str) -> str:
     return f"Q-{source_sha[:16]}-{int(number):03d}"
 
 
-def _insert_one(connection, context, question, code):
-    job, _, _, audits, crops, figures = context
+def _insert_one(connection, context, question, code, human_approval=None):
+    job, _, _, audits, crops, figures = context[:6]
     number = question["source_question_no"]
     primary_id = connection.execute("SELECT id FROM knowledge_points WHERE code=?", (question["primary_knowledge_point_code"],)).fetchone()[0]
     content_hash = hashlib.sha256(json.dumps(question, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
@@ -297,14 +628,32 @@ def _insert_one(connection, context, question, code):
             (qid, kind, asset["output_relative_path"], asset["width"], asset["height"], asset["byte_size"], asset["sha256"], job["id"]),
         )
     any_answer_provided = _has_markdown(question, "answer_markdown")
-    review_note = (
-        "AI审核auto_pass；原卷答案已通过审核"
-        if any_answer_provided else "AI审核auto_pass；原卷未提供答案"
+    answer_note = (
+        "原卷答案已通过审核" if any_answer_provided else "原卷未提供答案"
     )
+    if human_approval is not None:
+        evidence = json.dumps(
+            json.loads(human_approval["approval_evidence_json"]),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        reviewer = "human"
+        reviewed_at = human_approval["reviewed_at"]
+        review_note = (
+            f"人工审核通过；草稿版本={human_approval['version']}；"
+            f"候选源SHA256={human_approval['source_candidate_sha256']}；"
+            f"获批内容SHA256={_canonical_json_sha256(question)}；"
+            f"批准证据={evidence}；{answer_note}"
+        )
+    else:
+        reviewer = audits[number].get("auditor", "ai_audit")
+        reviewed_at = datetime.now(timezone.utc).isoformat()
+        review_note = f"AI二审通过（auto_pass）；{answer_note}"
     connection.execute(
         """INSERT INTO question_reviews(question_id,review_item,previous_status,new_status,reviewer,reviewed_at,notes)
            VALUES(?,'usability','pending','passed',?,?,?)""",
-        (qid, audits[number].get("auditor", "ai_audit"), datetime.now(timezone.utc).isoformat(), review_note),
+        (qid, reviewer, reviewed_at, review_note),
     )
     return qid
 
@@ -312,37 +661,65 @@ def _insert_one(connection, context, question, code):
 def admit_questions(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1):
     database_path = Path(database_path)
     private_root = Path(private_root or database_path.parent)
-    initialize_database(database_path).close()
-    connection = sqlite3.connect(database_path)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys=ON")
-    try:
-        context = _load_context(connection, private_root, job_id)
-        assessment = _assess(connection, context)
-        manifest_reasons = {
-            "empty_stem", "invalid_question_type", "missing_knowledge_point",
-            "missing_question_crop", "missing_approved_figure",
-            "answer_status_not_passed", "analysis_status_not_passed",
-            "answer_analysis_sha256_mismatch",
-        }
-        unsafe = [item for item in assessment.ineligible if manifest_reasons.intersection(item.reasons)]
-        if unsafe:
-            detail = "; ".join(f"Q{x.question_no}:{','.join(x.reasons)}" for x in unsafe)
-            raise AdmissionError(f"批次不满足安全入库条件（{detail}）")
-        by_no = {q["source_question_no"]: q for q in context[2]}
-        codes, inserted, present = [], 0, 0
-        with connection:
+    job_dir = private_root / "processing" / f"import_job_{job_id}"
+    with _job_artifact_lock(job_dir) as artifact_lock:
+        initialize_database(database_path).close()
+        connection = sqlite3.connect(database_path, timeout=10.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=10000")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            context = _load_context(
+                connection, private_root, job_id, artifact_lock=artifact_lock
+            )
+            effective = _effective_questions(connection, context)
+            assessment = _assess(connection, context, effective)
+            manifest_reasons = {
+                "empty_stem", "invalid_question_type", "missing_knowledge_point",
+                "missing_question_crop", "missing_approved_figure",
+                "answer_status_not_passed", "analysis_status_not_passed",
+                "answer_analysis_sha256_mismatch",
+            }
+            unsafe = [
+                item for item in assessment.ineligible
+                if manifest_reasons.intersection(item.reasons)
+            ]
+            if unsafe:
+                detail = "; ".join(
+                    f"Q{x.question_no}:{','.join(x.reasons)}" for x in unsafe
+                )
+                raise AdmissionError(f"批次不满足安全入库条件（{detail}）")
+            codes, inserted, present = [], 0, 0
             for item in assessment.eligible:
                 code = _code(context[0]["sha256"], item.question_no)
                 codes.append(code)
-                if connection.execute("SELECT 1 FROM questions WHERE question_code=?", (code,)).fetchone():
+                if connection.execute(
+                    "SELECT 1 FROM questions WHERE question_code=?", (code,)
+                ).fetchone():
                     present += 1
                     continue
-                _insert_one(connection, context, by_no[item.question_no], code)
+                if effective[item.question_no][3]:
+                    raise AdmissionError(
+                        f"Q{item.question_no} 的历史批准不得用于首次入库"
+                    )
+                _insert_one(
+                    connection, context, effective[item.question_no][0], code,
+                    effective[item.question_no][1],
+                )
                 inserted += 1
-        return AdmissionResult(inserted, present, len(assessment.eligible), len(assessment.ineligible), tuple(codes))
-    finally:
-        connection.close()
+            _verify_artifact_snapshots(artifact_lock.descriptor, context[7])
+            result = AdmissionResult(
+                inserted, present, len(assessment.eligible), len(assessment.ineligible),
+                tuple(codes),
+            )
+            connection.commit()
+            return result
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
 
 def backup_database(database_path=DEFAULT_DATABASE_PATH, backup_dir=None):
