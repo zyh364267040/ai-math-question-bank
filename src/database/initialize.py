@@ -62,6 +62,90 @@ def _tag_code(category, position):
     return f"{category}_{position:02d}"
 
 
+def _rebuild_layout_analysis_runs(connection, old_columns):
+    """Replace a legacy layout-run table with the fully constrained schema."""
+    connection.row_factory = sqlite3.Row
+    old_rows = [dict(row) for row in connection.execute(
+        "SELECT * FROM import_layout_analysis_runs"
+    )]
+    schema = SCHEMA_PATH.read_text(encoding="utf-8")
+    start = schema.index("CREATE TABLE IF NOT EXISTS import_layout_analysis_runs (")
+    end = schema.index("\n\nCREATE TABLE IF NOT EXISTS import_upload_receipts", start)
+    create_sql = schema[start:end].replace("IF NOT EXISTS ", "", 1).replace(
+        "CREATE TABLE import_layout_analysis_runs (",
+        "CREATE TABLE import_layout_analysis_runs_current (",
+        1,
+    )
+    connection.execute(create_sql)
+    columns = (
+        "import_job_id", "status", "total_pages", "analyzed_pages",
+        "detected_questions", "manifest_sha256", "manifest_byte_size",
+        "published_batch_id", "source_pdf_sha256", "render_manifest_sha256",
+        "error_message", "started_at", "completed_at", "updated_at",
+    )
+    for row in old_rows:
+        total_pages = row.get("total_pages")
+        total_pages = total_pages if type(total_pages) is int and total_pages > 0 else None
+        analyzed_pages = row.get("analyzed_pages", 0)
+        if (
+            type(analyzed_pages) is not int
+            or analyzed_pages < 0
+            or (total_pages is not None and analyzed_pages > total_pages)
+        ):
+            analyzed_pages = 0
+        detected_questions = row.get("detected_questions", 0)
+        if type(detected_questions) is not int or detected_questions < 0:
+            detected_questions = 0
+        anchors = {
+            "manifest_sha256": row.get("manifest_sha256") if "manifest_sha256" in old_columns else None,
+            "manifest_byte_size": row.get("manifest_byte_size") if "manifest_byte_size" in old_columns else None,
+            "published_batch_id": row.get("published_batch_id") if "published_batch_id" in old_columns else None,
+            "source_pdf_sha256": row.get("source_pdf_sha256") if "source_pdf_sha256" in old_columns else None,
+            "render_manifest_sha256": row.get("render_manifest_sha256") if "render_manifest_sha256" in old_columns else None,
+        }
+        anchors_valid = (
+            all(isinstance(anchors[name], str) and len(anchors[name]) == 64 for name in (
+                "manifest_sha256", "source_pdf_sha256", "render_manifest_sha256"
+            ))
+            and type(anchors["manifest_byte_size"]) is int
+            and anchors["manifest_byte_size"] > 0
+            and isinstance(anchors["published_batch_id"], str)
+            and 1 <= len(anchors["published_batch_id"]) <= 64
+        )
+        status = row.get("status")
+        if status not in {"pending", "processing", "completed", "failed"}:
+            status = "failed"
+        if status == "completed" and not (
+            anchors_valid and total_pages is not None and analyzed_pages == total_pages
+        ):
+            status = "failed"
+        if not anchors_valid:
+            anchors = {name: None for name in anchors}
+        values = {
+            "import_job_id": row["import_job_id"],
+            "status": status,
+            "total_pages": total_pages,
+            "analyzed_pages": analyzed_pages,
+            "detected_questions": detected_questions,
+            **anchors,
+            "error_message": row.get("error_message"),
+            "started_at": row.get("started_at"),
+            "completed_at": row.get("completed_at") if status == "completed" else None,
+            "updated_at": row.get("updated_at") or "1970-01-01T00:00:00+00:00",
+        }
+        connection.execute(
+            f"INSERT INTO import_layout_analysis_runs_current ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(values[column] for column in columns),
+        )
+    connection.execute("DROP TABLE import_layout_analysis_runs")
+    connection.execute(
+        "ALTER TABLE import_layout_analysis_runs_current "
+        "RENAME TO import_layout_analysis_runs"
+    )
+    connection.row_factory = None
+
+
 def _ensure_schema_migrations(connection):
     columns = {row[1] for row in connection.execute("PRAGMA table_info(knowledge_points)")}
     if "sort_order" not in columns:
@@ -74,19 +158,53 @@ def _ensure_schema_migrations(connection):
             "PRAGMA table_info(import_layout_analysis_runs)"
         )
     }
-    layout_anchor_columns = {
-        "manifest_sha256": "TEXT CHECK (manifest_sha256 IS NULL OR length(manifest_sha256) = 64)",
-        "manifest_byte_size": "INTEGER CHECK (manifest_byte_size IS NULL OR manifest_byte_size > 0)",
-        "published_batch_id": "TEXT CHECK (published_batch_id IS NULL OR length(published_batch_id) BETWEEN 1 AND 64)",
-        "source_pdf_sha256": "TEXT CHECK (source_pdf_sha256 IS NULL OR length(source_pdf_sha256) = 64)",
-        "render_manifest_sha256": "TEXT CHECK (render_manifest_sha256 IS NULL OR length(render_manifest_sha256) = 64)",
-    }
-    for name, declaration in layout_anchor_columns.items():
-        if name not in layout_columns:
-            connection.execute(
-                f"ALTER TABLE import_layout_analysis_runs "
-                f"ADD COLUMN {name} {declaration}"
-            )
+    layout_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='import_layout_analysis_runs'"
+    ).fetchone()
+    schema = SCHEMA_PATH.read_text(encoding="utf-8")
+    layout_start = schema.index(
+        "CREATE TABLE IF NOT EXISTS import_layout_analysis_runs ("
+    )
+    layout_end = schema.index(
+        "\n\nCREATE TABLE IF NOT EXISTS import_upload_receipts", layout_start
+    )
+
+    def normalize_layout_sql(sql):
+        text = (sql or "").strip().rstrip(";")
+        normalized = []
+        in_literal = False
+        index = 0
+        while index < len(text):
+            character = text[index]
+            if character == "'":
+                normalized.append(character)
+                if in_literal and index + 1 < len(text) and text[index + 1] == "'":
+                    normalized.append("'")
+                    index += 2
+                    continue
+                in_literal = not in_literal
+            elif not in_literal and character.isspace():
+                if normalized and normalized[-1] != " ":
+                    normalized.append(" ")
+            elif in_literal:
+                normalized.append(character)
+            else:
+                normalized.append(character.lower())
+            index += 1
+        result = "".join(normalized).strip()
+        result = result.replace(
+            "create table if not exists ", "create table ", 1
+        )
+        return result.replace(
+            'create table "import_layout_analysis_runs"',
+            "create table import_layout_analysis_runs",
+            1,
+        )
+
+    expected_layout_sql = normalize_layout_sql(schema[layout_start:layout_end])
+    if normalize_layout_sql(layout_sql_row[0]) != expected_layout_sql:
+        _rebuild_layout_analysis_runs(connection, layout_columns)
     question_columns = {row[1] for row in connection.execute("PRAGMA table_info(questions)")}
     if "answer_status" not in question_columns:
         # SQLite cannot drop the historic non-empty-answer CHECK in place.  This
@@ -174,6 +292,19 @@ def _upsert_knowledge_points(connection, points):
             ).fetchone()[0]
 
 
+def _execute_script_transactionally(connection, script):
+    """Execute a SQLite script without executescript's implicit COMMIT."""
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            if pending.strip():
+                connection.execute(pending)
+            pending = ""
+    if pending.strip():
+        raise sqlite3.OperationalError("incomplete schema statement")
+
+
 def initialize_database(
     database_path=DEFAULT_DATABASE_PATH,
     knowledge_points_path=DEFAULT_KNOWLEDGE_POINTS_PATH,
@@ -187,42 +318,46 @@ def initialize_database(
     }
     rebuilding_questions = bool(existing_question_columns) and "answer_status" not in existing_question_columns
     connection.execute(f"PRAGMA foreign_keys = {'OFF' if rebuilding_questions else 'ON'}")
+    schema = SCHEMA_PATH.read_text(encoding="utf-8")
     try:
-        connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-        with connection:
-            _ensure_schema_migrations(connection)
-            for table, rows in DICTIONARY_ROWS.items():
-                connection.executemany(
-                    f"INSERT OR IGNORE INTO {table} (code, name) VALUES (?, ?)", rows
-                )
+        connection.execute("BEGIN IMMEDIATE")
+        _execute_script_transactionally(connection, schema)
+        _ensure_schema_migrations(connection)
+        for table, rows in DICTIONARY_ROWS.items():
             connection.executemany(
-                """INSERT OR IGNORE INTO difficulty_levels
-                   (level, name, description) VALUES (?, ?, ?)""",
-                DIFFICULTIES,
+                f"INSERT OR IGNORE INTO {table} (code, name) VALUES (?, ?)", rows
             )
-            tag_rows = [
-                (category, _tag_code(category, position), name)
-                for category, names in TAG_NAMES.items()
-                for position, name in enumerate(names, start=1)
-            ]
-            connection.executemany(
-                """INSERT OR IGNORE INTO tag_definitions
-                   (category, code, name) VALUES (?, ?, ?)""",
-                tag_rows,
-            )
-            _upsert_knowledge_points(
-                connection, _load_knowledge_points(knowledge_points_path)
-            )
-            connection.execute(
-                "INSERT OR IGNORE INTO baskets (basket_key, name) VALUES ('default', '默认选题篮')"
-            )
+        connection.executemany(
+            """INSERT OR IGNORE INTO difficulty_levels
+               (level, name, description) VALUES (?, ?, ?)""",
+            DIFFICULTIES,
+        )
+        tag_rows = [
+            (category, _tag_code(category, position), name)
+            for category, names in TAG_NAMES.items()
+            for position, name in enumerate(names, start=1)
+        ]
+        connection.executemany(
+            """INSERT OR IGNORE INTO tag_definitions
+               (category, code, name) VALUES (?, ?, ?)""",
+            tag_rows,
+        )
+        _upsert_knowledge_points(
+            connection, _load_knowledge_points(knowledge_points_path)
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO baskets (basket_key, name) VALUES ('default', '默认选题篮')"
+        )
         if rebuilding_questions:
-            connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-            connection.execute("PRAGMA foreign_keys = ON")
-            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
-            if violations:
-                raise sqlite3.IntegrityError(f"迁移后外键检查失败: {violations[:3]}")
+            _execute_script_transactionally(connection, schema)
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise sqlite3.IntegrityError(f"迁移后外键检查失败: {violations[:3]}")
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = ON")
     except Exception:
+        if connection.in_transaction:
+            connection.rollback()
         connection.close()
         raise
     return connection

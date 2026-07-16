@@ -6,16 +6,20 @@ import fcntl
 import hashlib
 import io
 import json
+import multiprocessing
 import os
 import re
+import resource
 import secrets
 import sqlite3
 import stat
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 import pymupdf
+import psutil
 from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 
 from src.processing.pdf_page_renderer import (
@@ -35,6 +39,15 @@ MAX_DOWNSCALED_PIXELS_PER_PAGE = 2_000_000
 MAX_TOTAL_ANALYSIS_PIXELS = 200_000_000
 MAX_COLUMNS = 3
 MAX_QUESTIONS = 200
+MAX_TEXT_WORDS_PER_PAGE = 50_000
+MAX_TOTAL_TEXT_WORDS = 500_000
+MAX_TEXT_BYTES_PER_PAGE = 5 * 1024 * 1024
+MAX_TOTAL_TEXT_BYTES = 20 * 1024 * 1024
+MAX_TEXT_WORKER_MEMORY_BYTES = 1024 * 1024 * 1024
+MAX_TEXT_WORKER_CPU_SECONDS = 60
+MAX_TEXT_EXTRACTION_SECONDS = 90
+MAX_TEXT_IPC_BYTES = 1024 * 1024
+MAX_JOB_DIRECTORY_ENTRIES = 64
 MAX_LAYOUT_OUTPUT_BYTES = 1024 * 1024 * 1024
 MIN_FREE_BYTES = 512 * 1024 * 1024
 MAX_MANIFEST_BYTES = 10 * 1024 * 1024
@@ -424,7 +437,9 @@ def _load_inputs(
             if cumulative > MAX_LAYOUT_OUTPUT_BYTES:
                 raise PageLayoutError(SAFE_LIMIT_ERROR)
             statted.append((entry, name, details.st_size))
-        if set(os.listdir(pages_fd)) != expected_names:
+        if _bounded_directory_names(
+            pages_fd, len(expected_names), SAFE_INPUT_ERROR
+        ) != expected_names:
             raise PageLayoutError(SAFE_INPUT_ERROR)
         loaded = []
         for entry, name, size in statted:
@@ -473,6 +488,7 @@ def _load_valid_existing(
     detected_questions: int,
     *,
     target_page_number: int | None = None,
+    verify_overlay_bytes: bool = True,
 ) -> dict:
     """Validate the complete published overlay batch before reading image bytes."""
     root_fd = processing_fd = job_fd = result_fd = overlays_fd = None
@@ -515,6 +531,11 @@ def _load_valid_existing(
         dimensions = {
             entry["page_number"]: (entry["pixel_width"], entry["pixel_height"])
             for entry in render_pages
+        }
+        pages_by_number = {
+            page["page_number"]: page
+            for page in pages
+            if isinstance(page, dict) and type(page.get("page_number")) is int
         }
         page_order = {
             entry["page_number"]: index for index, entry in enumerate(render_pages)
@@ -560,11 +581,24 @@ def _load_valid_existing(
             if total > MAX_LAYOUT_OUTPUT_BYTES:
                 raise PageLayoutError(SAFE_EXISTING_ERROR)
             expected_names.add(name)
-            if target_page_number is None or number == target_page_number:
+            is_requested_file = (
+                target_page_number is None or number == target_page_number
+            )
+            if is_requested_file:
+                details = os.stat(name, dir_fd=overlays_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(details.st_mode)
+                    or details.st_nlink != 1
+                    or details.st_size != overlay["byte_size"]
+                ):
+                    raise PageLayoutError(SAFE_EXISTING_ERROR)
+            if verify_overlay_bytes and is_requested_file:
                 statted.append(
                     (number, name, overlay, width, height, overlay["byte_size"])
                 )
-        if target_page_number is None and set(os.listdir(overlays_fd)) != expected_names:
+        if target_page_number is None and _bounded_directory_names(
+            overlays_fd, len(expected_names), SAFE_EXISTING_ERROR
+        ) != expected_names:
             raise PageLayoutError(SAFE_EXISTING_ERROR)
         for question in questions:
             if (
@@ -583,10 +617,7 @@ def _load_valid_existing(
                 width, height = dimensions[region["page_number"]]
                 if not _valid_bbox(region.get("bbox"), width, height):
                     raise PageLayoutError(SAFE_EXISTING_ERROR)
-                region_page = next(
-                    item for item in pages
-                    if item["page_number"] == region["page_number"]
-                )
+                region_page = pages_by_number[region["page_number"]]
                 containing_columns = [
                     column_index
                     for column_index, column in enumerate(region_page["columns"])
@@ -638,6 +669,24 @@ def _load_valid_existing(
         raise PageLayoutError(SAFE_EXISTING_ERROR) from error
     finally:
         _close_descriptors(overlays_fd, result_fd, job_fd, processing_fd, root_fd)
+
+
+def _bounded_directory_names(
+    directory_fd: int, max_entries: int, error_message: str
+) -> set[str]:
+    """Enumerate at most the manifest-authorized number of directory entries."""
+    names = set()
+    try:
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                if len(names) >= max_entries:
+                    raise PageLayoutError(error_message)
+                names.add(entry.name)
+    except PageLayoutError:
+        raise
+    except OSError as error:
+        raise PageLayoutError(error_message) from error
+    return names
 
 
 def _valid_bbox(value, width: int, height: int) -> bool:
@@ -739,27 +788,49 @@ MAIN_NUMBER = re.compile(r"^(?P<number>[1-9]\d{0,2})(?:[.．、]|题)(?!\d)")
 
 
 def _page_words(document, page_number: int):
-    try:
-        return document.load_page(page_number - 1).get_text("words", sort=True)
-    except Exception:
-        return []
+    return document.load_page(page_number - 1).get_text("words", sort=True)
 
 
-def _anchors_for_page(document, entry: dict, columns: list[list[int]]):
+def _anchors_for_page(
+    document,
+    entry: dict,
+    columns: list[list[int]],
+    text_budget: dict[str, int] | None = None,
+):
     page = document.load_page(entry["page_number"] - 1)
     scale_x = entry["pixel_width"] / page.rect.width
     scale_y = entry["pixel_height"] / page.rect.height
     words = _page_words(document, entry["page_number"])
+    if len(words) > MAX_TEXT_WORDS_PER_PAGE:
+        raise PageLayoutError(SAFE_LIMIT_ERROR)
+    if text_budget is None:
+        text_budget = {"words": 0, "bytes": 0, "anchors": 0}
+    text_budget["words"] += len(words)
+    if text_budget["words"] > MAX_TOTAL_TEXT_WORDS:
+        raise PageLayoutError(SAFE_LIMIT_ERROR)
     anchors = []
+    page_text_bytes = 0
     for word in words:
-        match = MAIN_NUMBER.match(str(word[4]).strip())
+        text = str(word[4]).strip()
+        text_bytes = len(text.encode("utf-8"))
+        page_text_bytes += text_bytes
+        text_budget["bytes"] += text_bytes
+        if (
+            page_text_bytes > MAX_TEXT_BYTES_PER_PAGE
+            or text_budget["bytes"] > MAX_TOTAL_TEXT_BYTES
+        ):
+            raise PageLayoutError(SAFE_LIMIT_ERROR)
+        match = MAIN_NUMBER.match(text)
         if not match:
             continue
         px = round(word[0] * scale_x)
         py = round(word[1] * scale_y)
         for column_index, column in enumerate(columns):
             column_width = column[2] - column[0]
-            if column[0] - 5 <= px <= column[0] + max(30, column_width * 0.16):
+            if (
+                column[0] - 5 <= px <= column[0] + max(30, column_width * 0.16)
+                and py < column[3]
+            ):
                 anchors.append({
                     "question_no": match.group("number"),
                     "page_number": entry["page_number"],
@@ -767,9 +838,191 @@ def _anchors_for_page(document, entry: dict, columns: list[list[int]]):
                     "x": max(column[0], px),
                     "y": max(column[1], py),
                 })
+                text_budget["anchors"] += 1
+                if text_budget["anchors"] > MAX_QUESTIONS:
+                    raise PageLayoutError(SAFE_LIMIT_ERROR)
                 break
     anchors.sort(key=lambda item: (item["column_index"], item["y"], item["x"]))
     return bool(words), anchors
+
+
+def _limit_text_worker_resources() -> None:
+    """Apply a kernel CPU limit before parsing an untrusted PDF text layer."""
+    resource.setrlimit(
+        resource.RLIMIT_CPU,
+        (MAX_TEXT_WORKER_CPU_SECONDS, MAX_TEXT_WORKER_CPU_SECONDS + 1),
+    )
+
+
+def _text_extraction_worker(connection, source: bytes, page_specs: list[dict]) -> None:
+    """Extract bounded anchors in a disposable process and return small metadata."""
+    document = None
+    try:
+        _limit_text_worker_resources()
+        document = pymupdf.open(stream=source, filetype="pdf")
+        text_budget = {"words": 0, "bytes": 0, "anchors": 0}
+        results = []
+        for spec in page_specs:
+            text_available, anchors = _anchors_for_page(
+                document, spec, spec["columns"], text_budget
+            )
+            results.append({
+                "page_number": spec["page_number"],
+                "text_layer_available": text_available,
+                "anchors": anchors,
+            })
+        document.close()
+        document = None
+        payload = json.dumps(
+            {"status": "ok", "results": results},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload) > MAX_TEXT_IPC_BYTES:
+            raise PageLayoutError(SAFE_LIMIT_ERROR)
+        connection.send_bytes(payload)
+    except PageLayoutError as error:
+        kind = "limit" if str(error) == SAFE_LIMIT_ERROR else "analysis"
+        try:
+            connection.send_bytes(json.dumps(
+                {"status": "error", "kind": kind}, separators=(",", ":")
+            ).encode("utf-8"))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    except BaseException:
+        try:
+            connection.send_bytes(
+                b'{"status":"error","kind":"analysis"}'
+            )
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        if document is not None:
+            document.close()
+        connection.close()
+
+
+def _extract_text_anchors(
+    source: bytes,
+    page_specs: list[dict],
+    *,
+    timeout_seconds: float = MAX_TEXT_EXTRACTION_SECONDS,
+    memory_limit_bytes: int = MAX_TEXT_WORKER_MEMORY_BYTES,
+    cpu_limit_seconds: float = MAX_TEXT_WORKER_CPU_SECONDS,
+    max_ipc_bytes: int = MAX_TEXT_IPC_BYTES,
+    worker_target=None,
+) -> list[tuple[int, bool, list[dict]]]:
+    """Run PDF text extraction with process memory, CPU and wall-clock limits."""
+    context = multiprocessing.get_context("spawn")
+    receive_connection, send_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=worker_target or _text_extraction_worker,
+        args=(send_connection, source, page_specs),
+        daemon=True,
+    )
+    process.start()
+    send_connection.close()
+    frame = None
+    try:
+        monitored = psutil.Process(process.pid)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            alive = process.is_alive()
+            if alive:
+                try:
+                    if monitored.memory_info().rss > memory_limit_bytes:
+                        raise PageLayoutError(SAFE_LIMIT_ERROR)
+                    cpu_times = monitored.cpu_times()
+                    if cpu_times.user + cpu_times.system > cpu_limit_seconds:
+                        raise PageLayoutError(SAFE_LIMIT_ERROR)
+                except psutil.NoSuchProcess:
+                    alive = False
+                except (psutil.AccessDenied, psutil.Error) as error:
+                    raise PageLayoutError(SAFE_ANALYSIS_ERROR) from error
+            if frame is None and receive_connection.poll(0.01 if alive else 0):
+                try:
+                    frame = receive_connection.recv_bytes(max_ipc_bytes)
+                except (EOFError, OSError) as error:
+                    raise PageLayoutError(SAFE_ANALYSIS_ERROR) from error
+            if not alive:
+                break
+            if time.monotonic() >= deadline:
+                raise PageLayoutError(SAFE_LIMIT_ERROR)
+        process.join(timeout=1)
+        if process.exitcode != 0 or frame is None:
+            raise PageLayoutError(SAFE_ANALYSIS_ERROR)
+    finally:
+        receive_connection.close()
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=2)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+    try:
+        message = json.loads(frame.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, AttributeError) as error:
+        raise PageLayoutError(SAFE_ANALYSIS_ERROR) from error
+    if not isinstance(message, dict) or message.get("status") not in {"ok", "error"}:
+        raise PageLayoutError(SAFE_ANALYSIS_ERROR)
+    if message["status"] == "error":
+        if set(message) != {"status", "kind"} or message["kind"] not in {
+            "limit", "analysis"
+        }:
+            raise PageLayoutError(SAFE_ANALYSIS_ERROR)
+        raise PageLayoutError(
+            SAFE_LIMIT_ERROR if message["kind"] == "limit" else SAFE_ANALYSIS_ERROR
+        )
+    if set(message) != {"status", "results"}:
+        raise PageLayoutError(SAFE_ANALYSIS_ERROR)
+    results = message["results"]
+    if not isinstance(results, list) or len(results) != len(page_specs):
+        raise PageLayoutError(SAFE_ANALYSIS_ERROR)
+    expected_numbers = [spec["page_number"] for spec in page_specs]
+    validated_results = []
+    total_anchors = 0
+    for result, expected_number in zip(results, expected_numbers):
+        if (
+            not isinstance(result, dict)
+            or set(result) != {"page_number", "text_layer_available", "anchors"}
+            or type(result["page_number"]) is not int
+            or result["page_number"] != expected_number
+            or type(result["text_layer_available"]) is not bool
+            or not isinstance(result["anchors"], list)
+        ):
+            raise PageLayoutError(SAFE_ANALYSIS_ERROR)
+        spec = page_specs[len(validated_results)]
+        anchors = result["anchors"]
+        total_anchors += len(anchors)
+        if total_anchors > MAX_QUESTIONS or (
+            not result["text_layer_available"] and anchors
+        ):
+            raise PageLayoutError(SAFE_ANALYSIS_ERROR)
+        for anchor in anchors:
+            if (
+                not isinstance(anchor, dict)
+                or set(anchor) != {
+                    "question_no", "page_number", "column_index", "x", "y"
+                }
+                or re.fullmatch(r"[1-9]\d{0,2}", anchor.get("question_no", "")) is None
+                or type(anchor.get("page_number")) is not int
+                or anchor.get("page_number") != expected_number
+                or type(anchor.get("column_index")) is not int
+                or not 0 <= anchor["column_index"] < len(spec["columns"])
+                or type(anchor.get("x")) is not int
+                or type(anchor.get("y")) is not int
+            ):
+                raise PageLayoutError(SAFE_ANALYSIS_ERROR)
+            column = spec["columns"][anchor["column_index"]]
+            if not (
+                column[0] <= anchor["x"] <= column[2]
+                and column[1] <= anchor["y"] < column[3]
+            ):
+                raise PageLayoutError(SAFE_ANALYSIS_ERROR)
+        validated_results.append((
+            expected_number, result["text_layer_available"], anchors
+        ))
+    return validated_results
 
 
 def _build_questions(page_results: list[dict], all_anchors: list[dict]):
@@ -930,7 +1183,9 @@ def _directory_matches_anchor(job_fd: int, name: str, anchor: dict) -> bool:
     directory_fd = overlays_fd = None
     try:
         directory_fd = _open_child_directory(job_fd, name)
-        if set(os.listdir(directory_fd)) != {"layout_manifest.json", "overlays"}:
+        if _bounded_directory_names(
+            directory_fd, 2, SAFE_EXISTING_ERROR
+        ) != {"layout_manifest.json", "overlays"}:
             return False
         content = _read_regular_at(
             directory_fd,
@@ -1042,7 +1297,9 @@ def _directory_matches_anchor(job_fd: int, name: str, anchor: dict) -> bool:
             expected_names.add(filename)
             page_order[number] = len(page_order)
             dimensions[number] = (width, height, page["columns"])
-        if set(os.listdir(overlays_fd)) != expected_names:
+        if _bounded_directory_names(
+            overlays_fd, len(expected_names), SAFE_EXISTING_ERROR
+        ) != expected_names:
             return False
         for question in questions:
             if (
@@ -1120,7 +1377,9 @@ def _recover_layout_publication(
     try:
         workspace = _LayoutWorkspace.open(private_root, job_id)
         fd = workspace.job_fd
-        names = os.listdir(fd)
+        names = _bounded_directory_names(
+            fd, MAX_JOB_DIRECTORY_ENTRIES, SAFE_ANALYSIS_ERROR
+        )
         batches = sorted(name for name in names if _CONTROLLED_BATCH.fullmatch(name))
         backups = sorted(name for name in names if _CONTROLLED_BACKUP.fullmatch(name))
         anchored = (
@@ -1419,28 +1678,24 @@ def _load_completed_reference(database_path: Path, private_root: Path, job_id: i
 
 
 def load_completed_layout(database_path, private_root, job_id: int) -> dict:
-    """Read and fully verify one completed review manifest without starting work."""
+    """Validate trusted metadata for a completed review without reading large PNGs."""
     if type(job_id) is not int or job_id <= 0:
         raise PageLayoutError("版面分析参数无效")
     database_path, private_root = Path(database_path), Path(private_root)
-    reference, anchored_render, anchored_render_bytes = _load_completed_reference(
+    reference, render, render_bytes = _load_completed_reference(
         database_path, private_root, job_id
     )
-    job, _, render, render_bytes, _ = _load_inputs(
-        database_path, private_root, job_id, decode_images=False
-    )
-    if render != anchored_render or render_bytes != anchored_render_bytes:
-        raise PageLayoutError(SAFE_EXISTING_ERROR)
     return _load_valid_existing(
         private_root,
         job_id,
-        job["sha256"],
+        reference["sha256"],
         _sha256(render_bytes),
         render["pages"],
         reference["manifest_sha256"],
         reference["manifest_byte_size"],
         reference["published_batch_id"],
         reference["detected_questions"],
+        verify_overlay_bytes=False,
     )
 
 
@@ -1486,7 +1741,7 @@ def analyze_page_layout(database_path, private_root, job_id: int):
     if type(job_id) is not int or job_id <= 0:
         raise PageLayoutError("版面分析参数无效")
     database_path, private_root = Path(database_path), Path(private_root)
-    workspace = document = None
+    workspace = None
     try:
         job, source, render, render_bytes, loaded = _load_inputs(
             database_path, private_root, job_id, decode_images=False
@@ -1516,7 +1771,6 @@ def analyze_page_layout(database_path, private_root, job_id: int):
                     updated_at=excluded.updated_at""",
                 (job_id, len(loaded), now, now),
             )
-        document = pymupdf.open(stream=source, filetype="pdf")
         workspace = _LayoutWorkspace.open(private_root, job_id)
         workspace.create_batch()
         _check_remaining_disk(workspace.job_fd, 0)
@@ -1528,22 +1782,12 @@ def analyze_page_layout(database_path, private_root, job_id: int):
                 columns = _ink_projection_columns(image)
             finally:
                 image.close()
-            text_available, page_anchors = _anchors_for_page(document, entry, columns)
-            warnings = []
-            if not text_available:
-                warnings.append(NO_TEXT_WARNING)
-            elif not page_anchors:
-                warnings.append(NO_ANCHOR_WARNING)
-            anchors.extend(page_anchors)
             page_result = {
                 "page_number": entry["page_number"],
                 "pixel_width": entry["pixel_width"],
                 "pixel_height": entry["pixel_height"],
                 "column_count": len(columns),
                 "columns": columns,
-                "text_layer_available": text_available,
-                "confidence": "medium" if text_available else "low",
-                "warnings": warnings,
             }
             page_results.append(page_result)
             with sqlite3.connect(database_path) as connection:
@@ -1555,6 +1799,21 @@ def analyze_page_layout(database_path, private_root, job_id: int):
                     "WHERE import_job_id=? AND status='processing'",
                     (analyzed, _now(), job_id),
                 )
+        text_results = _extract_text_anchors(source, page_results)
+        for page_result, (_, text_available, page_anchors) in zip(
+            page_results, text_results, strict=True
+        ):
+            warnings = []
+            if not text_available:
+                warnings.append(NO_TEXT_WARNING)
+            elif not page_anchors:
+                warnings.append(NO_ANCHOR_WARNING)
+            anchors.extend(page_anchors)
+            page_result.update({
+                "text_layer_available": text_available,
+                "confidence": "medium" if text_available else "low",
+                "warnings": warnings,
+            })
         questions = _build_questions(page_results, anchors)
         if not questions:
             manifest_warnings.append(
@@ -1640,6 +1899,20 @@ def analyze_page_layout(database_path, private_root, job_id: int):
         _write_new_regular_at(workspace.batch_fd, "layout_manifest.json", manifest_bytes)
         os.fsync(workspace.overlays_fd)
         os.fsync(workspace.batch_fd)
+        candidate_anchor = {
+            "job_id": job_id,
+            "manifest_sha256": _sha256(manifest_bytes),
+            "manifest_byte_size": len(manifest_bytes),
+            "published_batch_id": workspace.batch_id,
+            "total_pages": len(page_results),
+            "detected_questions": len(questions),
+            "source_pdf_sha256": job["sha256"],
+            "render_manifest_sha256": _sha256(render_bytes),
+        }
+        if workspace.batch_name is None or not _directory_matches_anchor(
+            workspace.job_fd, workspace.batch_name, candidate_anchor
+        ):
+            raise PageLayoutError(SAFE_ANALYSIS_ERROR)
         publish = _publish(workspace)
         workspace.assert_attached()
         _complete_run(
@@ -1665,7 +1938,5 @@ def analyze_page_layout(database_path, private_root, job_id: int):
         _mark_failed(database_path, job_id, SAFE_ANALYSIS_ERROR)
         raise PageLayoutError(SAFE_ANALYSIS_ERROR) from error
     finally:
-        if document is not None:
-            document.close()
         if workspace is not None:
             workspace.close()

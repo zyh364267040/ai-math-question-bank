@@ -4,6 +4,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +13,78 @@ import pymupdf
 
 from src.database.initialize import initialize_database
 from src.processing.pdf_page_renderer import render_import_job
+
+
+def _hanging_text_worker(connection, source, page_specs):
+    time.sleep(5)
+
+
+def _failing_text_worker(connection, source, page_specs):
+    connection.send_bytes(json.dumps({"status": "error", "kind": "analysis"}).encode())
+    connection.close()
+
+
+def _ok_then_crash_text_worker(connection, source, page_specs):
+    connection.send_bytes(json.dumps({"status": "ok", "results": []}).encode())
+    connection.close()
+    os._exit(1)
+
+
+def _invalid_anchor_text_worker(connection, source, page_specs):
+    payload = {
+        "status": "ok",
+        "results": [{
+            "page_number": 1,
+            "text_layer_available": True,
+            "anchors": [{
+                "question_no": "1",
+                "page_number": 999,
+                "column_index": 0,
+                "x": -1,
+                "y": -1,
+            }],
+        }],
+    }
+    connection.send_bytes(json.dumps(payload).encode())
+    connection.close()
+
+
+def _boolean_page_text_worker(connection, source, page_specs):
+    payload = {
+        "status": "ok",
+        "results": [{
+            "page_number": True,
+            "text_layer_available": True,
+            "anchors": [],
+        }],
+    }
+    connection.send_bytes(json.dumps(payload).encode())
+    connection.close()
+
+
+def _boolean_anchor_page_text_worker(connection, source, page_specs):
+    payload = {
+        "status": "ok",
+        "results": [{
+            "page_number": 1,
+            "text_layer_available": True,
+            "anchors": [{
+                "question_no": "1",
+                "page_number": True,
+                "column_index": 0,
+                "x": 1,
+                "y": 1,
+            }],
+        }],
+    }
+    connection.send_bytes(json.dumps(payload).encode())
+    connection.close()
+
+
+def _oversized_text_worker(connection, source, page_specs):
+    valid_json = b'{"status":"ok","results":[]}'
+    connection.send_bytes(valid_json + b" " * 1024)
+    connection.close()
 
 
 class PageLayoutAnalyzerTests(unittest.TestCase):
@@ -139,6 +212,166 @@ class PageLayoutAnalyzerTests(unittest.TestCase):
                     "VALUES (999,'invented',0,0)"
                 )
 
+    def test_legacy_layout_table_is_rebuilt_with_current_completed_constraints(self):
+        _, job_id = self.create_rendered_job(columns=1)
+        with sqlite3.connect(self.database_path) as connection:
+            source_id = connection.execute(
+                "SELECT source_paper_id FROM import_jobs WHERE id=?", (job_id,)
+            ).fetchone()[0]
+            legacy_completed_job_id = connection.execute(
+                """INSERT INTO import_jobs
+                   (source_paper_id,page_start,page_end,status)
+                   VALUES (?,1,1,'pending')""",
+                (source_id,),
+            ).lastrowid
+            connection.execute("DROP TABLE import_layout_analysis_runs")
+            connection.execute(
+                """CREATE TABLE import_layout_analysis_runs (
+                    import_job_id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    total_pages INTEGER,
+                    analyzed_pages INTEGER NOT NULL DEFAULT 0,
+                    detected_questions INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO import_layout_analysis_runs
+                   (import_job_id,status,total_pages,analyzed_pages,detected_questions)
+                   VALUES (?,'pending',1,0,0)""",
+                (job_id,),
+            )
+            connection.execute(
+                """INSERT INTO import_layout_analysis_runs
+                   (import_job_id,status,total_pages,analyzed_pages,detected_questions,
+                    completed_at)
+                   VALUES (?,'completed',1,1,1,'2026-07-15T12:00:00+08:00')""",
+                (legacy_completed_job_id,),
+            )
+
+        initialize_database(self.database_path).close()
+
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            row = connection.execute(
+                "SELECT status,total_pages,analyzed_pages FROM "
+                "import_layout_analysis_runs WHERE import_job_id=?",
+                (job_id,),
+            ).fetchone()
+            self.assertEqual(("pending", 1, 0), row)
+            downgraded = connection.execute(
+                "SELECT status,completed_at FROM import_layout_analysis_runs "
+                "WHERE import_job_id=?",
+                (legacy_completed_job_id,),
+            ).fetchone()
+            self.assertEqual(("failed", None), downgraded)
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """UPDATE import_layout_analysis_runs
+                       SET status='completed',analyzed_pages=1
+                       WHERE import_job_id=?""",
+                    (job_id,),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE import_layout_analysis_runs SET analyzed_pages=2 "
+                    "WHERE import_job_id=?",
+                    (job_id,),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE import_layout_analysis_runs SET status='invented' "
+                    "WHERE import_job_id=?",
+                    (job_id,),
+                )
+
+        with sqlite3.connect(self.database_path) as connection:
+            schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+
+        initialize_database(self.database_path).close()
+        with sqlite3.connect(self.database_path) as connection:
+            self.assertEqual(
+                schema_version,
+                connection.execute("PRAGMA schema_version").fetchone()[0],
+            )
+            self.assertEqual(
+                2,
+                connection.execute(
+                    "SELECT COUNT(*) FROM import_layout_analysis_runs"
+                ).fetchone()[0],
+            )
+
+    def test_layout_schema_comparison_preserves_string_literal_case(self):
+        initialize_database(self.database_path).close()
+        with sqlite3.connect(self.database_path) as connection:
+            current_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='import_layout_analysis_runs'"
+            ).fetchone()[0]
+            altered_sql = current_sql.replace("'completed'", "'COMPLETED'")
+            self.assertNotEqual(current_sql, altered_sql)
+            connection.execute("DROP TABLE import_layout_analysis_runs")
+            connection.execute(altered_sql)
+
+        initialize_database(self.database_path).close()
+
+        with sqlite3.connect(self.database_path) as connection:
+            migrated_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='import_layout_analysis_runs'"
+            ).fetchone()[0]
+        self.assertNotIn("'COMPLETED'", migrated_sql)
+        self.assertIn("'completed'", migrated_sql)
+
+    def test_failed_legacy_layout_rebuild_rolls_back_without_temp_table(self):
+        initialize_database(self.database_path).close()
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("DROP TABLE import_layout_analysis_runs")
+            connection.execute(
+                """CREATE TABLE import_layout_analysis_runs (
+                    import_job_id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    total_pages INTEGER,
+                    analyzed_pages INTEGER NOT NULL DEFAULT 0,
+                    detected_questions INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO import_layout_analysis_runs
+                   (import_job_id,status,total_pages,analyzed_pages)
+                   VALUES (999,'pending',1,0)"""
+            )
+            original_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='import_layout_analysis_runs'"
+            ).fetchone()[0]
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            initialize_database(self.database_path)
+
+        with sqlite3.connect(self.database_path) as connection:
+            self.assertEqual(
+                original_sql,
+                connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' "
+                    "AND name='import_layout_analysis_runs'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                [(999,)],
+                connection.execute(
+                    "SELECT import_job_id FROM import_layout_analysis_runs"
+                ).fetchall(),
+            )
+            self.assertIsNone(connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='import_layout_analysis_runs_current'"
+            ).fetchone())
+
     def test_real_render_detects_two_columns_and_embedded_main_question_anchors(self):
         private_root, job_id = self.create_rendered_job(columns=2)
         from src.processing.page_layout_analyzer import analyze_page_layout
@@ -211,6 +444,28 @@ class PageLayoutAnalyzerTests(unittest.TestCase):
 
         with self.assertRaises(PageLayoutError):
             load_completed_layout(self.database_path, private_root, job_id)
+
+    def test_light_loader_skips_same_size_overlay_bytes_but_target_read_rejects(self):
+        private_root, job_id = self.create_rendered_job()
+        from src.processing import page_layout_analyzer as analyzer
+
+        analyzer.analyze_page_layout(self.database_path, private_root, job_id)
+        overlay_path = (
+            private_root / "processing" / f"import_job_{job_id}" /
+            "layout_result" / "overlays" / "page_001.png"
+        )
+        damaged = bytearray(overlay_path.read_bytes())
+        damaged[-1] ^= 1
+        overlay_path.write_bytes(damaged)
+
+        manifest = analyzer.load_completed_layout(
+            self.database_path, private_root, job_id
+        )
+        self.assertEqual(1, manifest["page_count"])
+        with self.assertRaises(analyzer.PageLayoutError):
+            analyzer.read_layout_overlay(
+                self.database_path, private_root, job_id, 1
+            )
 
     def test_completed_db_counts_and_upstream_digests_cross_check_manifest(self):
         private_root, job_id = self.create_rendered_job()
@@ -823,23 +1078,172 @@ class PageLayoutAnalyzerTests(unittest.TestCase):
         )
         self.assertEqual([], list(job_dir.glob(".layout_batch.*")))
 
-    def test_more_than_max_questions_fails_instead_of_silent_truncation(self):
-        private_root, job_id = self.create_rendered_job(columns=1)
+    def test_text_word_budget_fails_closed_before_scanning_an_excessive_page(self):
         from src.processing import page_layout_analyzer as analyzer
-        anchors = [
-            {
-                "question_no": str(index + 1),
-                "page_number": 1,
-                "column_index": 0,
-                "x": 100,
-                "y": 180 + index * 5,
-            }
+
+        page = type("Page", (), {
+            "rect": type("Rect", (), {"width": 100, "height": 100})()
+        })()
+        document = type("Document", (), {"load_page": lambda self, index: page})()
+        entry = {"page_number": 1, "pixel_width": 100, "pixel_height": 100}
+        excessive_words = [
+            (0, 0, 10, 10, "正文", 0, 0, index)
+            for index in range(50_001)
+        ]
+        with patch.object(analyzer, "_page_words", return_value=excessive_words):
+            with self.assertRaisesRegex(analyzer.PageLayoutError, "超过安全处理限制"):
+                analyzer._anchors_for_page(document, entry, [[0, 0, 100, 100]])
+
+    def test_text_extraction_timeout_terminates_isolated_worker(self):
+        from src.processing import page_layout_analyzer as analyzer
+
+        with self.assertRaisesRegex(analyzer.PageLayoutError, "超过安全处理限制"):
+            analyzer._extract_text_anchors(
+                b"unused",
+                [],
+                timeout_seconds=0.05,
+                worker_target=_hanging_text_worker,
+            )
+
+    def test_text_extraction_memory_watchdog_terminates_worker_before_timeout(self):
+        from src.processing import page_layout_analyzer as analyzer
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(analyzer.PageLayoutError, "超过安全处理限制"):
+            analyzer._extract_text_anchors(
+                b"unused",
+                [],
+                timeout_seconds=5,
+                memory_limit_bytes=1,
+                worker_target=_hanging_text_worker,
+            )
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_unknown_text_extraction_error_fails_instead_of_becoming_no_text(self):
+        from src.processing import page_layout_analyzer as analyzer
+
+        with self.assertRaisesRegex(analyzer.PageLayoutError, "版面分析失败"):
+            analyzer._extract_text_anchors(
+                b"unused",
+                [],
+                timeout_seconds=1,
+                worker_target=_failing_text_worker,
+            )
+
+    def test_text_worker_success_requires_clean_zero_exit(self):
+        from src.processing import page_layout_analyzer as analyzer
+
+        with self.assertRaisesRegex(analyzer.PageLayoutError, "版面分析失败"):
+            analyzer._extract_text_anchors(
+                b"unused",
+                [],
+                timeout_seconds=1,
+                worker_target=_ok_then_crash_text_worker,
+            )
+
+    def test_text_worker_rejects_invalid_nested_anchor_schema(self):
+        from src.processing import page_layout_analyzer as analyzer
+
+        specs = [{
+            "page_number": 1,
+            "pixel_width": 100,
+            "pixel_height": 100,
+            "columns": [[0, 0, 100, 100]],
+        }]
+        with self.assertRaisesRegex(analyzer.PageLayoutError, "版面分析失败"):
+            analyzer._extract_text_anchors(
+                b"unused",
+                specs,
+                timeout_seconds=1,
+                worker_target=_invalid_anchor_text_worker,
+            )
+
+    def test_text_worker_rejects_boolean_result_and_anchor_page_numbers(self):
+        from src.processing import page_layout_analyzer as analyzer
+
+        specs = [{
+            "page_number": 1,
+            "pixel_width": 100,
+            "pixel_height": 100,
+            "columns": [[0, 0, 100, 100]],
+        }]
+        for worker in (_boolean_page_text_worker, _boolean_anchor_page_text_worker):
+            with self.subTest(worker=worker.__name__), self.assertRaisesRegex(
+                analyzer.PageLayoutError, "版面分析失败"
+            ):
+                analyzer._extract_text_anchors(
+                    b"unused",
+                    specs,
+                    timeout_seconds=1,
+                    worker_target=worker,
+                )
+
+    def test_text_worker_rejects_oversized_ipc_frame(self):
+        from src.processing import page_layout_analyzer as analyzer
+
+        with self.assertRaisesRegex(analyzer.PageLayoutError, "版面分析失败"):
+            analyzer._extract_text_anchors(
+                b"unused",
+                [],
+                timeout_seconds=1,
+                max_ipc_bytes=64,
+                worker_target=_oversized_text_worker,
+            )
+
+    def test_total_text_word_budget_fails_during_multi_page_extraction(self):
+        from src.processing import page_layout_analyzer as analyzer
+
+        page = type("Page", (), {
+            "rect": type("Rect", (), {"width": 100, "height": 100})()
+        })()
+        document = type("Document", (), {"load_page": lambda self, index: page})()
+        entry = {"page_number": 1, "pixel_width": 100, "pixel_height": 100}
+        budget = {"words": 0, "bytes": 0, "anchors": 0}
+        one_word = [(0, 0, 10, 10, "正文", 0, 0, 0)]
+        with (
+            patch.object(analyzer, "MAX_TOTAL_TEXT_WORDS", 1),
+            patch.object(analyzer, "_page_words", return_value=one_word),
+        ):
+            analyzer._anchors_for_page(
+                document, entry, [[0, 0, 100, 100]], budget
+            )
+            with self.assertRaisesRegex(analyzer.PageLayoutError, "超过安全处理限制"):
+                analyzer._anchors_for_page(
+                    document, entry, [[0, 0, 100, 100]], budget
+                )
+
+    def test_text_byte_budget_fails_closed(self):
+        from src.processing import page_layout_analyzer as analyzer
+
+        page = type("Page", (), {
+            "rect": type("Rect", (), {"width": 100, "height": 100})()
+        })()
+        document = type("Document", (), {"load_page": lambda self, index: page})()
+        entry = {"page_number": 1, "pixel_width": 100, "pixel_height": 100}
+        one_word = [(0, 0, 10, 10, "正文", 0, 0, 0)]
+        with (
+            patch.object(analyzer, "MAX_TEXT_BYTES_PER_PAGE", 1),
+            patch.object(analyzer, "_page_words", return_value=one_word),
+        ):
+            with self.assertRaisesRegex(analyzer.PageLayoutError, "超过安全处理限制"):
+                analyzer._anchors_for_page(document, entry, [[0, 0, 100, 100]])
+
+    def test_more_than_max_questions_fails_instead_of_silent_truncation(self):
+        from src.processing import page_layout_analyzer as analyzer
+
+        page = type("Page", (), {
+            "rect": type("Rect", (), {"width": 100, "height": 100})()
+        })()
+        document = type("Document", (), {"load_page": lambda self, index: page})()
+        entry = {"page_number": 1, "pixel_width": 100, "pixel_height": 100}
+        words = [
+            (0, 1, 10, 2, "1.", 0, 0, index)
             for index in range(analyzer.MAX_QUESTIONS + 1)
         ]
 
-        with patch.object(analyzer, "_anchors_for_page", return_value=(True, anchors)):
+        with patch.object(analyzer, "_page_words", return_value=words):
             with self.assertRaisesRegex(analyzer.PageLayoutError, "超过安全处理限制"):
-                analyzer.analyze_page_layout(self.database_path, private_root, job_id)
+                analyzer._anchors_for_page(document, entry, [[0, 0, 100, 100]])
 
     def test_total_analysis_pixels_are_rejected_before_source_page_decode(self):
         private_root, job_id = self.create_rendered_job(columns=1)
@@ -854,7 +1258,7 @@ class PageLayoutAnalyzerTests(unittest.TestCase):
 
         decode.assert_not_called()
 
-    def test_completed_loader_does_not_convert_all_source_pages_to_rgb(self):
+    def test_completed_loader_uses_trusted_manifests_without_reading_large_pngs(self):
         private_root, job_id = self.create_custom_rendered_job(
             [{"columns": 1, "texts": [(0, 34, "1. one")]},
              {"columns": 1, "texts": [(0, 34, "2. two")]}],
@@ -863,14 +1267,33 @@ class PageLayoutAnalyzerTests(unittest.TestCase):
         from src.processing import page_layout_analyzer as analyzer
         analyzer.analyze_page_layout(self.database_path, private_root, job_id)
 
-        with patch.object(
-            analyzer, "_verify_png", wraps=analyzer._verify_png
-        ) as rgb_decode:
-            analyzer.load_completed_layout(
+        with (
+            patch.object(
+                analyzer,
+                "_load_inputs",
+                side_effect=AssertionError("completed GET must not reload source PNGs"),
+            ),
+            patch.object(
+                analyzer,
+                "_verify_png",
+                side_effect=AssertionError("completed GET must not decode overlay PNGs"),
+            ),
+            patch.object(
+                analyzer,
+                "_read_regular_at",
+                wraps=analyzer._read_regular_at,
+            ) as read_regular,
+        ):
+            manifest = analyzer.load_completed_layout(
                 self.database_path, private_root, job_id
             )
 
-        self.assertEqual(2, rgb_decode.call_count, "只应解码两张overlay，不应转RGB原页面")
+        names = [call.args[1] for call in read_regular.call_args_list]
+        self.assertEqual(
+            {"render_manifest.json", "layout_manifest.json"}, set(names)
+        )
+        self.assertFalse(any(name.endswith(".png") for name in names))
+        self.assertEqual(2, manifest["page_count"])
 
     def test_overlay_read_does_not_reload_all_source_pages(self):
         private_root, job_id = self.create_custom_rendered_job(
