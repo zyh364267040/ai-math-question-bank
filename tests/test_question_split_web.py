@@ -35,6 +35,16 @@ class FakeWebRunner:
         }), "web-fake-1")
 
 
+class FakeWeeklyChecker:
+    def __init__(self, remaining=100.0):
+        self.remaining = remaining
+
+    def __call__(self):
+        if isinstance(self.remaining, Exception):
+            raise self.remaining
+        return self.remaining
+
+
 class QuestionSplitWebTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -43,7 +53,11 @@ class QuestionSplitWebTests(unittest.TestCase):
         self.db = self.root / "question-bank.db"
         initialize_database(self.db).close()
         self.runner = FakeWebRunner()
-        self.client = TestClient(create_app(self.db, self.private, split_runner=self.runner))
+        self.weekly_checker = FakeWeeklyChecker()
+        self.client = TestClient(create_app(
+            self.db, self.private, split_runner=self.runner,
+            weekly_checker=self.weekly_checker,
+        ))
         self.client.get("/imports/new")
         self.csrf = self.client.cookies.get("basket_csrf")
 
@@ -204,6 +218,27 @@ class QuestionSplitWebTests(unittest.TestCase):
         self.assertEqual(200, self.client.get(
             f"/imports/{job_id}/split-images/1.png"
         ).status_code)
+
+    def test_weekly_gate_shows_specific_safe_web_messages_without_starting_runner(self):
+        job_id = self.upload_confirm_render()
+        self.weekly_checker.remaining = 29.99
+        blocked = self.client.post(
+            f"/imports/{job_id}/split", data={"csrf_token": self.csrf},
+        )
+        self.assertEqual(409, blocked.status_code)
+        self.assertIn("Codex weekly剩余低于30%，已停止新的自动切题任务", blocked.text)
+        self.assertNotIn("Codex 自动切题失败，请重试", blocked.text)
+        self.assertEqual([], self.runner.calls)
+
+        self.weekly_checker.remaining = RuntimeError("private detail")
+        unavailable = self.client.post(
+            f"/imports/{job_id}/split", data={"csrf_token": self.csrf},
+        )
+        self.assertEqual(409, unavailable.status_code)
+        self.assertIn("/status", unavailable.text)
+        self.assertNotIn("private detail", unavailable.text)
+        self.assertNotIn("Codex 自动切题失败，请重试", unavailable.text)
+        self.assertEqual([], self.runner.calls)
 
 
 if __name__ == "__main__":

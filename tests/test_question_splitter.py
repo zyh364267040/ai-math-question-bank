@@ -17,9 +17,12 @@ from src.processing.question_splitter import (
     CodexCliRunner,
     CodexRunResult,
     QuestionSplitError,
+    SAFE_WEEKLY_LOW,
+    SAFE_WEEKLY_UNAVAILABLE,
     _snapshot_outputs,
     claim_split_job,
     parse_codex_question_plan,
+    read_codex_weekly_remaining,
     run_claimed_split,
 )
 
@@ -109,6 +112,7 @@ class QuestionSplitterTests(unittest.TestCase):
             "page_start": 1, "page_end": 2, "page_count": 2, "pages": pages,
         }), encoding="utf-8")
         _anchor_render(self.db, self.job_id, self.job_dir)
+        self.weekly_checker = lambda: 100.0
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -191,7 +195,10 @@ class QuestionSplitterTests(unittest.TestCase):
         ]
         for index, runner in enumerate(runners):
             with self.subTest(index=index):
-                claim = claim_split_job(self.db, self.private, self.job_id, runner=runner)
+                claim = claim_split_job(
+                    self.db, self.private, self.job_id, runner=runner,
+                    weekly_checker=self.weekly_checker,
+                )
                 self.assertIsNone(run_claimed_split(claim))
                 with sqlite3.connect(self.db) as connection:
                     self.assertEqual("failed", connection.execute(
@@ -203,7 +210,10 @@ class QuestionSplitterTests(unittest.TestCase):
 
     def test_claim_run_generates_crops_review_and_persists_completion(self):
         runner = FakeRunner(self.valid())
-        claim = claim_split_job(self.db, self.private, self.job_id, runner=runner)
+        claim = claim_split_job(
+            self.db, self.private, self.job_id, runner=runner,
+            weekly_checker=self.weekly_checker,
+        )
         result = run_claimed_split(claim)
         self.assertEqual(2, result["question_count"])
         self.assertEqual(1, len(runner.calls))
@@ -243,7 +253,10 @@ class QuestionSplitterTests(unittest.TestCase):
 
         runner = MutatingRunner(self.valid())
         result = run_claimed_split(
-            claim_split_job(self.db, self.private, self.job_id, runner=runner)
+            claim_split_job(
+                self.db, self.private, self.job_id, runner=runner,
+                weekly_checker=self.weekly_checker,
+            )
         )
         self.assertEqual(2, result["question_count"])
         self.assertEqual(original, runner.assert_snapshot)
@@ -259,7 +272,10 @@ class QuestionSplitterTests(unittest.TestCase):
                 (self.job_id,),
             )
         with self.assertRaises(QuestionSplitError):
-            claim_split_job(self.db, self.private, self.job_id, runner=runner)
+            claim_split_job(
+                self.db, self.private, self.job_id, runner=runner,
+                weekly_checker=self.weekly_checker,
+            )
         self.assertEqual([], runner.calls)
         _anchor_render(self.db, self.job_id, self.job_dir)
 
@@ -269,7 +285,10 @@ class QuestionSplitterTests(unittest.TestCase):
         other = self.root / "hardlinked-page.png"
         other.write_bytes(saved)
         page.hardlink_to(other)
-        claim = claim_split_job(self.db, self.private, self.job_id, runner=runner)
+        claim = claim_split_job(
+            self.db, self.private, self.job_id, runner=runner,
+            weekly_checker=self.weekly_checker,
+        )
         self.assertIsNone(run_claimed_split(claim))
         self.assertEqual([], runner.calls)
         page.unlink()
@@ -281,13 +300,17 @@ class QuestionSplitterTests(unittest.TestCase):
         manifest_copy.write_bytes(manifest.read_bytes())
         manifest.unlink()
         manifest.symlink_to(manifest_copy)
-        claim = claim_split_job(self.db, self.private, self.job_id, runner=runner)
+        claim = claim_split_job(
+            self.db, self.private, self.job_id, runner=runner,
+            weekly_checker=self.weekly_checker,
+        )
         self.assertIsNone(run_claimed_split(claim))
         self.assertEqual([], runner.calls)
 
     def test_failures_mark_failed_without_replacing_old_complete_results(self):
         first = claim_split_job(
-            self.db, self.private, self.job_id, runner=FakeRunner(self.valid())
+            self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
+            weekly_checker=self.weekly_checker,
         )
         run_claimed_split(first)
         old_regions = (self.job_dir / "question_regions.json").read_bytes()
@@ -298,7 +321,10 @@ class QuestionSplitterTests(unittest.TestCase):
                 (self.job_id,),
             )
         bad = FakeRunner(error=CodexExecutionError("timeout"))
-        retry = claim_split_job(self.db, self.private, self.job_id, runner=bad)
+        retry = claim_split_job(
+            self.db, self.private, self.job_id, runner=bad,
+            weekly_checker=self.weekly_checker,
+        )
         self.assertIsNotNone(retry)
         self.assertIsNone(run_claimed_split(retry))
         self.assertEqual(old_regions, (self.job_dir / "question_regions.json").read_bytes())
@@ -311,7 +337,8 @@ class QuestionSplitterTests(unittest.TestCase):
 
     def test_next_claim_recovers_interrupted_top_level_publication(self):
         run_claimed_split(claim_split_job(
-            self.db, self.private, self.job_id, runner=FakeRunner(self.valid())
+            self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
+            weekly_checker=self.weekly_checker,
         ))
         old_regions = (self.job_dir / "question_regions.json").read_bytes()
         old_crop = (self.job_dir / "question_crops/Q001.png").read_bytes()
@@ -325,7 +352,8 @@ class QuestionSplitterTests(unittest.TestCase):
             )
         runner = FakeRunner(self.valid())
         self.assertIsNone(claim_split_job(
-            self.db, self.private, self.job_id, runner=runner
+            self.db, self.private, self.job_id, runner=runner,
+            weekly_checker=self.weekly_checker,
         ))
         self.assertEqual([], runner.calls)
         self.assertEqual(old_regions, (self.job_dir / "question_regions.json").read_bytes())
@@ -340,7 +368,8 @@ class QuestionSplitterTests(unittest.TestCase):
 
     def test_tampered_recovery_journal_fails_closed(self):
         run_claimed_split(claim_split_job(
-            self.db, self.private, self.job_id, runner=FakeRunner(self.valid())
+            self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
+            weekly_checker=self.weekly_checker,
         ))
         old_regions = (self.job_dir / "question_regions.json").read_bytes()
         _snapshot_outputs(self.job_dir)
@@ -350,14 +379,23 @@ class QuestionSplitterTests(unittest.TestCase):
         journal_path.write_text(json.dumps(journal))
         runner = FakeRunner(self.valid())
         with self.assertRaises(QuestionSplitError):
-            claim_split_job(self.db, self.private, self.job_id, runner=runner)
+            claim_split_job(
+                self.db, self.private, self.job_id, runner=runner,
+                weekly_checker=self.weekly_checker,
+            )
         self.assertEqual([], runner.calls)
         self.assertEqual(old_regions, (self.job_dir / "question_regions.json").read_bytes())
 
     def test_two_claims_only_invoke_runner_once_and_stale_can_resume(self):
         runner = FakeRunner(self.valid())
-        first = claim_split_job(self.db, self.private, self.job_id, runner=runner)
-        second = claim_split_job(self.db, self.private, self.job_id, runner=runner)
+        first = claim_split_job(
+            self.db, self.private, self.job_id, runner=runner,
+            weekly_checker=self.weekly_checker,
+        )
+        second = claim_split_job(
+            self.db, self.private, self.job_id, runner=runner,
+            weekly_checker=self.weekly_checker,
+        )
         self.assertIsNone(second)
         run_claimed_split(first)
         self.assertEqual(1, len(runner.calls))
@@ -366,7 +404,10 @@ class QuestionSplitterTests(unittest.TestCase):
                 "UPDATE import_question_split_runs SET status='processing' WHERE import_job_id=?",
                 (self.job_id,),
             )
-        resumed = claim_split_job(self.db, self.private, self.job_id, runner=runner)
+        resumed = claim_split_job(
+            self.db, self.private, self.job_id, runner=runner,
+            weekly_checker=self.weekly_checker,
+        )
         self.assertIsNotNone(resumed)
         run_claimed_split(resumed)
         self.assertEqual(2, len(runner.calls))
@@ -393,15 +434,140 @@ class QuestionSplitterTests(unittest.TestCase):
         manifest_path.write_text(json.dumps(manifest))
         _anchor_render(self.db, other_id, other_dir)
         first = claim_split_job(
-            self.db, self.private, self.job_id, runner=FakeRunner(self.valid())
+            self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
+            weekly_checker=self.weekly_checker,
         )
         try:
             second = claim_split_job(
-                self.db, self.private, other_id, runner=FakeRunner(self.valid())
+                self.db, self.private, other_id, runner=FakeRunner(self.valid()),
+                weekly_checker=self.weekly_checker,
             )
             self.assertIsNone(second)
         finally:
             first.close()
+
+    def test_weekly_gate_blocks_below_30_before_runner_and_preserves_results(self):
+        runner = FakeRunner(self.valid())
+        completed = claim_split_job(
+            self.db, self.private, self.job_id, runner=runner,
+            weekly_checker=lambda: 100.0,
+        )
+        run_claimed_split(completed)
+        old_regions = (self.job_dir / "question_regions.json").read_bytes()
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                "UPDATE import_question_split_runs SET status='failed' WHERE import_job_id=?",
+                (self.job_id,),
+            )
+        blocked_runner = FakeRunner(self.valid())
+        with self.assertRaisesRegex(QuestionSplitError, SAFE_WEEKLY_LOW):
+            claim_split_job(
+                self.db, self.private, self.job_id, runner=blocked_runner,
+                weekly_checker=lambda: 29.999,
+            )
+        self.assertEqual([], blocked_runner.calls)
+        self.assertEqual(old_regions, (self.job_dir / "question_regions.json").read_bytes())
+        with sqlite3.connect(self.db) as connection:
+            self.assertEqual("failed", connection.execute(
+                "SELECT status FROM import_question_split_runs WHERE import_job_id=?",
+                (self.job_id,),
+            ).fetchone()[0])
+
+    def test_weekly_gate_allows_exactly_30_and_above(self):
+        for remaining in (30.0, 70.0):
+            with self.subTest(remaining=remaining):
+                runner = FakeRunner(self.valid())
+                claim = claim_split_job(
+                    self.db, self.private, self.job_id, runner=runner,
+                    weekly_checker=lambda value=remaining: value,
+                )
+                self.assertIsNotNone(claim)
+                run_claimed_split(claim)
+                self.assertEqual(1, len(runner.calls))
+                with sqlite3.connect(self.db) as connection:
+                    connection.execute(
+                        "UPDATE import_question_split_runs SET status='failed' "
+                        "WHERE import_job_id=?", (self.job_id,),
+                    )
+
+    def test_weekly_gate_fails_closed_when_exact_data_is_unavailable(self):
+        runner = FakeRunner(self.valid())
+        for checker in (lambda: None, lambda: float("nan"), lambda: 101.0):
+            with self.subTest(checker=checker), self.assertRaisesRegex(
+                QuestionSplitError, SAFE_WEEKLY_UNAVAILABLE
+            ):
+                claim_split_job(
+                    self.db, self.private, self.job_id, runner=runner,
+                    weekly_checker=checker,
+                )
+        self.assertEqual([], runner.calls)
+
+    def test_weekly_check_does_not_hold_sqlite_write_transaction(self):
+        def checker():
+            with sqlite3.connect(self.db, timeout=0) as connection:
+                connection.execute(
+                    "UPDATE import_jobs SET updated_at=updated_at WHERE id=?",
+                    (self.job_id,),
+                )
+            return 100.0
+
+        claim = claim_split_job(
+            self.db, self.private, self.job_id,
+            runner=FakeRunner(self.valid()), weekly_checker=checker,
+        )
+        self.assertIsNotNone(claim)
+        claim.close()
+
+
+class CodexWeeklyUsageTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.sessions = Path(self.temporary.name) / "sessions"
+        self.sessions.mkdir()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def write_events(self, *events):
+        path = self.sessions / "rollout.jsonl"
+        path.write_text("".join(json.dumps(event) + "\n" for event in events))
+
+    @staticmethod
+    def event(timestamp, rate_limits):
+        return {
+            "timestamp": timestamp,
+            "payload": {"type": "token_count", "rate_limits": rate_limits},
+            "message": "must never be exposed",
+        }
+
+    def test_reads_latest_valid_seven_day_window_without_assuming_primary(self):
+        self.write_events(
+            self.event("2026-07-01T00:00:00Z", {
+                "secondary": {"window_minutes": 10080, "used_percent": 40},
+            }),
+            self.event("2026-07-02T00:00:00Z", {
+                "primary": {"window_minutes": 300, "used_percent": 99},
+            }),
+            self.event("2026-07-03T00:00:00Z", {
+                "primary": {"window_minutes": 10080, "used_percent": 101},
+            }),
+            self.event("2026-07-04T00:00:00Z", {
+                "other": {"window_minutes": 10080, "used_percent": 65.5},
+            }),
+        )
+        self.assertEqual(34.5, read_codex_weekly_remaining(self.sessions))
+
+    def test_rejects_nonfinite_out_of_range_and_missing_exact_weekly_data(self):
+        cases = (
+            {"primary": {"window_minutes": 10080, "used_percent": float("nan")}},
+            {"primary": {"window_minutes": 10080, "used_percent": -0.1}},
+            {"primary": {"window_minutes": 10080, "used_percent": 100.1}},
+            {"primary": {"window_minutes": 10079, "used_percent": 20}},
+        )
+        for limits in cases:
+            with self.subTest(limits=limits):
+                self.write_events(self.event("2026-07-01T00:00:00Z", limits))
+                self.assertIsNone(read_codex_weekly_remaining(self.sessions))
 
 
 class CodexCliRunnerTests(unittest.TestCase):

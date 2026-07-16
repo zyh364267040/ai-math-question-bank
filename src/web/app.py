@@ -50,6 +50,8 @@ from src.processing.question_splitter import (
     SAFE_EXISTING_ERROR as SAFE_SPLIT_EXISTING_ERROR,
     SAFE_RENDER_REQUIRED,
     SAFE_SPLIT_ERROR,
+    SAFE_WEEKLY_LOW,
+    SAFE_WEEKLY_UNAVAILABLE,
     QuestionSplitError,
     claim_split_job,
     completed_split_result_valid,
@@ -1009,6 +1011,7 @@ def create_app(
     private_root=DEFAULT_PRIVATE_ROOT,
     preview_request_max_bytes=MAX_PREVIEW_REQUEST_BYTES,
     split_runner=None,
+    weekly_checker=None,
     _initialize_schema=True,
 ):
     database_path = Path(database_path)
@@ -1019,6 +1022,7 @@ def create_app(
     application.state.database_path = database_path
     application.state.private_root = private_root
     application.state.split_runner = split_runner
+    application.state.weekly_checker = weekly_checker
     if not _initialize_schema:
         @application.on_event("startup")
         def initialize_schema_on_server_start():
@@ -1318,12 +1322,15 @@ def create_app(
             claim = claim_split_job(
                 database_path, private_root, job_id,
                 runner=application.state.split_runner,
+                weekly_checker=application.state.weekly_checker,
             )
         except QuestionSplitError as error:
             message = str(error)
             if message == "未找到导入任务":
                 return _error(request, templates, message, 404)
             if message in {SAFE_RENDER_REQUIRED, SAFE_CODEX_MISSING}:
+                return _error(request, templates, message, 409)
+            if message in {SAFE_WEEKLY_LOW, SAFE_WEEKLY_UNAVAILABLE}:
                 return _error(request, templates, message, 409)
             return _error(request, templates, "自动切题任务暂时无法启动", 500)
         if claim is not None:
