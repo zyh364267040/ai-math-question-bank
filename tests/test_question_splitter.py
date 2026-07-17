@@ -19,6 +19,8 @@ from src.processing.question_splitter import (
     QuestionSplitError,
     SAFE_WEEKLY_LOW,
     SAFE_WEEKLY_UNAVAILABLE,
+    _codex_output_schema,
+    _prompt,
     _snapshot_outputs,
     claim_split_job,
     parse_codex_question_plan,
@@ -579,6 +581,31 @@ class CodexCliRunnerTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_output_schema_const_version_has_explicit_integer_type(self):
+        version = _codex_output_schema()["properties"]["version"]
+        self.assertEqual("integer", version["type"])
+        self.assertEqual(1, version["const"])
+
+    def test_output_schema_confidence_uses_supported_string_enum(self):
+        confidence = _codex_output_schema()["properties"]["questions"]["items"][
+            "properties"
+        ]["confidence"]
+        self.assertEqual({
+            "type": "string", "enum": ["low", "medium", "high"]
+        }, confidence)
+
+    def test_prompt_requires_complete_nonoverlapping_questions_and_string_confidence(self):
+        prompt = _prompt(5, [(1, b"page", (100, 200))], {"pages": []})
+        for required in (
+            "题号、公共条件、题干、公式、选项、小问和必要配图",
+            "不得包含下一题题号或文字",
+            "试卷后的答案和解析页不作为新题",
+            "low、medium或high",
+            "版面提示仅作弱参考",
+        ):
+            self.assertIn(required, prompt)
+        self.assertNotIn("confidence\":0到1", prompt)
 
     def script(self, body):
         path = self.root / f"fake-{len(list(self.root.glob('fake-*')))}"

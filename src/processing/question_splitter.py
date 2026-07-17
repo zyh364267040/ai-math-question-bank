@@ -245,7 +245,7 @@ def _codex_output_schema():
         "type": "object", "additionalProperties": False,
         "required": ["version", "import_job_id", "question_count", "questions"],
         "properties": {
-            "version": {"const": 1},
+            "version": {"type": "integer", "const": 1},
             "import_job_id": {"type": "integer", "minimum": 1},
             "question_count": {"type": "integer", "minimum": 1, "maximum": MAX_QUESTIONS},
             "questions": {
@@ -274,10 +274,7 @@ def _codex_output_schema():
                             "items": {"type": "string", "maxLength": 500}
                         },
                         "confidence": {
-                            "oneOf": [
-                                {"type": "number", "minimum": 0, "maximum": 1},
-                                {"enum": ["low", "medium", "high"]},
-                            ]
+                            "type": "string", "enum": ["low", "medium", "high"]
                         },
                     },
                 },
@@ -610,11 +607,16 @@ def _prompt(job_id, pages, layout):
     hint = json.dumps(layout, ensure_ascii=False, separators=(",", ":")) if layout else "null"
     return (
         "只分析随本请求附加的原卷页面图片，不读取或修改任何文件。原图是最终依据。"
-        "识别连续规范题号及每题完整边界；跨页题或跨栏题使用多个region并按阅读顺序排列。"
+        "只识别正式试卷中的连续规范题号；试卷后的答案和解析页不作为新题。"
+        "每道题的region必须完整包含题号、公共条件、题干、公式、选项、小问和必要配图；"
+        "顶部宁可保留少量空白，也不能截断属于本题的条件。"
+        "同页相邻题应在两题之间的空白处分界，上一题不得包含下一题题号或文字，下一题也不得缺少开头。"
+        "跨页题或跨栏题使用多个region并按阅读顺序排列，不得把多个页面粗暴合并为无关大框。"
+        "版面提示仅作弱参考；如提示与图片冲突，必须以原图逐题核对结果为准。"
         "只输出一个JSON对象，禁止Markdown围栏和解释文字。结构必须严格为："
         '{"version":1,"import_job_id":整数,"question_count":整数,"questions":['
         '{"question_no":连续整数,"regions":[{"page_number":整数,'
-        '"bbox_normalized":[left,top,right,bottom]}],"warnings":[],"confidence":0到1}]}'
+        '"bbox_normalized":[left,top,right,bottom]}],"warnings":[],"confidence":low、medium或high}]}'
         f"。import_job_id={job_id}；允许页码={','.join(str(x[0]) for x in pages)}；"
         f"可选版面提示={hint}"
     )
