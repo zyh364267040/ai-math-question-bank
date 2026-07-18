@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}独立 Codex 视觉二审 · AI 数学题库{% endblock %}
+{% block head_extra %}{% if run.status == 'processing' %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">INDEPENDENT VISUAL AUDIT</p>
+  <h1>{{ run.paper_name }}</h1>
+  <p>候选题与已审核单题图的独立视觉复核</p>
+</section>
+<section class="paper-card processing-card">
+  <p><span class="status {{ run.status }}">{{ run.status_name }}</span></p>
+  {% if run.status == 'failed' %}<p class="form-error">{{ run.error_message }}</p>{% endif %}
+  {% if run.has_unanchored_audit %}
+    <p class="form-error">发现未登记的 ai_audit.json。系统不会盲信或覆盖它。</p>
+    <form method="post" action="/imports/{{ run.id }}/audit/adopt">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">严格校验并登记现有结果</button>
+    </form>
+  {% elif run.status in ('pending', 'failed', 'processing') %}
+    <p><strong>点击后启动全新 ephemeral Codex 会话；GET 浏览不会启动调用。</strong></p>
+    <form method="post" action="/imports/{{ run.id }}/audit">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">{% if run.status == 'processing' %}继续或恢复视觉二审{% elif run.status == 'failed' %}重试独立视觉二审{% else %}启动独立视觉二审{% endif %}</button>
+    </form>
+  {% endif %}
+  <p><strong>二审不解题、不分类知识点、不检查答案，不会创建草稿或正式入库。</strong></p>
+</section>
+{% if audit %}
+{% if applied >= 0 %}<div class="save-feedback" role="status">已应用 {{ applied }} 条新的自动通过结果</div>{% endif %}
+<section class="audit-summary">
+  <div><strong>{{ audit.counts.auto_pass }}</strong><span>自动通过</span></div>
+  <div><strong>{{ audit.counts.disputed }}</strong><span>有争议</span></div>
+  <div><strong>{{ audit.counts.human_required }}</strong><span>需人工确认</span></div>
+</section>
+{% if audit.counts.auto_pass %}
+<section class="paper-card processing-card">
+  <p>把本批次中仍与原候选完全一致的自动通过题设为 AI 二审通过；异常题和任何人工编辑状态保持不变。</p>
+  <form method="post" action="/imports/{{ run.id }}/audit/apply-auto-pass">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="button" type="submit">应用 {{ audit.counts.auto_pass }} 条自动通过结果</button>
+  </form>
+</section>
+{% endif %}
+<section class="layout-review">
+  {% for question in audit.questions %}
+  <article class="paper-card layout-question">
+    <h2>Q{{ '%03d'|format(question.source_question_no|int) }} · {{ question.audit_status }}</h2>
+    <p>证据页：{{ question.evidence_page }}；置信度：{{ question.audit_confidence }}</p>
+    <h3>问题</h3><ul>{% for issue in question.issues %}<li>{{ issue }}</li>{% else %}<li>无</li>{% endfor %}</ul>
+    <h3>建议更正</h3><ul>{% for correction in question.suggested_corrections %}<li>{{ correction }}</li>{% else %}<li>无</li>{% endfor %}</ul>
+  </article>
+  {% endfor %}
+</section>
+{% endif %}
+{% endblock %}

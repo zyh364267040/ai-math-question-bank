@@ -12,7 +12,10 @@ from fastapi.testclient import TestClient
 from src.database.initialize import initialize_database
 from src.importing.admit_questions import admit_questions
 from src.web.app import _required_question_content, create_app
-from tests.fixture_factory import create_import_job_fixture
+from tests.fixture_factory import (
+    anchor_synthetic_candidate_audit,
+    create_import_job_fixture,
+)
 
 
 class QuestionsPageParser(HTMLParser):
@@ -38,7 +41,7 @@ class QuestionsWebTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.private = root / "private"
-        create_import_job_fixture(self.private)
+        job_dir = create_import_job_fixture(self.private)
         self.db = self.private / "question-bank.db"
         initialize_database(self.db).close()
         with sqlite3.connect(self.db) as con:
@@ -48,6 +51,7 @@ class QuestionsWebTests(unittest.TestCase):
                 VALUES (?,1,'paper.pdf','raw_papers/TJ/2025/paper.pdf','TJ',2025,'YK','合成测试学校')""", ("b"*64,)
             ).lastrowid
             con.execute("INSERT INTO import_jobs(id,source_paper_id,page_start,page_end,status) VALUES(1,?,1,4,'needs_review')", (source,))
+        anchor_synthetic_candidate_audit(self.db, job_dir)
         admit_questions(self.db, self.private, 1)
         self.client = TestClient(create_app(self.db, self.private))
 

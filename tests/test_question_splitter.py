@@ -662,7 +662,10 @@ class CodexCliRunnerTests(unittest.TestCase):
             f"pathlib.Path({str(pid_file)!r}).write_text(str(p.pid));time.sleep(30)"
         )
         with self.assertRaises(CodexExecutionError):
-            CodexCliRunner(sleeper, timeout=0.5).run(
+            # Python 3.13 can spend more than 0.5s importing subprocess on a
+            # cold macOS runner.  Keep this bounded while allowing the fake to
+            # create the child whose process-group cleanup is under test.
+            CodexCliRunner(sleeper, timeout=2).run(
                 image_paths=[self.image], prompt="only json"
             )
         pid = int(pid_file.read_text())

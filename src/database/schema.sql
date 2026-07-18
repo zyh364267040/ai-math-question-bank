@@ -203,6 +203,96 @@ CREATE TABLE IF NOT EXISTS import_question_split_runs (
     )
 );
 
+CREATE TABLE IF NOT EXISTS import_candidate_extraction_runs (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'processing', 'completed', 'failed')
+    ),
+    question_count INTEGER CHECK (question_count IS NULL OR question_count > 0),
+    processed_questions INTEGER NOT NULL DEFAULT 0 CHECK (processed_questions >= 0),
+    error_message TEXT CHECK (error_message IS NULL OR length(error_message) <= 300),
+    codex_run_id TEXT CHECK (
+        codex_run_id IS NULL OR length(codex_run_id) BETWEEN 1 AND 200
+    ),
+    input_crop_generation_id TEXT CHECK (
+        input_crop_generation_id IS NULL OR length(input_crop_generation_id) = 32
+    ),
+    input_manifest_sha256 TEXT CHECK (
+        input_manifest_sha256 IS NULL OR length(input_manifest_sha256) = 64
+    ),
+    input_manifest_signature TEXT CHECK (
+        input_manifest_signature IS NULL OR length(input_manifest_signature) = 64
+    ),
+    output_sha256 TEXT CHECK (
+        output_sha256 IS NULL OR length(output_sha256) = 64
+    ),
+    output_byte_size INTEGER CHECK (
+        output_byte_size IS NULL OR output_byte_size > 0
+    ),
+    started_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (question_count IS NULL OR processed_questions <= question_count),
+    CHECK (
+        status != 'completed' OR (
+            question_count IS NOT NULL AND processed_questions = question_count AND
+            codex_run_id IS NOT NULL AND input_crop_generation_id IS NOT NULL AND
+            input_manifest_sha256 IS NOT NULL AND input_manifest_signature IS NOT NULL AND
+            output_sha256 IS NOT NULL AND output_byte_size IS NOT NULL AND
+            completed_at IS NOT NULL
+        )
+    )
+);
+
+CREATE TABLE IF NOT EXISTS import_candidate_audit_runs (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'processing', 'completed', 'failed')
+    ),
+    question_count INTEGER CHECK (question_count IS NULL OR question_count > 0),
+    processed_questions INTEGER NOT NULL DEFAULT 0 CHECK (processed_questions >= 0),
+    error_message TEXT CHECK (error_message IS NULL OR length(error_message) <= 300),
+    codex_run_id TEXT CHECK (
+        codex_run_id IS NULL OR length(codex_run_id) BETWEEN 1 AND 200
+    ),
+    input_candidate_sha256 TEXT CHECK (
+        input_candidate_sha256 IS NULL OR length(input_candidate_sha256) = 64
+    ),
+    input_candidate_byte_size INTEGER CHECK (
+        input_candidate_byte_size IS NULL OR input_candidate_byte_size > 0
+    ),
+    input_crop_generation_id TEXT CHECK (
+        input_crop_generation_id IS NULL OR length(input_crop_generation_id) = 32
+    ),
+    input_manifest_sha256 TEXT CHECK (
+        input_manifest_sha256 IS NULL OR length(input_manifest_sha256) = 64
+    ),
+    input_manifest_signature TEXT CHECK (
+        input_manifest_signature IS NULL OR length(input_manifest_signature) = 64
+    ),
+    output_sha256 TEXT CHECK (
+        output_sha256 IS NULL OR length(output_sha256) = 64
+    ),
+    output_byte_size INTEGER CHECK (
+        output_byte_size IS NULL OR output_byte_size > 0
+    ),
+    started_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (question_count IS NULL OR processed_questions <= question_count),
+    CHECK (
+        status != 'completed' OR (
+            question_count IS NOT NULL AND processed_questions = question_count AND
+            codex_run_id IS NOT NULL AND input_candidate_sha256 IS NOT NULL AND
+            input_candidate_byte_size IS NOT NULL AND
+            input_crop_generation_id IS NOT NULL AND
+            input_manifest_sha256 IS NOT NULL AND
+            input_manifest_signature IS NOT NULL AND output_sha256 IS NOT NULL AND
+            output_byte_size IS NOT NULL AND completed_at IS NOT NULL
+        )
+    )
+);
+
 CREATE TABLE IF NOT EXISTS tag_definitions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     category TEXT NOT NULL CHECK (category IN ('task', 'method', 'error', 'scenario')),
@@ -454,6 +544,85 @@ CREATE TABLE IF NOT EXISTS candidate_review_drafts (
 );
 CREATE INDEX IF NOT EXISTS idx_candidate_review_job_status ON candidate_review_drafts(import_job_id, status);
 
+CREATE TABLE IF NOT EXISTS corrected_draft_reaudits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_job_id INTEGER NOT NULL REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    source_question_no TEXT NOT NULL CHECK (length(trim(source_question_no)) BETWEEN 1 AND 3),
+    reviewed_draft_version INTEGER NOT NULL CHECK (reviewed_draft_version > 0),
+    edited_sha256 TEXT NOT NULL CHECK (length(edited_sha256) = 64 AND edited_sha256 NOT GLOB '*[^0-9a-f]*'),
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')),
+    source_candidate_sha256 TEXT NOT NULL CHECK (length(source_candidate_sha256) = 64),
+    source_snapshot_sha256 TEXT NOT NULL CHECK (length(source_snapshot_sha256) = 64),
+    batch_audit_output_sha256 TEXT NOT NULL CHECK (length(batch_audit_output_sha256) = 64),
+    crop_generation_id TEXT NOT NULL CHECK (length(crop_generation_id) = 32),
+    crop_manifest_sha256 TEXT NOT NULL CHECK (length(crop_manifest_sha256) = 64),
+    crop_manifest_signature TEXT NOT NULL CHECK (length(crop_manifest_signature) = 64),
+    crop_relative_path TEXT NOT NULL CHECK (
+        crop_relative_path GLOB 'question_crops/Q[0-9][0-9][0-9].png'
+        AND crop_relative_path NOT LIKE '%..%' AND crop_relative_path NOT LIKE '%\%'
+    ),
+    crop_sha256 TEXT NOT NULL CHECK (length(crop_sha256) = 64),
+    crop_byte_size INTEGER NOT NULL CHECK (crop_byte_size > 0),
+    fresh_model_run_id TEXT CHECK (fresh_model_run_id IS NULL OR length(fresh_model_run_id) BETWEEN 1 AND 200),
+    audit_output_sha256 TEXT CHECK (audit_output_sha256 IS NULL OR length(audit_output_sha256) = 64),
+    audit_output_byte_size INTEGER CHECK (audit_output_byte_size IS NULL OR audit_output_byte_size > 0),
+    decision TEXT CHECK (decision IS NULL OR decision IN ('passed','not_passed','error')),
+    confidence TEXT CHECK (confidence IS NULL OR confidence IN ('low','medium','high')),
+    reviewed_at TEXT,
+    approved_draft_version INTEGER CHECK (approved_draft_version IS NULL OR approved_draft_version > reviewed_draft_version),
+    error_message TEXT CHECK (error_message IS NULL OR length(error_message) <= 300),
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (import_job_id, source_question_no, reviewed_draft_version, edited_sha256),
+    UNIQUE (fresh_model_run_id),
+    CHECK (
+        status != 'completed' OR (
+            fresh_model_run_id IS NOT NULL AND audit_output_sha256 IS NOT NULL
+            AND audit_output_byte_size IS NOT NULL AND decision IS NOT NULL
+            AND confidence IS NOT NULL AND reviewed_at IS NOT NULL
+            AND error_message IS NULL
+            AND ((decision = 'passed' AND approved_draft_version IS NOT NULL)
+                 OR (decision != 'passed' AND approved_draft_version IS NULL))
+        )
+    ),
+    CHECK (status != 'failed' OR (decision = 'error' AND error_message IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_corrected_reaudit_lookup
+ON corrected_draft_reaudits(import_job_id, source_question_no, status, reviewed_draft_version);
+
+CREATE TRIGGER IF NOT EXISTS corrected_draft_reaudits_completed_immutable
+BEFORE UPDATE ON corrected_draft_reaudits
+WHEN OLD.status = 'completed'
+BEGIN
+    SELECT RAISE(ABORT, 'completed corrected draft re-audit is immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS candidate_knowledge_classifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_job_id INTEGER NOT NULL REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    source_question_no TEXT NOT NULL CHECK (length(trim(source_question_no)) BETWEEN 1 AND 3),
+    approved_draft_version INTEGER NOT NULL CHECK (approved_draft_version > 0),
+    edited_sha256 TEXT NOT NULL CHECK (length(edited_sha256) = 64 AND edited_sha256 NOT GLOB '*[^0-9a-f]*'),
+    primary_knowledge_point_code TEXT NOT NULL REFERENCES knowledge_points(code) ON DELETE RESTRICT,
+    related_knowledge_point_codes_json TEXT NOT NULL,
+    classifier TEXT NOT NULL CHECK (length(trim(classifier)) BETWEEN 1 AND 100),
+    reviewer TEXT NOT NULL CHECK (length(trim(reviewer)) BETWEEN 1 AND 100),
+    classifier_run_id TEXT NOT NULL CHECK (length(trim(classifier_run_id)) BETWEEN 1 AND 200),
+    evidence_sha256 TEXT NOT NULL CHECK (length(evidence_sha256) = 64 AND evidence_sha256 NOT GLOB '*[^0-9a-f]*'),
+    reason TEXT NOT NULL DEFAULT '' CHECK (length(reason) <= 200),
+    created_at TEXT NOT NULL,
+    UNIQUE (import_job_id, source_question_no, approved_draft_version, edited_sha256),
+    UNIQUE (classifier_run_id, source_question_no)
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_knowledge_lookup
+ON candidate_knowledge_classifications(import_job_id, source_question_no, approved_draft_version);
+
+CREATE TRIGGER IF NOT EXISTS candidate_knowledge_classifications_immutable
+BEFORE UPDATE ON candidate_knowledge_classifications
+BEGIN
+    SELECT RAISE(ABORT, 'completed knowledge classification is immutable');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_questions_content_hash ON questions(content_hash);
 CREATE INDEX IF NOT EXISTS idx_questions_source ON questions(region_code, exam_year, exam_type_code, paper_name, source_question_no);
 CREATE INDEX IF NOT EXISTS idx_questions_primary_knowledge ON questions(primary_knowledge_point_id);
@@ -471,3 +640,5 @@ CREATE INDEX IF NOT EXISTS idx_source_papers_source ON source_papers(region_code
 CREATE INDEX IF NOT EXISTS idx_import_jobs_source_status ON import_jobs(source_paper_id, status);
 CREATE INDEX IF NOT EXISTS idx_import_upload_receipts_source ON import_upload_receipts(source_paper_id);
 CREATE INDEX IF NOT EXISTS idx_import_question_split_status ON import_question_split_runs(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_import_candidate_extraction_status ON import_candidate_extraction_runs(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_import_candidate_audit_status ON import_candidate_audit_runs(status, updated_at);

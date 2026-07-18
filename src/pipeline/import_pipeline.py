@@ -231,7 +231,7 @@ def inspect_pipeline(database_path, private_root, job_id):
                     job_id,
                     "needs_candidates",
                     "provide_candidate_questions",
-                    "需要由外部视觉识别流程提供候选题",
+                    "需要在任务页显式生成候选题",
                 )
             crops = _object_at(job_fd, "question_crops.json")
             if not _matching_batch(crops, job_id, numbers):

@@ -36,6 +36,9 @@ CORE_TABLES = {
     "import_upload_receipts",
     "import_page_render_runs",
     "import_question_split_runs",
+    "import_candidate_extraction_runs",
+    "import_candidate_audit_runs",
+    "corrected_draft_reaudits",
 }
 
 

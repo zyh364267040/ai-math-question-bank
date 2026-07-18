@@ -25,6 +25,26 @@
 <dl class="complete-metadata"><div><dt>题型</dt><dd>{{ display.type_name }}题</dd></div><div><dt>主知识点</dt><dd>{{ display.primary_name }}</dd></div><div><dt>关联知识点</dt><dd>{% if display.related_names %}{{ display.related_names | join('、') }}{% else %}无{% endif %}</dd></div><div><dt>分类</dt><dd><button type="button" class="classification-edit-link" data-open-advanced="edit-question-type">修改分类</button></dd></div><div><dt>来源页码</dt><dd>{% if display.source_pages %}第 {{ display.source_pages | join('、') }} 页{% else %}未标注{% endif %}</dd></div><div><dt>当前审核状态</dt><dd data-review-status>{{ display.status_name }}</dd></div></dl>
 </article></div></section>
 
+{% if reaudit %}
+<section class="paper-card processing-card" aria-live="polite">
+  {% if reaudit.status == 'processing' %}<p><strong>修正后 AI 复审处理中</strong></p>
+  {% elif reaudit.status == 'failed' %}<p class="form-error">修正后 AI 复审失败，请重试</p>
+  {% elif reaudit.decision == 'passed' %}<p><strong>修正后 AI 复审已通过</strong></p>
+  {% else %}<p class="form-error">修正后 AI 复审未通过，请继续修正后再次提交</p>{% endif %}
+</section>
+{% endif %}
+{% if draft.status in ('draft', 'needs_fix') and (reaudit is none or reaudit.status != 'processing') %}
+<section class="paper-card processing-card">
+  <p>仅在你明确提交后，系统才会用当前精确草稿和本题原图启动一次全新的独立 AI 复审。</p>
+  <form method="post" action="/reviews/{{ job.id }}/questions/{{ number }}/ai-reaudit">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="version" value="{{ draft.version }}">
+    <input type="hidden" name="edited_sha256" value="{{ edited_sha256 }}">
+    <button class="button" type="submit">修正后重新 AI 复审</button>
+  </form>
+</section>
+{% endif %}
+
 <section class="quick-review{% if draft.status == 'approved' %} approved{% endif %}" aria-labelledby="quick-review-title"><div><p class="section-kicker">当前审核状态：<span data-review-status>{{ display.status_name }}</span></p><h2 id="quick-review-title">快速审核</h2></div><div class="quick-review-actions">
 <form method="post" action="/reviews/{{ job.id }}/questions/{{ number }}/quick-status"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version" value="{{ draft.version }}" data-review-version><button name="action" value="approve" class="quick-approve">{% if draft.status == 'approved' %}已审核通过（再次确认并进入下一题）{% else %}审核通过并进入下一题{% endif %}</button></form>
 <form method="post" action="/reviews/{{ job.id }}/questions/{{ number }}/quick-status"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version" value="{{ draft.version }}" data-review-version><button name="action" value="needs_fix" class="quick-fix">标记需要修正</button></form>

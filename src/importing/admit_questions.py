@@ -18,6 +18,8 @@ from PIL import Image, UnidentifiedImageError
 
 from src.database.initialize import DEFAULT_DATABASE_PATH, initialize_database
 from src.reviewing.finalize import is_ai_second_pass_eligible
+from src.reviewing.candidate_review_ai import validate_ai_approval
+from src.reviewing.knowledge_classification import load_bound_knowledge_classification
 from src.processing.secure_crop_artifacts import (
     LOCK_FILENAME,
     SecureCropArtifactError,
@@ -376,7 +378,8 @@ def _load_context(connection, private_root: Path, job_id: int, artifact_lock=Non
         figures[number] = entry
     return (
         job, job_dir, questions, audits, crops, figures,
-        candidate_snapshot.sha256, tuple(snapshots),
+        candidate_snapshot.sha256, _audit_snapshot.sha256,
+        _crops_snapshot.sha256, tuple(snapshots),
     )
 
 
@@ -432,14 +435,49 @@ def _assess(connection, context, effective=None):
     return AssessmentReport(tuple(eligible), tuple(ineligible))
 
 
+def _overlay_knowledge_classification(
+    connection, job_id, number, question, draft, reasons, legacy_present,
+):
+    """Overlay only exact draft-bound classification evidence."""
+    points = {
+        row[0] for row in connection.execute(
+            "SELECT code FROM knowledge_points WHERE is_active=1"
+        )
+    }
+    primary = question.get("primary_knowledge_point_code")
+    related = question.get("related_knowledge_point_codes")
+    if (
+        primary in points and isinstance(related, list)
+        and all(code in points for code in related)
+    ):
+        return question, draft, reasons, legacy_present
+    bound = None
+    if draft is not None:
+        bound = load_bound_knowledge_classification(
+            connection, job_id, number, dict(draft)
+        )
+    if bound is None:
+        return (
+            question, draft,
+            tuple(dict.fromkeys((*reasons, "knowledge_classification_missing"))),
+            legacy_present,
+        )
+    overlaid = dict(question)
+    overlaid["primary_knowledge_point_code"] = bound["primary_code"]
+    overlaid["related_knowledge_point_codes"] = bound["related_codes"]
+    return overlaid, draft, reasons, legacy_present
+
+
 def _effective_questions(connection, context):
     """Choose reviewed human content for candidates not eligible via AI review."""
     job, _, questions, audits, _, _ = context[:6]
     candidate_sha256 = context[6]
+    audit_sha256 = context[7]
+    crop_manifest_sha256 = context[8]
     drafts = {
         row["source_question_no"]: row
         for row in connection.execute(
-            """SELECT source_question_no,source_candidate_sha256,source_snapshot_json,
+            """SELECT import_job_id,source_question_no,source_candidate_sha256,source_snapshot_json,
                       edited_json,status,version,reviewed_at,approval_source,
                       approval_evidence_json,deleted_at
                FROM candidate_review_drafts WHERE import_job_id=?""",
@@ -451,13 +489,34 @@ def _effective_questions(connection, context):
         number = question["source_question_no"]
         draft = drafts.get(number)
         ai_eligible = is_ai_second_pass_eligible(audits[number])
-        human_approved = bool(
-            draft is not None
-            and draft["status"] == "approved"
-            and draft["approval_source"] == "human"
-        )
-        if draft is None or (ai_eligible and not human_approved):
-            selected[number] = (question, None, (), False)
+        if draft is None:
+            anchor = connection.execute(
+                """SELECT status,input_candidate_sha256,input_manifest_sha256,
+                          output_sha256 FROM import_candidate_audit_runs
+                   WHERE import_job_id=?""", (job["id"],),
+            ).fetchone()
+            anchored = bool(
+                anchor is not None and anchor["status"] == "completed"
+                and anchor["input_candidate_sha256"] == candidate_sha256
+                and anchor["input_manifest_sha256"] == crop_manifest_sha256
+                and anchor["output_sha256"] == audit_sha256
+            )
+            selected[number] = (
+                (question, None, (), False) if ai_eligible and anchored
+                else (question, None, ("batch_ai_approval_not_anchored",), False)
+            )
+            continue
+        if draft["status"] == "approved" and draft["approval_source"] == "ai_second_pass":
+            if validate_ai_approval(
+                connection, dict(draft), question,
+                candidate_sha256=candidate_sha256,
+                audit_sha256=audit_sha256, audit_entry=audits[number],
+            ):
+                selected[number] = (json.loads(draft["edited_json"]), draft, (), False)
+            else:
+                selected[number] = (
+                    question, None, ("ai_approval_provenance_invalid",), False
+                )
             continue
         if draft["status"] != "approved":
             selected[number] = (
@@ -545,7 +604,12 @@ def _effective_questions(connection, context):
                 question, None, ("human_approval_edited_json_invalid",), False
             )
         )
-    return selected
+    return {
+        number: _overlay_knowledge_classification(
+            connection, job["id"], number, *selection
+        )
+        for number, selection in selected.items()
+    }
 
 
 def assess_job(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1):
@@ -560,12 +624,42 @@ def assess_job(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1)
                 connection, private_root, job_id, artifact_lock=artifact_lock
             )
             report = _assess(connection, context)
-            _verify_artifact_snapshots(artifact_lock.descriptor, context[7])
+            _verify_artifact_snapshots(artifact_lock.descriptor, context[9])
             return report
 
 
 def _code(source_sha: str, number: str) -> str:
     return f"Q-{source_sha[:16]}-{int(number):03d}"
+
+
+def _approval_review_metadata(approval, question, answer_note, audits, number):
+    if approval is not None:
+        evidence = json.dumps(
+            json.loads(approval["approval_evidence_json"]),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        source = approval["approval_source"]
+        if source == "human":
+            reviewer = "human"
+            label = "人工审核通过"
+        elif source == "ai_second_pass":
+            reviewer = "ai_second_pass"
+            label = "AI二审通过"
+        else:
+            raise AdmissionError("批准来源无效")
+        reviewed_at = approval["reviewed_at"]
+        review_note = (
+            f"{label}；草稿版本={approval['version']}；"
+            f"候选源SHA256={approval['source_candidate_sha256']}；"
+            f"获批内容SHA256={_canonical_json_sha256(question)}；"
+            f"批准证据={evidence}；{answer_note}"
+        )
+        return reviewer, reviewed_at, review_note
+    reviewer = audits[number].get("auditor", "ai_audit")
+    reviewed_at = datetime.now(timezone.utc).isoformat()
+    return reviewer, reviewed_at, f"AI二审通过（auto_pass）；{answer_note}"
 
 
 def _insert_one(connection, context, question, code, human_approval=None):
@@ -631,25 +725,9 @@ def _insert_one(connection, context, question, code, human_approval=None):
     answer_note = (
         "原卷答案已通过审核" if any_answer_provided else "原卷未提供答案"
     )
-    if human_approval is not None:
-        evidence = json.dumps(
-            json.loads(human_approval["approval_evidence_json"]),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        reviewer = "human"
-        reviewed_at = human_approval["reviewed_at"]
-        review_note = (
-            f"人工审核通过；草稿版本={human_approval['version']}；"
-            f"候选源SHA256={human_approval['source_candidate_sha256']}；"
-            f"获批内容SHA256={_canonical_json_sha256(question)}；"
-            f"批准证据={evidence}；{answer_note}"
-        )
-    else:
-        reviewer = audits[number].get("auditor", "ai_audit")
-        reviewed_at = datetime.now(timezone.utc).isoformat()
-        review_note = f"AI二审通过（auto_pass）；{answer_note}"
+    reviewer, reviewed_at, review_note = _approval_review_metadata(
+        human_approval, question, answer_note, audits, number
+    )
     connection.execute(
         """INSERT INTO question_reviews(question_id,review_item,previous_status,new_status,reviewer,reviewed_at,notes)
            VALUES(?,'usability','pending','passed',?,?,?)""",
@@ -708,7 +786,7 @@ def admit_questions(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_
                     effective[item.question_no][1],
                 )
                 inserted += 1
-            _verify_artifact_snapshots(artifact_lock.descriptor, context[7])
+            _verify_artifact_snapshots(artifact_lock.descriptor, context[9])
             result = AdmissionResult(
                 inserted, present, len(assessment.eligible), len(assessment.ineligible),
                 tuple(codes),

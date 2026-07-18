@@ -58,9 +58,38 @@ from src.processing.question_splitter import (
     read_completed_split_image,
     run_claimed_split,
 )
+from src.processing.candidate_extractor import (
+    SAFE_EXISTING_ERROR as SAFE_CANDIDATE_EXISTING_ERROR,
+    SAFE_EXTRACTION_ERROR,
+    SAFE_INPUT_INVALID as SAFE_CANDIDATE_INPUT_INVALID,
+    SAFE_INPUT_REQUIRED as SAFE_CANDIDATE_INPUT_REQUIRED,
+    CandidateExtractionError,
+    claim_candidate_extraction,
+    load_completed_candidates,
+    run_claimed_candidate_extraction,
+)
 from src.processing.secure_crop_artifacts import (
     SecureCropArtifactError,
     validate_signed_manifest,
+)
+from src.reviewing.candidate_auditor import (
+    SAFE_AUDIT_ERROR,
+    SAFE_EXISTING_ERROR as SAFE_AUDIT_EXISTING_ERROR,
+    SAFE_EXISTING_UNANCHORED,
+    SAFE_INPUT_INVALID as SAFE_AUDIT_INPUT_INVALID,
+    SAFE_INPUT_REQUIRED as SAFE_AUDIT_INPUT_REQUIRED,
+    CandidateAuditError,
+    adopt_existing_candidate_audit,
+    claim_candidate_audit,
+    load_completed_candidate_audit,
+    run_claimed_candidate_audit,
+)
+from src.reviewing.candidate_review_ai import (
+    SAFE_REAUDIT_BUSY,
+    SAFE_REAUDIT_INPUT,
+    apply_batch_auto_pass,
+    claim_corrected_draft_audit,
+    run_claimed_corrected_draft_audit,
 )
 
 
@@ -92,6 +121,18 @@ SPLIT_STATUS_NAMES = {
     "processing": "Codex 正在自动切题",
     "completed": "自动切题完成",
     "failed": "自动切题失败",
+}
+CANDIDATE_STATUS_NAMES = {
+    "pending": "等待调用",
+    "processing": "Codex 正在识别题目内容",
+    "completed": "候选题识别完成",
+    "failed": "候选题识别失败",
+}
+AUDIT_STATUS_NAMES = {
+    "pending": "等待调用",
+    "processing": "Codex 正在独立视觉二审",
+    "completed": "独立视觉二审完成",
+    "failed": "独立视觉二审失败",
 }
 SAFE_SPLIT_ERRORS = {SAFE_SPLIT_ERROR, SAFE_CODEX_MISSING}
 SAFE_LAYOUT_ERRORS = {
@@ -191,7 +232,10 @@ class PreviewUploadBodyLimitMiddleware:
             return
         if path == "/imports/preview":
             request_limit = self.max_body_bytes
-        elif re.fullmatch(r"/imports/[^/]+/(?:render|layout|split)", path):
+        elif re.fullmatch(
+            r"/imports/[^/]+/(?:render|layout|split|candidates|audit(?:/adopt)?)",
+            path,
+        ):
             request_limit = min(self.max_body_bytes, MAX_RENDER_START_FORM_BYTES)
         else:
             await self.app(scope, receive, send)
@@ -604,7 +648,7 @@ def _review_guidance(question, edited, crop, figures, audit):
                 add(_review_action(text))
         else:
             add("按候选题的人工复核标记，对照原题逐项确认")
-    confidence = question.get("confidence")
+    confidence = question.get("extraction_confidence", question.get("confidence"))
     if confidence not in (None, "", "high"):
         confidence_name = {"medium": "中", "low": "低"}.get(str(confidence).casefold(), "异常")
         add(f"候选识别置信度为{confidence_name}，请重点对照原题核查")
@@ -734,7 +778,9 @@ def _load_question_crops(
             if (candidate is None or candidate.is_absolute() or ".." in candidate.parts
                     or "\\" in relative or candidate.as_posix() != expected_relative
                     or entry.get("crop_status") != "generated"
-                    or entry.get("review_status") not in {"pending_ai_review", "ai_review_passed"}
+                    or entry.get("review_status") not in {
+                        "pending_ai_review", "ai_review_passed", "needs_recrop",
+                    }
                     or not isinstance(entry.get("warnings"), list)):
                 return []
             target = (job_dir / expected_relative).resolve()
@@ -1012,6 +1058,9 @@ def create_app(
     preview_request_max_bytes=MAX_PREVIEW_REQUEST_BYTES,
     split_runner=None,
     weekly_checker=None,
+    candidate_runner=None,
+    audit_runner=None,
+    corrected_audit_runner=None,
     _initialize_schema=True,
 ):
     database_path = Path(database_path)
@@ -1022,6 +1071,9 @@ def create_app(
     application.state.database_path = database_path
     application.state.private_root = private_root
     application.state.split_runner = split_runner
+    application.state.candidate_runner = candidate_runner
+    application.state.audit_runner = audit_runner
+    application.state.corrected_audit_runner = corrected_audit_runner or audit_runner
     application.state.weekly_checker = weekly_checker
     if not _initialize_schema:
         @application.on_event("startup")
@@ -1047,7 +1099,7 @@ def create_app(
         response.headers["X-AI-Math-Question-Bank"] = "1"
         if (
             request.method == "GET"
-            and re.fullmatch(r"/imports/[^/]+/layout", request.url.path)
+            and re.fullmatch(r"/imports/[^/]+/(?:layout|split|candidates|audit)", request.url.path)
         ):
             response.headers["Cache-Control"] = "no-store"
         if cookie_token != token:
@@ -1107,6 +1159,8 @@ def create_app(
                               la.analyzed_pages, la.detected_questions,
                               qs.status AS split_status,
                               qs.question_count AS split_question_count,
+                              ce.status AS candidate_status,
+                              ar.status AS audit_run_status,
                               (SELECT COUNT(*) FROM candidate_review_drafts d
                                WHERE d.import_job_id=j.id AND d.deleted_at IS NOT NULL) AS deleted_count
                        FROM import_jobs j
@@ -1116,6 +1170,8 @@ def create_app(
                        LEFT JOIN import_page_render_runs pr ON pr.import_job_id = j.id
                        LEFT JOIN import_layout_analysis_runs la ON la.import_job_id = j.id
                        LEFT JOIN import_question_split_runs qs ON qs.import_job_id = j.id
+                       LEFT JOIN import_candidate_extraction_runs ce ON ce.import_job_id = j.id
+                       LEFT JOIN import_candidate_audit_runs ar ON ar.import_job_id = j.id
                        ORDER BY j.created_at DESC, j.id DESC"""
                 ).fetchall()
         except sqlite3.Error:
@@ -1391,6 +1447,15 @@ def create_app(
             run["status"] = "failed"
             run["status_name"] = "结果校验失败"
             run["error_message"] = SAFE_SPLIT_EXISTING_ERROR
+        run["crop_review_passed"] = sum(
+            crop.get("review_status") == "ai_review_passed" for crop in crops
+        )
+        run["crop_review_needs_recrop"] = sum(
+            crop.get("review_status") == "needs_recrop" for crop in crops
+        )
+        run["crop_review_pending"] = sum(
+            crop.get("review_status") == "pending_ai_review" for crop in crops
+        )
         return templates.TemplateResponse(
             request=request, name="import_split.html",
             context={"run": run, "crops": crops},
@@ -1421,6 +1486,194 @@ def create_app(
         return Response(
             content, media_type="image/png",
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @application.post("/imports/{job_id}/candidates")
+    async def start_candidate_extraction(
+        request: Request, job_id: int, background_tasks: BackgroundTasks
+    ):
+        """Only a CSRF-protected click may start transcription of verified crops."""
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "候选题识别请求参数无效", 400)
+        try:
+            claim = claim_candidate_extraction(
+                database_path, private_root, job_id,
+                runner=application.state.candidate_runner,
+                weekly_checker=application.state.weekly_checker,
+            )
+        except CandidateExtractionError as error:
+            message = str(error)
+            if message == "未找到导入任务":
+                return _error(request, templates, message, 404)
+            if message in {
+                SAFE_CANDIDATE_INPUT_REQUIRED, SAFE_CANDIDATE_INPUT_INVALID,
+                SAFE_CODEX_MISSING, SAFE_WEEKLY_LOW, SAFE_WEEKLY_UNAVAILABLE,
+            }:
+                return _error(request, templates, message, 409)
+            return _error(request, templates, "候选题识别任务暂时无法启动", 500)
+        if claim is not None:
+            background_tasks.add_task(run_claimed_candidate_extraction, claim)
+        return RedirectResponse(f"/imports/{job_id}/candidates", status_code=303)
+
+    @application.get("/imports/{job_id}/candidates", response_class=HTMLResponse)
+    def candidate_extraction_status(request: Request, job_id: int):
+        """Read status/results without creating state, drafts, or artifacts."""
+        try:
+            with _connect(database_path) as connection:
+                row = connection.execute(
+                    """SELECT j.id,j.status AS import_status,s.paper_name,
+                              s.original_filename,q.status AS split_status,
+                              q.question_count AS split_question_count,c.status,
+                              c.question_count,c.processed_questions,c.error_message,
+                              c.codex_run_id,c.input_crop_generation_id,
+                              c.input_manifest_sha256,c.updated_at
+                       FROM import_jobs j JOIN source_papers s ON s.id=j.source_paper_id
+                       LEFT JOIN import_question_split_runs q ON q.import_job_id=j.id
+                       LEFT JOIN import_candidate_extraction_runs c ON c.import_job_id=j.id
+                       WHERE j.id=?""", (job_id,)
+                ).fetchone()
+        except sqlite3.Error:
+            return _error(request, templates, "候选题识别状态暂时无法读取", 500)
+        if row is None:
+            return _error(request, templates, "未找到导入任务", 404)
+        if row["import_status"] != "pending" or row["split_status"] != "completed":
+            return _error(request, templates, SAFE_CANDIDATE_INPUT_REQUIRED, 409)
+        run = dict(row)
+        run["status"] = run["status"] or "pending"
+        run["processed_questions"] = run["processed_questions"] or 0
+        run["status_name"] = CANDIDATE_STATUS_NAMES[run["status"]]
+        if run["error_message"] != SAFE_EXTRACTION_ERROR:
+            run["error_message"] = (
+                SAFE_EXTRACTION_ERROR if run["status"] == "failed" else None
+            )
+        candidate = None
+        if run["status"] == "completed":
+            try:
+                candidate = load_completed_candidates(
+                    database_path, private_root, job_id
+                )
+            except CandidateExtractionError:
+                run["status"] = "failed"
+                run["status_name"] = "结果或输入已变化"
+                run["error_message"] = SAFE_CANDIDATE_EXISTING_ERROR
+        return templates.TemplateResponse(
+            request=request, name="import_candidates.html",
+            context={"run": run, "candidate": candidate},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @application.post("/imports/{job_id}/audit")
+    async def start_candidate_audit(
+        request: Request, job_id: int, background_tasks: BackgroundTasks
+    ):
+        """Only an explicit CSRF-protected POST may launch the independent audit."""
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "独立视觉二审请求参数无效", 400)
+        try:
+            claim = claim_candidate_audit(
+                database_path, private_root, job_id,
+                runner=application.state.audit_runner,
+                weekly_checker=application.state.weekly_checker,
+            )
+        except CandidateAuditError as error:
+            message = str(error)
+            if message == "未找到导入任务":
+                return _error(request, templates, message, 404)
+            if message in {
+                SAFE_AUDIT_INPUT_REQUIRED, SAFE_AUDIT_INPUT_INVALID,
+                SAFE_EXISTING_UNANCHORED, SAFE_AUDIT_EXISTING_ERROR,
+                SAFE_CODEX_MISSING, SAFE_WEEKLY_LOW, SAFE_WEEKLY_UNAVAILABLE,
+            }:
+                return _error(request, templates, message, 409)
+            return _error(request, templates, "独立视觉二审任务暂时无法启动", 500)
+        if claim is not None:
+            background_tasks.add_task(run_claimed_candidate_audit, claim)
+        return RedirectResponse(f"/imports/{job_id}/audit", status_code=303)
+
+    @application.post("/imports/{job_id}/audit/adopt")
+    async def adopt_candidate_audit(request: Request, job_id: int):
+        """Explicitly validate and anchor a pre-existing result without Codex."""
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "现有二审结果登记请求参数无效", 400)
+        try:
+            adopt_existing_candidate_audit(database_path, private_root, job_id)
+        except CandidateAuditError as error:
+            status = 404 if str(error) == "未找到导入任务" else 409
+            return _error(request, templates, str(error), status)
+        return RedirectResponse(f"/imports/{job_id}/audit", status_code=303)
+
+    @application.post("/imports/{job_id}/audit/apply-auto-pass")
+    async def apply_candidate_audit_auto_pass(request: Request, job_id: int):
+        """Apply a completed batch audit only after an explicit protected POST."""
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "应用自动通过结果请求参数无效", 400)
+        try:
+            result = apply_batch_auto_pass(database_path, private_root, job_id)
+        except CandidateAuditError as error:
+            return _error(request, templates, str(error), 409)
+        return RedirectResponse(
+            f"/imports/{job_id}/audit?applied={result.changed}", status_code=303
+        )
+
+    @application.get("/imports/{job_id}/audit", response_class=HTMLResponse)
+    def candidate_audit_status(request: Request, job_id: int, applied: int = -1):
+        """Read audit status/results without creating files, rows, or drafts."""
+        try:
+            with _connect(database_path) as connection:
+                row = connection.execute(
+                    """SELECT j.id,j.status AS import_status,s.paper_name,
+                              s.original_filename,c.status AS candidate_status,
+                              c.question_count AS candidate_question_count,a.status,
+                              a.question_count,a.processed_questions,a.error_message,
+                              a.codex_run_id,a.updated_at
+                       FROM import_jobs j JOIN source_papers s ON s.id=j.source_paper_id
+                       LEFT JOIN import_candidate_extraction_runs c ON c.import_job_id=j.id
+                       LEFT JOIN import_candidate_audit_runs a ON a.import_job_id=j.id
+                       WHERE j.id=?""", (job_id,),
+                ).fetchone()
+        except sqlite3.Error:
+            return _error(request, templates, "独立视觉二审状态暂时无法读取", 500)
+        if row is None:
+            return _error(request, templates, "未找到导入任务", 404)
+        if (
+            row["import_status"] not in {"pending", "needs_review", "completed"}
+            or row["candidate_status"] != "completed"
+        ):
+            return _error(request, templates, SAFE_AUDIT_INPUT_REQUIRED, 409)
+        run = dict(row)
+        run["status"] = run["status"] or "pending"
+        run["processed_questions"] = run["processed_questions"] or 0
+        run["status_name"] = AUDIT_STATUS_NAMES[run["status"]]
+        if run["error_message"] != SAFE_AUDIT_ERROR:
+            run["error_message"] = SAFE_AUDIT_ERROR if run["status"] == "failed" else None
+        audit = None
+        if run["status"] == "completed":
+            try:
+                audit = load_completed_candidate_audit(
+                    database_path, private_root, job_id
+                )
+            except CandidateAuditError:
+                run["status"] = "failed"
+                run["status_name"] = "结果或输入已变化"
+                run["error_message"] = SAFE_AUDIT_EXISTING_ERROR
+        audit_path = _job_dir(private_root, job_id) / "ai_audit.json"
+        run["has_unanchored_audit"] = run["status"] == "pending" and audit_path.is_file()
+        return templates.TemplateResponse(
+            request=request, name="import_audit.html",
+            context={"run": run, "audit": audit, "applied": applied},
+            headers={"Cache-Control": "no-store"},
         )
 
     @application.get("/imports/new", response_class=HTMLResponse)
@@ -1591,6 +1844,17 @@ def create_app(
         question = questions[numbers.index(question_no)]
         draft = draft_by_no[question_no]
         edited = json.loads(draft["edited_json"])
+        edited_sha256 = hashlib.sha256(json.dumps(
+            edited, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        with _connect(database_path) as connection:
+            latest_reaudit = connection.execute(
+                """SELECT status,decision,error_message,reviewed_draft_version,
+                          approved_draft_version,updated_at
+                   FROM corrected_draft_reaudits WHERE import_job_id=?
+                     AND source_question_no=? ORDER BY id DESC LIMIT 1""",
+                (job_id, question_no),
+            ).fetchone()
         subquestion_display = _group_labeled_subquestions(edited.get("subquestions", []))
         type_names = {item["code"]: item["name"] for item in types}
         point_names = {item["code"]: item["name"] for item in points}
@@ -1636,6 +1900,8 @@ def create_app(
         source_page = next((p for p in manifest.get("pages", []) if p.get("page_number") == page_number), None)
         active_index = active_numbers.index(question_no) if question_no in active_numbers else None
         return {"job": dict(job), "number": question_no, "draft": draft, "edited": edited, "display": display,
+                "edited_sha256": edited_sha256,
+                "reaudit": dict(latest_reaudit) if latest_reaudit else None,
                 "subquestion_display": subquestion_display,
                 "question_types": types, "knowledge_points": points, "navigation": navigation,
                 "progress": progress, "crop": crops.get(question_no), "figures": question_figures,
@@ -1662,6 +1928,43 @@ def create_app(
             "needs_recrop": "已标记为需要重切，可继续检查裁图",
         }.get(quick)
         return templates.TemplateResponse(request=request, name="review_workbench.html", context=context)
+
+    @application.post("/reviews/{job_id}/questions/{question_no}/ai-reaudit")
+    async def start_corrected_draft_reaudit(
+        request: Request, job_id: int, question_no: str,
+        background_tasks: BackgroundTasks,
+    ):
+        form = await require_csrf(request)
+        if form is None:
+            return _review_error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token", "version", "edited_sha256"}:
+            return _review_error(request, templates, "修正后复审请求参数无效", 400)
+        try:
+            version_text = str(form.get("version", ""))
+            edited_sha256 = str(form.get("edited_sha256", ""))
+            if not re.fullmatch(r"[1-9][0-9]*", version_text) or not re.fullmatch(
+                r"[0-9a-f]{64}", edited_sha256
+            ):
+                raise CandidateAuditError(SAFE_REAUDIT_INPUT)
+            claim = claim_corrected_draft_audit(
+                database_path, private_root, job_id, question_no,
+                runner=application.state.corrected_audit_runner,
+                weekly_checker=application.state.weekly_checker,
+                expected_draft_version=int(version_text),
+                expected_edited_sha256=edited_sha256,
+            )
+        except CandidateAuditError as error:
+            status = 409 if str(error) in {
+                SAFE_REAUDIT_INPUT, SAFE_REAUDIT_BUSY, SAFE_WEEKLY_LOW,
+                SAFE_WEEKLY_UNAVAILABLE,
+            } else 500
+            return _review_error(request, templates, str(error), status)
+        if claim is not None:
+            background_tasks.add_task(run_claimed_corrected_draft_audit, claim)
+        return RedirectResponse(
+            f"/reviews/{job_id}/questions/{quote(question_no, safe='')}",
+            status_code=303,
+        )
 
     @application.get("/reviews/{job_id}/deleted", response_class=HTMLResponse)
     def deleted_candidate_questions(request: Request, job_id: int):
@@ -2501,10 +2804,20 @@ def create_app(
                             else "all"
                         ),
                     })
-        medium = sum(q.get("confidence") == "medium" for q in active_questions)
-        high = sum(q.get("confidence") == "high" for q in active_questions)
+        medium = sum(
+            q.get("extraction_confidence", q.get("confidence")) == "medium"
+            for q in active_questions
+        )
+        high = sum(
+            q.get("extraction_confidence", q.get("confidence")) == "high"
+            for q in active_questions
+        )
         figures = sum(bool(q.get("figure_required")) for q in active_questions)
-        focus = sum(bool(q.get("review_notes")) or q.get("confidence") != "high" for q in active_questions)
+        focus = sum(
+            bool(q.get("review_notes"))
+            or q.get("extraction_confidence", q.get("confidence")) != "high"
+            for q in active_questions
+        )
         summary = {"total": len(active_questions), "deleted": len(questions) - len(active_questions), "high": high, "medium": medium, "figures": figures, "focus": focus}
         return templates.TemplateResponse(
             request=request,

@@ -35,6 +35,12 @@
     {% if job.render_status == 'completed' %}
       <a class="button" href="/imports/{{ job.id }}/split">{% if job.split_status %}查看自动切题{% else %}下一步：调用 Codex 自动切题{% endif %}</a>
     {% endif %}
+    {% if job.split_status == 'completed' %}
+      <a class="button" href="/imports/{{ job.id }}/candidates">识别候选题内容</a>
+    {% endif %}
+    {% if job.candidate_status == 'completed' %}
+      <a class="button" href="/imports/{{ job.id }}/audit">{% if job.audit_run_status %}查看独立视觉二审{% else %}启动独立视觉二审{% endif %}</a>
+    {% endif %}
     {% if job.audit %}
       <section class="paper-audit">
         <b>AI已复核</b>

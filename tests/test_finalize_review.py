@@ -187,11 +187,33 @@ class FinalizeReviewTests(unittest.TestCase):
                 "evidence_page": 1,
             })
         counts = {"auto_pass": 3, "disputed": 0, "human_required": 1}
-        (job_dir / "ai_audit.json").write_text(
-            json.dumps({"import_job_id": 1, "question_count": 4, "questions": audits,
-                        "counts": counts}, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        audit_raw = json.dumps(
+            {"import_job_id": 1, "question_count": 4, "questions": audits,
+             "counts": counts}, separators=(",", ":")
+        ).encode("utf-8")
+        (job_dir / "ai_audit.json").write_bytes(audit_raw)
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            connection.execute(
+                """INSERT INTO import_candidate_audit_runs
+                   (import_job_id,status,question_count,processed_questions,codex_run_id,
+                    input_candidate_sha256,input_candidate_byte_size,
+                    input_crop_generation_id,input_manifest_sha256,input_manifest_signature,
+                    output_sha256,output_byte_size,completed_at,updated_at)
+                   VALUES(1,'completed',4,4,'finalize-fixture-run',?,?,?, ?,?,?,?,
+                          '2026-07-16T00:00:00+00:00','2026-07-16T00:00:00+00:00')
+                   ON CONFLICT(import_job_id) DO UPDATE SET
+                     status=excluded.status,question_count=excluded.question_count,
+                     processed_questions=excluded.processed_questions,
+                     codex_run_id=excluded.codex_run_id,
+                     input_candidate_sha256=excluded.input_candidate_sha256,
+                     input_candidate_byte_size=excluded.input_candidate_byte_size,
+                     output_sha256=excluded.output_sha256,
+                     output_byte_size=excluded.output_byte_size,
+                     completed_at=excluded.completed_at,updated_at=excluded.updated_at""",
+                (hashlib.sha256(self.candidate_raw).hexdigest(), len(self.candidate_raw),
+                 "1" * 32, "2" * 64, "3" * 64,
+                 hashlib.sha256(audit_raw).hexdigest(), len(audit_raw)),
+            )
 
     def _approve_q12_with_formal_question(self):
         with closing(sqlite3.connect(self.db_path)) as connection, connection:

@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Codex 候选题识别 · AI 数学题库{% endblock %}
+{% block head_extra %}{% if run.status == 'processing' %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">CANDIDATE EXTRACTION</p>
+  <h1>{{ run.paper_name }}</h1>
+  <p>来源文件：{{ run.original_filename }}</p>
+</section>
+<section class="paper-card processing-card">
+  <p><span class="status {{ run.status }}">{{ run.status_name }}</span></p>
+  {% if run.status == 'failed' %}<p class="form-error">{{ run.error_message }}</p>{% endif %}
+  {% if run.status in ('pending', 'failed') %}
+    <p><strong>点击后，只把已验证的单题 PNG 发送给 OpenAI Codex。</strong>GET 浏览本页绝不会启动调用。</p>
+    <form method="post" action="/imports/{{ run.id }}/candidates">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">{% if run.status == 'failed' %}重试调用 Codex 识别题目内容{% else %}调用 Codex 识别题目内容{% endif %}</button>
+    </form>
+  {% elif run.status == 'processing' %}
+    <p>Codex 正在逐题转录；若服务曾重启，可显式继续。</p>
+    <form method="post" action="/imports/{{ run.id }}/candidates">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">继续或恢复候选题识别</button>
+    </form>
+  {% elif run.status == 'completed' %}
+    <h2>共识别 {{ run.question_count }} 道候选题</h2>
+    <a class="button" href="/imports/{{ run.id }}/audit">下一步：独立 Codex 视觉二审</a>
+  {% endif %}
+  <p><strong>未生成答案/解析，尚未AI二审，尚未正式入库。</strong></p>
+</section>
+{% if candidate %}
+<section class="layout-review">
+  {% for question in candidate.questions %}
+  <article class="paper-card layout-question">
+    <h2>Q{{ '%03d'|format(question.source_question_no|int) }}</h2>
+    <img loading="lazy" src="/imports/{{ run.id }}/split-images/{{ question.source_question_no }}.png" alt="Q{{ '%03d'|format(question.source_question_no|int) }} 已验证单题图片">
+    <h3>识别题干</h3>
+    <p class="candidate-stem">{{ question.stem_markdown }}</p>
+    {% if question.options %}
+    <ul>
+      {% for option in question.options %}<li><strong>{{ option.code }}.</strong> {{ option.content }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if question.subquestions %}
+    <ol>
+      {% for item in question.subquestions %}<li><strong>{{ item.label }}</strong> {{ item.stem_markdown }}</li>{% endfor %}
+    </ol>
+    {% endif %}
+    <p>置信度：<code>{{ question.extraction_confidence }}</code></p>
+    {% for warning in question.warnings %}<p class="form-error">{{ warning }}</p>{% endfor %}
+  </article>
+  {% endfor %}
+</section>
+{% endif %}
+{% endblock %}

@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import re
 import sqlite3
@@ -12,6 +13,7 @@ from PIL import Image
 
 from src.database.initialize import initialize_database
 from src.processing.question_splitter import CodexRunResult
+from src.processing.crop_review import record_crop_ai_review
 from src.web.app import create_app
 
 
@@ -130,6 +132,25 @@ class QuestionSplitWebTests(unittest.TestCase):
                 opened.load()
                 self.assertEqual("PNG", opened.format)
 
+        job_dir = self.private / "processing" / f"import_job_{job_id}"
+        manifest_bytes = (job_dir / "question_crops.json").read_bytes()
+        manifest = json.loads(manifest_bytes)
+        record_crop_ai_review(self.db, self.private, {
+            "version": 1,
+            "import_job_id": job_id,
+            "input_generation_id": manifest["generation_id"],
+            "input_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "reviewer_run_id": "web-vision-review-1",
+            "questions": [
+                {"question_no": 1, "status": "ai_review_passed", "warnings": []},
+                {"question_no": 2, "status": "needs_recrop", "warnings": ["下边界需重切"]},
+            ],
+        })
+        reviewed = self.client.get(f"/imports/{job_id}/split")
+        self.assertIn("通过 1 题，需重切 1 题，待审核 0 题", reviewed.text)
+        self.assertIn("审核状态：已通过", reviewed.text)
+        self.assertIn("审核状态：需重切", reviewed.text)
+
         with sqlite3.connect(self.db) as connection:
             connection.execute(
                 "UPDATE import_question_split_runs SET status='failed' WHERE import_job_id=?",
@@ -141,10 +162,9 @@ class QuestionSplitWebTests(unittest.TestCase):
             f"/imports/{job_id}/split-images/1.png"
         ).status_code)
 
-        job_dir = self.private / "processing" / f"import_job_{job_id}"
         manifest = json.loads((job_dir / "question_crops.json").read_text())
         self.assertEqual(2, manifest["question_count"])
-        self.assertEqual("pending_ai_review", manifest["questions"][0]["review_status"])
+        self.assertEqual("ai_review_passed", manifest["questions"][0]["review_status"])
         self.assertEqual(64, len(manifest["questions"][0]["sha256"]))
         with sqlite3.connect(self.db) as connection:
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM questions").fetchone()[0])

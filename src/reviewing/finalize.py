@@ -17,6 +17,8 @@ from src.processing.secure_crop_artifacts import (
     locked_job,
     read_file_at,
 )
+from src.reviewing.candidate_review_ai import validate_ai_approval
+from src.reviewing.knowledge_classification import load_bound_knowledge_classification
 from src.web.app import AuditDataError, _validate_audit_payload
 
 
@@ -155,7 +157,7 @@ def _drafts(connection, job_id):
     source = "approval_source" if "approval_source" in columns else "NULL AS approval_source"
     evidence = "approval_evidence_json" if "approval_evidence_json" in columns else "NULL AS approval_evidence_json"
     return connection.execute(
-        f"""SELECT id,source_question_no,source_candidate_sha256,source_snapshot_json,
+        f"""SELECT id,import_job_id,source_question_no,source_candidate_sha256,source_snapshot_json,
                    edited_json,status,version,reviewed_at,deleted_at,{source},{evidence}
             FROM candidate_review_drafts WHERE import_job_id=? ORDER BY id""",
         (job_id,),
@@ -201,7 +203,7 @@ def _ai_evidence(audit, audit_sha):
     }
 
 
-def _plan(drafts, batch):
+def _plan(connection, drafts, batch):
     planned = []
     for row in drafts:
         item = dict(row)
@@ -221,28 +223,54 @@ def _plan(drafts, batch):
         )
         unedited = bound and _canonical(edited) == _canonical(candidate)
         audit = batch["audits"].get(number)
-        expected_ai_evidence = _ai_evidence(audit, batch["audit_sha"]) if audit else None
+        planned_reviewed_at = item["reviewed_at"]
         if status == "approved" and source == "human":
             if not bound or not _valid_human_evidence(item):
                 raise FinalizationError(f"Q{number} 人工批准证据或候选绑定无效")
         elif status == "approved" and source == "ai_second_pass":
-            try:
-                stored_evidence = json.loads(evidence)
-            except (TypeError, json.JSONDecodeError):
-                stored_evidence = None
             if (
-                not unedited
-                or not is_ai_second_pass_eligible(audit)
-                or stored_evidence != expected_ai_evidence
+                not validate_ai_approval(
+                    connection, item, candidate,
+                    candidate_sha256=batch["candidate_sha"],
+                    audit_sha256=batch["audit_sha"], audit_entry=audit,
+                )
             ):
                 raise FinalizationError(f"Q{number} AI批准证据、内容或候选绑定无效")
         elif status == "approved":
             raise FinalizationError(f"Q{number} 人工批准证据或候选绑定无效")
         elif status == "pending" and unedited and is_ai_second_pass_eligible(audit):
-            status = "approved"
-            source = "ai_second_pass"
-            evidence = _canonical(expected_ai_evidence)
-        item.update(planned_status=status, planned_source=source, planned_evidence=evidence)
+            anchor = connection.execute(
+                """SELECT status,codex_run_id,input_candidate_sha256,output_sha256,
+                          completed_at FROM import_candidate_audit_runs
+                   WHERE import_job_id=?""", (item["import_job_id"],),
+            ).fetchone()
+            if (
+                anchor is not None and anchor["status"] == "completed"
+                and anchor["input_candidate_sha256"] == batch["candidate_sha"]
+                and anchor["output_sha256"] == batch["audit_sha"]
+                and anchor["codex_run_id"] and anchor["completed_at"]
+            ):
+                status, source = "approved", "ai_second_pass"
+                planned_reviewed_at = anchor["completed_at"]
+                evidence = _canonical({
+                    "method": "batch_auto_pass",
+                    "audit_output_sha256": batch["audit_sha"],
+                    "candidate_sha256": batch["candidate_sha"],
+                    "source_snapshot_sha256": hashlib.sha256(
+                        _canonical(candidate).encode("utf-8")
+                    ).hexdigest(),
+                    "edited_sha256": hashlib.sha256(
+                        _canonical(candidate).encode("utf-8")
+                    ).hexdigest(),
+                    "audit_run_id": anchor["codex_run_id"],
+                    "audited_at": anchor["completed_at"],
+                    "reviewed_at": anchor["completed_at"],
+                    "approved_draft_version": item["version"] + 1,
+                })
+        item.update(
+            planned_status=status, planned_source=source,
+            planned_evidence=evidence, planned_reviewed_at=planned_reviewed_at,
+        )
         planned.append(item)
     return planned
 
@@ -261,6 +289,36 @@ def _formal_questions(connection, job_id, approved):
     return mapping
 
 
+def _edited_with_classification(connection, job_id, item):
+    try:
+        edited = json.loads(item["edited_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise FinalizationError("审核草稿JSON损坏") from exc
+    valid_points = {
+        row[0] for row in connection.execute(
+            "SELECT code FROM knowledge_points WHERE is_active=1"
+        )
+    }
+    primary = edited.get("primary_knowledge_point_code")
+    related = edited.get("related_knowledge_point_codes")
+    if (
+        primary in valid_points and isinstance(related, list)
+        and all(code in valid_points for code in related)
+    ):
+        return edited
+    bound = load_bound_knowledge_classification(
+        connection, job_id, item["source_question_no"], item
+    )
+    if bound is None:
+        raise FinalizationError(
+            f"Q{item['source_question_no']} 知识点分类证据缺失或已失效"
+        )
+    edited = dict(edited)
+    edited["primary_knowledge_point_code"] = bound["primary_code"]
+    edited["related_knowledge_point_codes"] = bound["related_codes"]
+    return edited
+
+
 def _preflight(connection, job_id, approved):
     """Validate all references and calculate the exact content change count."""
     formal = _formal_questions(connection, job_id, approved)
@@ -273,10 +331,7 @@ def _preflight(connection, job_id, approved):
         "SELECT code FROM knowledge_points WHERE is_active=1"
     )}
     for item in approved:
-        try:
-            edited = json.loads(item["edited_json"])
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise FinalizationError("审核草稿JSON损坏") from exc
+        edited = _edited_with_classification(connection, job_id, item)
         desired = _desired(edited)
         if desired["question_type_code"] not in valid_types:
             raise FinalizationError(f"题型不存在：{desired['question_type_code']}")
@@ -520,7 +575,7 @@ def _inspect_database(connection, job_id, batch):
         raise FinalizationError("候选题文件与导入任务来源不匹配")
     drafts = _drafts(connection, job_id)
     _validate_draft_batch(drafts, batch["numbers"])
-    planned = _plan(drafts, batch)
+    planned = _plan(connection, drafts, batch)
     approved = [
         item for item in planned
         if item["planned_status"] == "approved" and item["deleted_at"] is None
@@ -579,7 +634,7 @@ def finalize_review(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_
                                            version=version+1,reviewed_at=COALESCE(reviewed_at,?),
                                            updated_at=? WHERE id=? AND version=?""",
                                     (*planned_values,
-                                     now if item["planned_status"] == "approved" else None,
+                                     item["planned_reviewed_at"] if item["planned_status"] == "approved" else None,
                                      now, item["id"], item["version"]),
                                 )
                                 if cursor.rowcount != 1:

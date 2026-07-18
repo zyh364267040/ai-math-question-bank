@@ -24,7 +24,8 @@
     </form>
   {% elif run.status == 'completed' %}
     <h2>共切分 {{ run.question_count }} 题</h2>
-    <p>新裁图仅为 <code>pending_ai_review</code>，不会自动入库或标记审核通过。</p>
+    <p>独立视觉审核：通过 {{ run.crop_review_passed }} 题，需重切 {{ run.crop_review_needs_recrop }} 题，待审核 {{ run.crop_review_pending }} 题。</p>
+    {% if run.crop_review_pending %}<p>新裁图默认为 <code>pending_ai_review</code>，不会自动入库或标记审核通过。</p>{% endif %}
   {% endif %}
 </section>
 {% if crops %}
@@ -32,6 +33,7 @@
   {% for crop in crops %}
   <article class="paper-card layout-question">
     <h2>Q{{ '%03d'|format(crop.question_no) }}</h2>
+    <p>审核状态：{% if crop.review_status == 'ai_review_passed' %}已通过{% elif crop.review_status == 'needs_recrop' %}需重切{% else %}待审核{% endif %}</p>
     <p>来源页：{% for region in crop.regions %}{{ region.page_number }}{% if not loop.last %}、{% endif %}{% endfor %}</p>
     {% for warning in crop.warnings %}<p class="form-error">{{ warning }}</p>{% endfor %}
     <img src="/imports/{{ run.id }}/split-images/{{ crop.question_no }}.png" alt="Q{{ '%03d'|format(crop.question_no) }} 完整单题图片">

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 
 from PIL import Image
@@ -223,3 +224,60 @@ def create_import_job_fixture(
         "dpi": 72, "page_count": 4, "pages": page_entries,
     })
     return job_dir
+
+
+def anchor_synthetic_candidate_audit(database_path: Path, job_dir: Path) -> None:
+    """Add the DB half of the synthetic fixture's completed batch audit."""
+    candidate_raw = (job_dir / "candidate_questions.json").read_bytes()
+    audit_raw = (job_dir / "ai_audit.json").read_bytes()
+    crop_raw = (job_dir / "question_crops.json").read_bytes()
+    candidate = json.loads(candidate_raw)
+    crop = json.loads(crop_raw)
+    count = candidate["question_count"]
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """INSERT INTO import_candidate_audit_runs
+               (import_job_id,status,question_count,processed_questions,codex_run_id,
+                input_candidate_sha256,input_candidate_byte_size,
+                input_crop_generation_id,input_manifest_sha256,input_manifest_signature,
+                output_sha256,output_byte_size,completed_at,updated_at)
+               VALUES(?,'completed',?,?,'synthetic-admission-run',?,?,?,?,?,?,?,
+                      '2026-07-16T00:00:00+00:00','2026-07-16T00:00:00+00:00')""",
+            (candidate["import_job_id"], count, count,
+             hashlib.sha256(candidate_raw).hexdigest(), len(candidate_raw),
+             crop["generation_id"], hashlib.sha256(crop_raw).hexdigest(),
+             crop["signature"], hashlib.sha256(audit_raw).hexdigest(), len(audit_raw)),
+        )
+
+
+def write_synthetic_crop_review_evidence(job_dir):
+    """Create authenticated review evidence for an already-reviewed synthetic manifest."""
+    manifest_bytes = (job_dir / "question_crops.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    questions = [
+        {
+            "question_no": item["question_no"],
+            "status": item["review_status"],
+            "warnings": item["warnings"],
+        }
+        for item in manifest["questions"]
+    ]
+    payload = {
+        "version": 1,
+        "import_job_id": manifest["import_job_id"],
+        "input_generation_id": manifest["generation_id"],
+        "input_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "reviewer_run_id": "synthetic-fixture-review",
+        "questions": questions,
+    }
+    request_sha256 = hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    evidence = sign_manifest(load_hmac_key(job_dir), {
+        **payload,
+        "reviewed_at": "2026-01-01T00:00:00+00:00",
+        "output_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "output_manifest_signature": manifest["signature"],
+        "request_sha256": request_sha256,
+    })
+    _write_json(job_dir / "crop_ai_review.json", evidence)

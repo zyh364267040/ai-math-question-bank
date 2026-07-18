@@ -47,6 +47,7 @@ class AdmitQuestionsTests(unittest.TestCase):
                 ("a" * 64, "测试卷"),
             ).lastrowid
             con.execute("INSERT INTO import_jobs(id,source_paper_id,page_start,page_end,status) VALUES(1,?,1,4,'needs_review')", (source,))
+        self._anchor_batch_audit()
 
     def tearDown(self):
         self.temp.cleanup()
@@ -57,6 +58,52 @@ class AdmitQuestionsTests(unittest.TestCase):
 
     def _write(self, path, data):
         path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        if path.name in {"candidate_questions.json", "ai_audit.json", "question_crops.json"}:
+            self._anchor_batch_audit()
+
+    def _anchor_batch_audit(self):
+        candidate = self.job / "candidate_questions.json"
+        audit = self.job / "ai_audit.json"
+        crops = self.job / "question_crops.json"
+        if not all(path.is_file() for path in (candidate, audit, crops)):
+            return
+        crop_payload = json.loads(crops.read_text(encoding="utf-8"))
+        if "generation_id" not in crop_payload or "signature" not in crop_payload:
+            return
+        candidate_payload = json.loads(candidate.read_text(encoding="utf-8"))
+        question_count = candidate_payload["question_count"]
+        candidate_raw, audit_raw, crop_raw = (
+            candidate.read_bytes(), audit.read_bytes(), crops.read_bytes()
+        )
+        try:
+            with sqlite3.connect(self.db, timeout=0.05) as con:
+                con.execute(
+                """INSERT INTO import_candidate_audit_runs
+                   (import_job_id,status,question_count,processed_questions,codex_run_id,
+                    input_candidate_sha256,input_candidate_byte_size,
+                    input_crop_generation_id,input_manifest_sha256,input_manifest_signature,
+                    output_sha256,output_byte_size,completed_at,updated_at)
+                   VALUES(1,'completed',?,?,'admission-fixture-run',?,?,?,?,?,?,?,
+                          '2026-07-16T00:00:00+00:00','2026-07-16T00:00:00+00:00')
+                   ON CONFLICT(import_job_id) DO UPDATE SET
+                     status=excluded.status,question_count=excluded.question_count,
+                     processed_questions=excluded.processed_questions,
+                     input_candidate_sha256=excluded.input_candidate_sha256,
+                     input_candidate_byte_size=excluded.input_candidate_byte_size,
+                     input_crop_generation_id=excluded.input_crop_generation_id,
+                     input_manifest_sha256=excluded.input_manifest_sha256,
+                     input_manifest_signature=excluded.input_manifest_signature,
+                     output_sha256=excluded.output_sha256,
+                     output_byte_size=excluded.output_byte_size,
+                     completed_at=excluded.completed_at,updated_at=excluded.updated_at""",
+                (question_count, question_count,
+                 hashlib.sha256(candidate_raw).hexdigest(), len(candidate_raw),
+                 crop_payload["generation_id"], hashlib.sha256(crop_raw).hexdigest(),
+                 crop_payload["signature"], hashlib.sha256(audit_raw).hexdigest(),
+                    len(audit_raw)),
+                )
+        except sqlite3.OperationalError:
+            pass
 
     def _mutate_audits(self, mutate):
         path, audit = self._json("ai_audit.json")
@@ -272,8 +319,6 @@ class AdmitQuestionsTests(unittest.TestCase):
         self.assertIn("人工审核通过", row[2])
 
     def test_nonapproved_drafts_do_not_obscure_auto_pass_candidate(self):
-        candidate = self._json("candidate_questions.json")[1]
-        original = candidate["questions"][0]
         for status in ("pending", "draft", "needs_fix"):
             with self.subTest(status=status):
                 with sqlite3.connect(self.db) as con:
@@ -292,17 +337,9 @@ class AdmitQuestionsTests(unittest.TestCase):
                         (status,),
                     )
 
-                admit_questions(self.db, self.private, 1)
-
-                with sqlite3.connect(self.db) as con:
-                    row = con.execute(
-                        """SELECT q.stem_markdown,r.reviewer,r.notes
-                           FROM questions q JOIN question_reviews r ON r.question_id=q.id
-                           WHERE q.source_question_no='1' AND r.review_item='usability'"""
-                    ).fetchone()
-                self.assertEqual(original["stem_markdown"], row[0])
-                self.assertEqual("ai_audit", row[1])
-                self.assertIn("AI二审通过", row[2])
+                report = assess_job(self.db, self.private, 1)
+                q1 = next(item for item in report.ineligible if item.question_no == "1")
+                self.assertIn("human_approval_status_invalid", q1.reasons)
 
     def test_human_draft_status_must_be_approved(self):
         self._approve_human_draft()
@@ -320,7 +357,7 @@ class AdmitQuestionsTests(unittest.TestCase):
         report = assess_job(self.db, self.private, 1)
 
         q12 = next(item for item in report.ineligible if item.question_no == "12")
-        self.assertIn("human_approval_source_invalid", q12.reasons)
+        self.assertIn("ai_approval_provenance_invalid", q12.reasons)
 
     def test_human_draft_requires_reviewed_at_and_valid_approval_evidence(self):
         self._approve_human_draft()
