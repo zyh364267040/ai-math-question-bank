@@ -4,11 +4,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import src.database.initialize as initialize_module
 from src.database.initialize import initialize_database
 
 
@@ -96,6 +98,37 @@ class DatabaseSchemaTests(unittest.TestCase):
         )
         return cursor.lastrowid, knowledge_point_id
 
+    @staticmethod
+    def database_snapshot(connection):
+        schema = connection.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master "
+            "ORDER BY type,name"
+        ).fetchall()
+        tables = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        rows = {
+            table: sorted(
+                connection.execute(f'SELECT * FROM "{table}"').fetchall(),
+                key=repr,
+            )
+            for table in tables
+        }
+        return {
+            "schema": schema,
+            "rows": rows,
+            "integrity": connection.execute("PRAGMA integrity_check").fetchall(),
+            "foreign_keys": connection.execute("PRAGMA foreign_key_check").fetchall(),
+        }
+
+    @staticmethod
+    def sequence_snapshot(connection):
+        return dict(connection.execute("SELECT name,seq FROM sqlite_sequence"))
+
     def test_all_core_tables_exist(self):
         actual = {
             row[0]
@@ -138,6 +171,150 @@ class DatabaseSchemaTests(unittest.TestCase):
             )
         }
         self.assertEqual({"task", "method", "error", "scenario"}, categories)
+
+    def test_second_initialization_preserves_entire_database_and_all_sequences(self):
+        before_sequence = self.sequence_snapshot(self.connection)
+        before_database = self.database_snapshot(self.connection)
+        self.assertEqual(
+            {"knowledge_points", "tag_definitions", "baskets"},
+            set(before_sequence),
+        )
+
+        initialize_database(self.db_path).close()
+
+        self.assertEqual(before_sequence, self.sequence_snapshot(self.connection))
+        self.assertEqual(before_database, self.database_snapshot(self.connection))
+
+    def test_reinitialization_only_advances_sequence_for_each_missing_seed(self):
+        cases = (
+            ("knowledge_points", "code", "08.06.02"),
+            ("tag_definitions", "code", "task_01"),
+            ("baskets", "basket_key", "default"),
+        )
+        for table, key_column, key_value in cases:
+            with self.subTest(table=table), tempfile.TemporaryDirectory() as directory:
+                database_path = Path(directory) / "missing-seed.db"
+                initialize_database(database_path).close()
+                with sqlite3.connect(database_path) as connection:
+                    before = self.sequence_snapshot(connection)
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE {key_column}=?", (key_value,)
+                    )
+                    connection.commit()
+
+                initialize_database(database_path).close()
+
+                with sqlite3.connect(database_path) as connection:
+                    after = self.sequence_snapshot(connection)
+                    self.assertEqual(
+                        1,
+                        connection.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE {key_column}=?",
+                            (key_value,),
+                        ).fetchone()[0],
+                    )
+                    expected = dict(before)
+                    expected[table] += 1
+                    self.assertEqual(expected, after)
+                    self.assertEqual([], connection.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall())
+                    if table == "knowledge_points":
+                        self.assertEqual(
+                            ("分离参数", 3, "08.06", "v1", 2),
+                            connection.execute(
+                                """SELECT child.name,child.level,parent.code,
+                                          child.system_version,child.sort_order
+                                   FROM knowledge_points child
+                                   JOIN knowledge_points parent
+                                     ON parent.id=child.parent_id
+                                   WHERE child.code='08.06.02'"""
+                            ).fetchone(),
+                        )
+                    elif table == "tag_definitions":
+                        self.assertEqual(
+                            ("task", "task_01", "求值"),
+                            connection.execute(
+                                "SELECT category,code,name FROM tag_definitions "
+                                "WHERE code='task_01'"
+                            ).fetchone(),
+                        )
+                    else:
+                        self.assertEqual(
+                            ("default", "默认选题篮"),
+                            connection.execute(
+                                "SELECT basket_key,name FROM baskets "
+                                "WHERE basket_key='default'"
+                            ).fetchone(),
+                        )
+
+    def test_seed_field_sync_uses_update_without_advancing_sequences(self):
+        before = self.sequence_snapshot(self.connection)
+        self.connection.execute(
+            "UPDATE knowledge_points SET name='错误名称',sort_order=999 "
+            "WHERE code='08.06.02'"
+        )
+        self.connection.execute(
+            "UPDATE tag_definitions SET name='错误标签' WHERE code='task_01'"
+        )
+        self.connection.execute(
+            "UPDATE baskets SET name='我的选题篮' WHERE basket_key='default'"
+        )
+        self.connection.commit()
+
+        initialize_database(self.db_path).close()
+
+        self.assertEqual(before, self.sequence_snapshot(self.connection))
+        self.assertEqual(
+            ("分离参数", 2, "v1"),
+            self.connection.execute(
+                "SELECT name,sort_order,system_version FROM knowledge_points "
+                "WHERE code='08.06.02'"
+            ).fetchone(),
+        )
+        self.assertEqual(
+            "求值",
+            self.connection.execute(
+                "SELECT name FROM tag_definitions WHERE code='task_01'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            "我的选题篮",
+            self.connection.execute(
+                "SELECT name FROM baskets WHERE basket_key='default'"
+            ).fetchone()[0],
+        )
+
+    def test_migration_failure_rolls_back_schema_seed_rows_and_sequences(self):
+        self.connection.execute(
+            "DROP TRIGGER web_admission_protect_questions_update"
+        )
+        self.connection.execute(
+            "CREATE TRIGGER web_admission_protect_questions_update "
+            "BEFORE UPDATE ON questions BEGIN SELECT 1; END"
+        )
+        self.connection.execute(
+            "DELETE FROM tag_definitions WHERE code='task_01'"
+        )
+        self.connection.commit()
+        before_sequence = self.sequence_snapshot(self.connection)
+        before_database = self.database_snapshot(self.connection)
+        real_upsert = initialize_module._upsert_knowledge_points
+
+        def fail_after_knowledge_sync(connection, points):
+            real_upsert(connection, points)
+            raise RuntimeError("injected migration failure")
+
+        with mock.patch.object(
+            initialize_module,
+            "_upsert_knowledge_points",
+            side_effect=fail_after_knowledge_sync,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected migration failure"):
+                initialize_database(self.db_path)
+
+        self.assertEqual(before_sequence, self.sequence_snapshot(self.connection))
+        self.assertEqual(before_database, self.database_snapshot(self.connection))
 
     def test_question_code_is_unique(self):
         self.insert_question()

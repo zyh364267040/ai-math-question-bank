@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}严格整批入库 · AI 数学题库{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">STRICT ADMISSION</p>
+  <h1>{{ page.paper_name }}</h1>
+  <p>严格整批准入评估只读显示当前证据；正式入库每次都需要教师明确授权。</p>
+</section>
+
+<section class="paper-card">
+  <dl>
+    <div><dt>任务状态</dt><dd>{{ page.job_status }}</dd></div>
+    <div><dt>候选总数</dt><dd>{{ page.candidate_count }}</dd></div>
+    <div><dt>分类证据数</dt><dd>{{ page.evidence_count }}</dd></div>
+    <div><dt>已存在正式题</dt><dd>{{ page.formal_count }}</dd></div>
+    <div><dt>可入库</dt><dd>{{ page.eligible_count }}</dd></div>
+    <div><dt>不可入库</dt><dd>{{ page.ineligible_count }}</dd></div>
+    <div><dt>协调阶段</dt><dd>{{ page.stage }}</dd></div>
+  </dl>
+</section>
+
+{% if page.stage == 'processing' %}
+<section class="paper-card"><p>另一个请求正在处理，可安全刷新本页查看进度。</p></section>
+{% elif page.stage == 'admitted_pending_finalize' %}
+<section class="paper-card"><p>正式题已完成严格整批入库，任务收口尚未完成；重试不会重复创建正式题。</p></section>
+{% elif page.stage == 'completed' %}
+<section class="paper-card"><p>整批入库与任务收口已完成。本页仅供查看。</p></section>
+{% endif %}
+
+{% if page.safe_error %}<div class="error-message" role="alert">{{ page.safe_error }}</div>{% endif %}
+
+{% if page.ineligible %}
+<section class="paper-card">
+  <h2>未通过严格准入的题目</h2>
+  <ul>
+  {% for item in page.ineligible %}
+    <li><strong>第 {{ item.question_no }} 题</strong>：{{ item.reasons | join('；') }}</li>
+  {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<section class="paper-card">
+  <p><strong>原卷答案缺失时始终保持 missing，AI 不会猜测或补写答案。</strong></p>
+  {% if page.stage != 'completed' and page.can_apply %}
+  <form method="post" action="/imports/{{ page.job_id }}/admission/apply">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="button urgent" type="submit">正式入库并完成任务</button>
+  </form>
+  {% elif page.stage != 'completed' %}
+  <p>当前不满足整批严格门禁，不能执行正式入库。</p>
+  {% endif %}
+</section>
+{% endblock %}

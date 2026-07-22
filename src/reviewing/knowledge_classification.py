@@ -27,6 +27,7 @@ TOP_KEYS = {
 QUESTION_KEYS = {
     "source_question_no", "primary_code", "related_codes", "reason",
 }
+ENRICHED_QUESTION_KEYS = QUESTION_KEYS | {"reviewer", "approval_source"}
 
 
 class KnowledgeClassificationError(RuntimeError):
@@ -74,7 +75,9 @@ def _parse(raw: str, job_id: int) -> dict:
         _fail()
     seen = set()
     for item in value["questions"]:
-        if not isinstance(item, dict) or set(item) != QUESTION_KEYS:
+        if not isinstance(item, dict) or set(item) not in {
+            frozenset(QUESTION_KEYS), frozenset(ENRICHED_QUESTION_KEYS)
+        }:
             _fail()
         number = item["source_question_no"]
         related = item["related_codes"]
@@ -87,6 +90,14 @@ def _parse(raw: str, job_id: int) -> dict:
             or len(related) != len(set(related))
             or item["primary_code"] in related
             or not isinstance(item["reason"], str) or len(item["reason"]) > 200
+        ):
+            _fail()
+        if set(item) == ENRICHED_QUESTION_KEYS and (
+            item["approval_source"] not in {"local_double_pass", "human"}
+            or item["reviewer"] != {
+                "local_double_pass": "local_double_pass",
+                "human": "teacher_human_review",
+            }[item["approval_source"]]
         ):
             _fail()
         seen.add(number)
@@ -104,15 +115,38 @@ def adopt_knowledge_classifications(
         _fail()
     if not RUN_ID_PATTERN.fullmatch(classifier_run_id):
         _fail()
-    payload = _parse(raw, job_id)
-    evidence_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    by_number = {item["source_question_no"]: item for item in payload["questions"]}
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
         with sqlite3.connect(Path(database_path)) as connection:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("BEGIN IMMEDIATE")
+            result = adopt_knowledge_classifications_in_connection(
+                connection, job_id, raw, classifier_run_id
+            )
+            connection.commit()
+            return result
+    except KnowledgeClassificationError:
+        raise
+    except sqlite3.Error as exc:
+        raise KnowledgeClassificationError(SAFE_CLASSIFICATION_ERROR) from exc
+
+
+def adopt_knowledge_classifications_in_connection(
+    connection: sqlite3.Connection,
+    job_id: int,
+    raw: str,
+    classifier_run_id: str,
+) -> KnowledgeClassificationAdoption:
+    """Adopt into an existing write transaction for a larger atomic operation."""
+    if not isinstance(job_id, int) or job_id <= 0 or not isinstance(classifier_run_id, str):
+        _fail()
+    if not RUN_ID_PATTERN.fullmatch(classifier_run_id):
+        _fail()
+    payload = _parse(raw, job_id)
+    evidence_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    by_number = {item["source_question_no"]: item for item in payload["questions"]}
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
             valid_points = {
                 row[0] for row in connection.execute(
                     "SELECT code FROM knowledge_points WHERE is_active=1"
@@ -147,10 +181,12 @@ def adopt_knowledge_classifications(
                 prepared.append((
                     number, draft["version"], _canonical_sha(edited), primary,
                     json.dumps(related, ensure_ascii=False, separators=(",", ":")),
-                    item["reason"],
+                    item["reason"], item.get("reviewer", payload["reviewer"]),
                 ))
             inserted = 0
-            for number, version, edited_sha, primary, related_json, reason in prepared:
+            for (
+                number, version, edited_sha, primary, related_json, reason, reviewer
+            ) in prepared:
                 existing = connection.execute(
                     """SELECT * FROM candidate_knowledge_classifications
                        WHERE import_job_id=? AND source_question_no=?
@@ -158,7 +194,8 @@ def adopt_knowledge_classifications(
                     (job_id, number, version, edited_sha),
                 ).fetchone()
                 expected = (
-                    primary, related_json, payload["source_classifier"], payload["reviewer"],
+                    primary, related_json, payload["source_classifier"],
+                    reviewer,
                     classifier_run_id, evidence_sha, reason,
                 )
                 if existing is not None:
@@ -181,12 +218,12 @@ def adopt_knowledge_classifications(
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         job_id, number, version, edited_sha, primary, related_json,
-                        payload["source_classifier"], payload["reviewer"],
+                        payload["source_classifier"],
+                        reviewer,
                         classifier_run_id, evidence_sha, reason, now,
                     ),
                 )
                 inserted += 1
-            connection.commit()
             return KnowledgeClassificationAdoption(payload["question_count"], inserted)
     except KnowledgeClassificationError:
         raise

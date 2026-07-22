@@ -91,6 +91,17 @@ from src.reviewing.candidate_review_ai import (
     claim_corrected_draft_audit,
     run_claimed_corrected_draft_audit,
 )
+from src.reviewing.local_knowledge_classification import (
+    SAFE_CLASSIFICATION_INPUT,
+    SAFE_CLASSIFICATION_MODEL,
+    SAFE_CLASSIFICATION_STORAGE,
+    KnowledgeClassificationRunError,
+    apply_classification_evidence,
+    claim_knowledge_classification,
+    load_classification_page,
+    review_classification_draft,
+    run_claimed_knowledge_classification,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -188,6 +199,11 @@ INLINE_EDIT_FIELDS = {
     "option_content": ("options", "content", MAX_ITEM_CONTENT_LENGTH),
     "subquestion_content": ("subquestions", "stem_markdown", MAX_ITEM_CONTENT_LENGTH),
 }
+CLASSIFICATION_REVIEW_FIELDS = {
+    "csrf_token", "version", "action", "primary_code", "related_codes",
+}
+MAX_CLASSIFICATION_FORM_BYTES = 16_384
+MAX_ADMISSION_FORM_BYTES = 4_096
 MAX_REVIEW_GUIDANCE_ITEMS = 8
 MAX_REVIEW_GUIDANCE_ITEM_LENGTH = 180
 OPTION_CODE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,15}\Z")
@@ -232,6 +248,13 @@ class PreviewUploadBodyLimitMiddleware:
             return
         if path == "/imports/preview":
             request_limit = self.max_body_bytes
+        elif re.fullmatch(
+            r"/imports/[^/]+/classification(?:/start|/apply|/questions/[^/]+)?",
+            path,
+        ):
+            request_limit = min(self.max_body_bytes, MAX_CLASSIFICATION_FORM_BYTES)
+        elif re.fullmatch(r"/imports/[^/]+/admission/apply", path):
+            request_limit = min(self.max_body_bytes, MAX_ADMISSION_FORM_BYTES)
         elif re.fullmatch(
             r"/imports/[^/]+/(?:render|layout|split|candidates|audit(?:/adopt)?)",
             path,
@@ -1061,6 +1084,8 @@ def create_app(
     candidate_runner=None,
     audit_runner=None,
     corrected_audit_runner=None,
+    classification_runner=None,
+    web_admission_service=None,
     _initialize_schema=True,
 ):
     database_path = Path(database_path)
@@ -1075,6 +1100,8 @@ def create_app(
     application.state.audit_runner = audit_runner
     application.state.corrected_audit_runner = corrected_audit_runner or audit_runner
     application.state.weekly_checker = weekly_checker
+    application.state.classification_runner = classification_runner
+    application.state.web_admission_service = web_admission_service
     if not _initialize_schema:
         @application.on_event("startup")
         def initialize_schema_on_server_start():
@@ -1099,7 +1126,7 @@ def create_app(
         response.headers["X-AI-Math-Question-Bank"] = "1"
         if (
             request.method == "GET"
-            and re.fullmatch(r"/imports/[^/]+/(?:layout|split|candidates|audit)", request.url.path)
+            and re.fullmatch(r"/imports/[^/]+/(?:layout|split|candidates|audit|classification|admission)", request.url.path)
         ):
             response.headers["Cache-Control"] = "no-store"
         if cookie_token != token:
@@ -1161,6 +1188,10 @@ def create_app(
                               qs.question_count AS split_question_count,
                               ce.status AS candidate_status,
                               ar.status AS audit_run_status,
+                              kc.status AS classification_status,
+                              kc.applied_at AS classification_applied_at,
+                              (SELECT COUNT(*) FROM candidate_knowledge_classifications e
+                               WHERE e.import_job_id=j.id) AS classification_evidence_count,
                               (SELECT COUNT(*) FROM candidate_review_drafts d
                                WHERE d.import_job_id=j.id AND d.deleted_at IS NOT NULL) AS deleted_count
                        FROM import_jobs j
@@ -1172,6 +1203,7 @@ def create_app(
                        LEFT JOIN import_question_split_runs qs ON qs.import_job_id = j.id
                        LEFT JOIN import_candidate_extraction_runs ce ON ce.import_job_id = j.id
                        LEFT JOIN import_candidate_audit_runs ar ON ar.import_job_id = j.id
+                       LEFT JOIN import_knowledge_classification_runs kc ON kc.import_job_id = j.id
                        ORDER BY j.created_at DESC, j.id DESC"""
                 ).fetchall()
         except sqlite3.Error:
@@ -1673,6 +1705,141 @@ def create_app(
         return templates.TemplateResponse(
             request=request, name="import_audit.html",
             context={"run": run, "audit": audit, "applied": applied},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @application.post("/imports/{job_id}/classification/start")
+    async def start_knowledge_classification(
+        request: Request, job_id: int, background_tasks: BackgroundTasks
+    ):
+        """A protected click claims local classification; GET never launches it."""
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "本地知识点分类请求参数无效", 400)
+        try:
+            claim = claim_knowledge_classification(
+                database_path, private_root, job_id,
+                runner=application.state.classification_runner,
+            )
+        except KnowledgeClassificationRunError as error:
+            status = 404 if str(error) == "未找到导入任务" else 409
+            return _error(request, templates, str(error), status)
+        if claim is not None:
+            background_tasks.add_task(run_claimed_knowledge_classification, claim)
+        return RedirectResponse(f"/imports/{job_id}/classification", status_code=303)
+
+    @application.post("/imports/{job_id}/classification/questions/{question_no}")
+    async def save_knowledge_classification(
+        request: Request, job_id: int, question_no: str
+    ):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        required = {"csrf_token", "version", "action", "primary_code"}
+        if set(form.keys()) - CLASSIFICATION_REVIEW_FIELDS:
+            return _error(request, templates, "分类复核请求参数无效", 400)
+        if not required.issubset(form.keys()) or any(
+            len(form.getlist(name)) != 1 for name in required
+        ):
+            return _error(request, templates, "分类复核请求参数无效", 400)
+        try:
+            if len(question_no) > 3 or len(str(form.get("primary_code", ""))) > 50:
+                raise ValueError
+            version = int(form.get("version", ""))
+            action = str(form.get("action", ""))
+            related = [str(value) for value in form.getlist("related_codes") if str(value)]
+            if (
+                action not in {"save", "approve"} or len(related) > 2
+                or any(len(value) > 50 for value in related)
+            ):
+                raise ValueError
+            review_classification_draft(
+                database_path, job_id, question_no, version=version,
+                primary_code=str(form.get("primary_code", "")),
+                related_codes=related, approve=action == "approve",
+            )
+        except (ValueError, KnowledgeClassificationRunError) as error:
+            message = str(error) if isinstance(error, KnowledgeClassificationRunError) else "分类复核请求参数无效"
+            status = 409 if (
+                "版本冲突" in message or "不可修改" in message
+            ) else 400
+            return _error(request, templates, message, status)
+        return RedirectResponse(
+            f"/imports/{job_id}/classification#question-{quote(question_no, safe='')}",
+            status_code=303,
+        )
+
+    @application.post("/imports/{job_id}/classification/apply")
+    async def apply_knowledge_classification(request: Request, job_id: int):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "分类证据登记请求参数无效", 400)
+        try:
+            apply_classification_evidence(database_path, private_root, job_id)
+        except KnowledgeClassificationRunError as error:
+            return _error(request, templates, str(error), 409)
+        return RedirectResponse(f"/imports/{job_id}/classification?applied=1", status_code=303)
+
+    @application.get("/imports/{job_id}/classification", response_class=HTMLResponse)
+    def knowledge_classification_status(request: Request, job_id: int, applied: int = 0):
+        """Render only DB-backed state; never create a run or inspect private output JSON."""
+        try:
+            page = load_classification_page(database_path, job_id)
+            with _connect(database_path) as connection:
+                paper = connection.execute(
+                    """SELECT s.paper_name FROM import_jobs j JOIN source_papers s
+                       ON s.id=j.source_paper_id WHERE j.id=?""", (job_id,)
+                ).fetchone()
+                points = [dict(row) for row in connection.execute(
+                    "SELECT code,name FROM knowledge_points WHERE is_active=1 AND level=3 ORDER BY code"
+                )]
+        except KnowledgeClassificationRunError as error:
+            status = 404 if str(error) == "未找到导入任务" else 500
+            return _error(request, templates, str(error), status)
+        context = {
+            "job_id": job_id, "paper_name": paper["paper_name"], "page": page,
+            "points": points, "applied_notice": bool(applied),
+            "safe_model_errors": {SAFE_CLASSIFICATION_MODEL, SAFE_CLASSIFICATION_STORAGE,
+                                  SAFE_CLASSIFICATION_INPUT},
+        }
+        return templates.TemplateResponse(
+            request=request, name="import_classification.html", context=context,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @application.post("/imports/{job_id}/admission/apply")
+    async def apply_strict_web_admission(request: Request, job_id: int):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "严格整批入库请求参数无效", 400)
+        from src.importing.web_admission import (
+            WebAdmissionError,
+            apply_web_admission,
+        )
+        service = application.state.web_admission_service or apply_web_admission
+        try:
+            service(database_path, private_root, job_id)
+        except WebAdmissionError as error:
+            return _error(request, templates, str(error), error.status_code)
+        except Exception:
+            return _error(request, templates, "严格整批入库暂时无法完成", 500)
+        return RedirectResponse(f"/imports/{job_id}/admission", status_code=303)
+
+    @application.get("/imports/{job_id}/admission", response_class=HTMLResponse)
+    def strict_web_admission_status(request: Request, job_id: int):
+        from src.importing.web_admission import WebAdmissionError, load_admission_page
+        try:
+            page = load_admission_page(database_path, private_root, job_id)
+        except WebAdmissionError as error:
+            return _error(request, templates, str(error), error.status_code)
+        return templates.TemplateResponse(
+            request=request, name="import_admission.html", context={"page": page},
             headers={"Cache-Control": "no-store"},
         )
 

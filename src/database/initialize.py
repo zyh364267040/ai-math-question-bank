@@ -146,6 +146,97 @@ def _rebuild_layout_analysis_runs(connection, old_columns):
     connection.row_factory = None
 
 
+def _rebuild_web_admission_runs(connection):
+    """Migrate the initial Web coordinator schema without weakening old anchors."""
+    connection.row_factory = sqlite3.Row
+    rows = [dict(row) for row in connection.execute(
+        "SELECT * FROM import_web_admission_runs"
+    )]
+    connection.execute("DROP TRIGGER IF EXISTS web_admission_completed_immutable")
+    connection.execute(
+        "DROP TRIGGER IF EXISTS web_admission_completed_delete_immutable"
+    )
+    for (trigger_name,) in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' "
+        "AND name LIKE 'web_admission_protect_%'"
+    ).fetchall():
+        connection.execute(f'DROP TRIGGER "{trigger_name}"')
+    connection.execute("DROP INDEX IF EXISTS idx_web_admission_run_claim")
+    connection.execute(
+        "ALTER TABLE import_web_admission_runs RENAME TO import_web_admission_runs_legacy"
+    )
+    schema = SCHEMA_PATH.read_text(encoding="utf-8")
+    start = schema.index("CREATE TABLE IF NOT EXISTS import_web_admission_runs (")
+    end = schema.index("\n\nCREATE INDEX IF NOT EXISTS idx_questions_content_hash", start)
+    _execute_script_transactionally(connection, schema[start:end])
+    columns = [row[1] for row in connection.execute(
+        "PRAGMA table_info(import_web_admission_runs)"
+    )]
+    for row in rows:
+        if row.get("status") == "admitted_pending_finalize":
+            row["status"] = "failed"
+            row["stage"] = "admitted_pending_finalize"
+        if row.get("status") != "processing":
+            row["claim_token"] = None
+            row["lease_expires_at"] = None
+        if row.get("status") == "completed" and not row.get("formal_batch_digest"):
+            from src.importing.web_admission import _formal_batch_digest
+
+            row["formal_batch_digest"] = _formal_batch_digest(
+                connection, row["import_job_id"]
+            )
+        connection.execute(
+            f"INSERT INTO import_web_admission_runs ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(row.get(column) for column in columns),
+        )
+    connection.execute("DROP TABLE import_web_admission_runs_legacy")
+    connection.row_factory = None
+
+
+def _refresh_web_admission_protection_triggers(connection, schema):
+    """Replace every versioned formal-data guard with the current definition."""
+    start = schema.index(
+        "CREATE TRIGGER IF NOT EXISTS web_admission_protect_"
+    )
+    end = schema.index(
+        "\n\nCREATE INDEX IF NOT EXISTS idx_questions_content_hash", start
+    )
+    trigger_schema = schema[start:end]
+
+    def normalized(sql):
+        value = " ".join((sql or "").strip().rstrip(";").split()).lower()
+        return value.replace(
+            "create trigger if not exists ", "create trigger ", 1
+        )
+
+    expected = {}
+    pending = ""
+    for line in trigger_schema.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            pending = ""
+            words = statement.split()
+            if words[:5] == ["CREATE", "TRIGGER", "IF", "NOT", "EXISTS"]:
+                expected[words[5]] = normalized(statement)
+    if pending.strip():
+        raise sqlite3.OperationalError("incomplete Web admission trigger schema")
+
+    actual = dict(connection.execute(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+        "AND name LIKE 'web_admission_protect_%'"
+    ))
+    if set(actual) == set(expected) and all(
+        normalized(actual[name]) == sql for name, sql in expected.items()
+    ):
+        return
+    for name in actual:
+        quoted_name = '"' + name.replace('"', '""') + '"'
+        connection.execute(f"DROP TRIGGER {quoted_name}")
+    _execute_script_transactionally(connection, trigger_schema)
+
+
 def _ensure_schema_migrations(connection):
     columns = {row[1] for row in connection.execute("PRAGMA table_info(knowledge_points)")}
     if "sort_order" not in columns:
@@ -279,6 +370,52 @@ def _ensure_schema_migrations(connection):
             "ALTER TABLE candidate_review_drafts ADD COLUMN approval_evidence_json TEXT "
             "CHECK (approval_evidence_json IS NULL OR json_valid(approval_evidence_json))"
         )
+    classification_run_columns = {
+        row[1] for row in connection.execute(
+            "PRAGMA table_info(import_knowledge_classification_runs)"
+        )
+    }
+    if classification_run_columns and "stage" not in classification_run_columns:
+        connection.execute(
+            "ALTER TABLE import_knowledge_classification_runs ADD COLUMN stage TEXT "
+            "NOT NULL DEFAULT 'waiting' CHECK (stage IN "
+            "('waiting','level2','proposal','verifier','publishing','review_ready'))"
+        )
+    classification_draft_columns = {
+        row[1] for row in connection.execute(
+            "PRAGMA table_info(candidate_knowledge_classification_drafts)"
+        )
+    }
+    if classification_draft_columns and "human_review_note" not in classification_draft_columns:
+        connection.execute(
+            "ALTER TABLE candidate_knowledge_classification_drafts ADD COLUMN "
+            "human_review_note TEXT NOT NULL DEFAULT '' CHECK (length(human_review_note) <= 200)"
+        )
+    web_admission_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='import_web_admission_runs'"
+    ).fetchone()
+    if web_admission_sql and (
+        "preparing_backup" not in (web_admission_sql[0] or "")
+        or "formal_batch_digest" not in (web_admission_sql[0] or "")
+        or "'processing','failed','admitted_pending_finalize'" not in (
+            web_admission_sql[0] or ""
+        )
+    ):
+        _rebuild_web_admission_runs(connection)
+    web_admission_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(import_web_admission_runs)")
+    }
+    for name in (
+        "pre_backup_source_digest", "backup_snapshot_digest",
+        "finalize_source_digest", "finalize_backup_snapshot_digest",
+    ):
+        if web_admission_columns and name not in web_admission_columns:
+            connection.execute(
+                f"ALTER TABLE import_web_admission_runs ADD COLUMN {name} "
+                f"TEXT CHECK ({name} IS NULL OR length({name})=64)"
+            )
+    _refresh_web_admission_protection_triggers(connection, schema)
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_questions_deleted ON questions(deleted_at)"
     )
@@ -303,24 +440,62 @@ def _upsert_knowledge_points(connection, points):
     for level in (1, 2, 3):
         for point in (item for item in points if item["level"] == level):
             parent_id = ids_by_code.get(point["parent_code"])
-            connection.execute(
-                """INSERT INTO knowledge_points
-                       (code, name, level, parent_id, system_version, sort_order)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(code) DO UPDATE SET
-                       name = excluded.name,
-                       level = excluded.level,
-                       parent_id = excluded.parent_id,
-                       system_version = excluded.system_version,
-                       sort_order = excluded.sort_order""",
-                (
-                    point["code"], point["name"], point["level"], parent_id,
-                    point["system_version"], point["sort_order"],
-                ),
+            expected = (
+                point["name"], point["level"], parent_id,
+                point["system_version"], point["sort_order"],
             )
-            ids_by_code[point["code"]] = connection.execute(
-                "SELECT id FROM knowledge_points WHERE code = ?", (point["code"],)
-            ).fetchone()[0]
+            existing = connection.execute(
+                "SELECT id,name,level,parent_id,system_version,sort_order "
+                "FROM knowledge_points WHERE code=?",
+                (point["code"],),
+            ).fetchone()
+            if existing is None:
+                cursor = connection.execute(
+                    """INSERT INTO knowledge_points
+                           (code,name,level,parent_id,system_version,sort_order)
+                       VALUES (?,?,?,?,?,?)""",
+                    (point["code"], *expected),
+                )
+                ids_by_code[point["code"]] = cursor.lastrowid
+                continue
+            ids_by_code[point["code"]] = existing[0]
+            if existing[1:] != expected:
+                connection.execute(
+                    """UPDATE knowledge_points
+                       SET name=?,level=?,parent_id=?,system_version=?,sort_order=?
+                       WHERE id=?""",
+                    (*expected, existing[0]),
+                )
+
+
+def _sync_tag_definitions(connection, rows):
+    """Synchronize tag seeds without reserving rowids for existing codes."""
+    for category, code, name in rows:
+        existing = connection.execute(
+            "SELECT id,name FROM tag_definitions WHERE category=? AND code=?",
+            (category, code),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                "INSERT INTO tag_definitions (category,code,name) VALUES (?,?,?)",
+                (category, code, name),
+            )
+        elif existing[1] != name:
+            connection.execute(
+                "UPDATE tag_definitions SET name=? WHERE id=?",
+                (name, existing[0]),
+            )
+
+
+def _ensure_default_basket(connection):
+    """Create the compatible default basket only when it is absent."""
+    existing = connection.execute(
+        "SELECT 1 FROM baskets WHERE basket_key='default'"
+    ).fetchone()
+    if existing is None:
+        connection.execute(
+            "INSERT INTO baskets (basket_key,name) VALUES ('default','默认选题篮')"
+        )
 
 
 def _execute_script_transactionally(connection, script):
@@ -368,17 +543,11 @@ def initialize_database(
             for category, names in TAG_NAMES.items()
             for position, name in enumerate(names, start=1)
         ]
-        connection.executemany(
-            """INSERT OR IGNORE INTO tag_definitions
-               (category, code, name) VALUES (?, ?, ?)""",
-            tag_rows,
-        )
+        _sync_tag_definitions(connection, tag_rows)
         _upsert_knowledge_points(
             connection, _load_knowledge_points(knowledge_points_path)
         )
-        connection.execute(
-            "INSERT OR IGNORE INTO baskets (basket_key, name) VALUES ('default', '默认选题篮')"
-        )
+        _ensure_default_basket(connection)
         if rebuilding_questions:
             _execute_script_transactionally(connection, schema)
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()

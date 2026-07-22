@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}本地知识点分类 · AI 数学题库{% endblock %}
+{% block head_extra %}{% if page.status == 'processing' %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">LOCAL KNOWLEDGE CLASSIFICATION</p>
+  <h1>{{ paper_name }}</h1>
+  <p>本机 Ollama 双重分类；只复核冲突或低置信度题。</p>
+</section>
+
+{% if applied_notice %}<div class="save-feedback" role="status">整批分类证据已登记</div>{% endif %}
+<section class="paper-card processing-card">
+  {% if page.applied or page.completed_evidence %}
+    <p><span class="status completed">分类已完成</span></p>
+    <p>append-only 分类证据已经登记；本页不再允许修改或重新运行。</p>
+  {% elif page.status == 'processing' %}
+    <p><span class="status processing">本地 Ollama 分类中</span></p>
+    <p>当前阶段：{{ {'waiting':'等待本机模型锁','level2':'二级知识模块初判','proposal':'三级知识点初审','verifier':'独立三级复核','publishing':'安全发布分类草稿'}.get(page.stage, '处理中') }}。同一任务不会重复启动。</p>
+  {% elif page.status == 'failed' %}
+    <p><span class="status failed">分类失败</span></p>
+    <p class="form-error">{{ page.error_message }}</p>
+    <form method="post" action="/imports/{{ job_id }}/classification/start">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">重试本地知识点分类</button>
+    </form>
+  {% elif not page.exists %}
+    <p><strong>只有显式点击才会调用本机 qwen2.5:14b；GET 浏览不会启动模型或创建状态。</strong></p>
+    <form method="post" action="/imports/{{ job_id }}/classification/start">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="button" type="submit">开始本地知识点分类</button>
+    </form>
+  {% else %}
+    <p><span class="status completed">分类草稿复核就绪</span></p>
+  {% endif %}
+  <p><strong>分类不检查答案是否正确，也不会自动正式入库。</strong></p>
+</section>
+
+{% if page.exists and page.status == 'completed' %}
+<section class="audit-summary">
+  <div><strong>{{ page.auto_approved }}</strong><span>双重一致自动通过</span></div>
+  <div><strong>{{ page.pending }}</strong><span>待教师复核</span></div>
+  <div><strong>{{ page.approved }}</strong><span>已批准</span></div>
+</section>
+
+{% if page.drafts %}
+<nav class="paper-card" aria-label="分类题目导航">
+  {% for draft in page.drafts %}<a class="text-link" href="#question-{{ draft.source_question_no }}">Q{{ draft.source_question_no }}{% if draft.status == 'pending' %}（异常）{% endif %}</a>{% endfor %}
+</nav>
+<section class="layout-review">
+  {% for draft in page.drafts %}
+  <article class="paper-card layout-question" id="question-{{ draft.source_question_no }}">
+    <h2>Q{{ '%03d'|format(draft.source_question_no|int) }} · {% if draft.status == 'pending' %}待复核{% else %}已批准{% endif %}</h2>
+    <p class="candidate-stem">{{ draft.stem_markdown }}</p>
+    <div class="classification-comparison">
+      <section><h3>Proposal</h3><p>主知识点：{{ draft.proposal_primary_code }} {{ draft.proposal_name }}</p><p>关联：{{ draft.proposal_related_codes|join('、') or '无' }}</p><p>置信度：{{ draft.proposal_confidence }}；理由：{{ draft.proposal_reason }}</p></section>
+      <section><h3>Verifier</h3><p>主知识点：{{ draft.verifier_primary_code }} {{ draft.verifier_name }}</p><p>关联：{{ draft.verifier_related_codes|join('、') or '无' }}</p><p>置信度：{{ draft.verifier_confidence }}；理由：{{ draft.verifier_reason }}</p></section>
+    </div>
+    <p>批准来源：{{ '本地双重一致' if draft.approval_source == 'local_double_pass' else ('教师复核' if draft.approval_source == 'human' else '尚未批准') }}</p>
+    {% if not page.applied %}
+    <form method="post" action="/imports/{{ job_id }}/classification/questions/{{ draft.source_question_no }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="version" value="{{ draft.version }}">
+      <label>最终主知识点
+        <select name="primary_code" required>{% for point in points %}<option value="{{ point.code }}"{% if point.code == draft.final_primary_code %} selected{% endif %}>{{ point.code }} {{ point.name }}</option>{% endfor %}</select>
+      </label>
+      <label>最终关联知识点（最多 2 个）
+        <select name="related_codes" multiple size="5">{% for point in points %}<option value="{{ point.code }}"{% if point.code in draft.final_related_codes %} selected{% endif %}>{{ point.code }} {{ point.name }}</option>{% endfor %}</select>
+      </label>
+      <button type="submit" name="action" value="save">保存</button>
+      <button class="button" type="submit" name="action" value="approve">保存并批准</button>
+    </form>
+    {% endif %}
+  </article>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if page.pending == 0 and page.approved == page.question_count and not page.applied %}
+<section class="paper-card processing-card">
+  <p>全部分类草稿已批准。登记时会重新校验整批输入摘要、草稿版本/哈希与 active taxonomy。</p>
+  <form method="post" action="/imports/{{ job_id }}/classification/apply">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="button" type="submit">登记整批分类证据</button>
+  </form>
+  <p>此操作只登记独立分类证据，不会正式入库。</p>
+</section>
+{% endif %}
+{% endif %}
+<section class="paper-card">
+  <a class="button" href="/imports/{{ job_id }}/admission">查看严格整批入库评估</a>
+</section>
+{% endblock %}

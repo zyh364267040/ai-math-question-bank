@@ -6,6 +6,8 @@
   <p class="eyebrow">REVIEW · TASK #{{ job.id }}</p>
   <h1>{{ job.paper_name }}</h1>
   <p><span class="warning-pill">候选识别，尚未人工确认</span> 本页面仅供对照查看，不会写入正式题库。</p>
+  <a class="button" href="/imports/{{ job.id }}/classification">本地知识点分类</a>
+  <a class="button" href="/imports/{{ job.id }}/admission">严格整批入库评估</a>
 </section>
 {% if audit_error %}<div class="audit-error"><b>AI复核数据损坏或不完整</b><span>已停止使用本次AI复核结果，下面按原有方式展示全部候选题。</span></div>{% endif %}
 {% if audit %}

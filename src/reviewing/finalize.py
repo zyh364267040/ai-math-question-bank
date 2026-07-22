@@ -588,7 +588,11 @@ def _inspect_database(connection, job_id, batch):
     return job, planned, approved, formal, desired_by_number, predicted_changes
 
 
-def finalize_review(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1, *, apply=False):
+def finalize_review(
+    database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1, *,
+    apply=False, backup_result=None, pre_apply_callback=None,
+    completion_callback=None,
+):
     """Plan, or transactionally apply, finalization for one import job."""
     database_path = Path(database_path).expanduser().resolve()
     private_root = Path(private_root or database_path.parent).expanduser().resolve()
@@ -605,7 +609,21 @@ def finalize_review(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_
                 _verify_artifact_snapshots(artifact_lock, batch["snapshots"])
                 return _result(planned, predicted_changes)
 
-            backup_path, backup_sha = _backup(database_path)
+            if backup_result is None:
+                backup_path, backup_sha = _backup(database_path)
+            else:
+                try:
+                    backup_path, backup_sha = backup_result
+                    backup_path = Path(backup_path).expanduser().resolve()
+                except (TypeError, ValueError) as exc:
+                    raise FinalizationError("收口备份锚点无效") from exc
+                if (
+                    not isinstance(backup_sha, str) or len(backup_sha) != 64
+                    or any(character not in "0123456789abcdef" for character in backup_sha)
+                    or not backup_path.is_file()
+                    or _sha256(backup_path.read_bytes()) != backup_sha
+                ):
+                    raise FinalizationError("收口备份锚点无效")
             connection = sqlite3.connect(database_path)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
@@ -613,6 +631,8 @@ def finalize_review(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 try:
+                    if pre_apply_callback is not None:
+                        pre_apply_callback(connection)
                     (job, planned, approved, formal, desired_by_number,
                      predicted_changes) = _inspect_database(connection, job_id, batch)
                     should_complete = _completion_ready(planned, batch["numbers"])
@@ -682,6 +702,8 @@ def finalize_review(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_
                             f"收口后外键检查失败：{violations[:3]}"
                         )
                     _verify_artifact_snapshots(artifact_lock, batch["snapshots"])
+                    if completion_callback is not None:
+                        completion_callback(connection)
                     connection.commit()
                 except Exception:
                     connection.rollback()

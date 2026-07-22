@@ -26,6 +26,10 @@
   <p><strong>二审不解题、不分类知识点、不检查答案，不会创建草稿或正式入库。</strong></p>
 </section>
 {% if audit %}
+<section class="paper-card processing-card">
+  <p>视觉二审与异常修正全部批准后，可进入独立的本地知识点分类；分类不会解题或正式入库。</p>
+  <a class="button" href="/imports/{{ run.id }}/classification">进入本地知识点分类</a>
+</section>
 {% if applied >= 0 %}<div class="save-feedback" role="status">已应用 {{ applied }} 条新的自动通过结果</div>{% endif %}
 <section class="audit-summary">
   <div><strong>{{ audit.counts.auto_pass }}</strong><span>自动通过</span></div>

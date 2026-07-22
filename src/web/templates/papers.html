@@ -51,6 +51,8 @@
       <a class="button urgent" href="/reviews/{{ job.id }}/questions/{{ job.first_question_no }}">进入审核工作台</a>
       <a class="text-link" href="/review/{{ job.id }}?status=human_required">处理人工确认</a>
       <a class="text-link" href="/review/{{ job.id }}?status=all">查看全部</a>
+      <a class="button" href="/imports/{{ job.id }}/classification">{% if job.classification_applied_at or job.classification_evidence_count %}分类已完成{% elif job.classification_status %}查看本地知识点分类{% else %}开始本地知识点分类{% endif %}</a>
+      <a class="button" href="/imports/{{ job.id }}/admission">严格整批入库评估</a>
     {% elif job.has_candidates %}
       <p class="audit-waiting">{% if job.audit_error %}AI复核数据异常{% else %}等待AI复核{% endif %}</p>
       <a class="button" href="/reviews/{{ job.id }}/questions/{{ job.first_question_no }}">进入审核工作台</a>

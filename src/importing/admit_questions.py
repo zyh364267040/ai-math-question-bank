@@ -9,7 +9,7 @@ import json
 import os
 import sqlite3
 import stat
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -110,15 +110,30 @@ def _verify_artifact_snapshots(job_fd: int, snapshots) -> None:
 
 
 @contextmanager
-def _job_artifact_lock(job_dir: Path):
+def _job_artifact_lock(job_dir: Path, *, create=True):
     descriptor = None
     try:
         supplied = Path(job_dir)
         if supplied.is_symlink():
             raise OSError("symbolic link job directory")
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        if create:
+            flags |= os.O_CREAT
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(supplied / LOCK_FILENAME, flags, 0o600)
+        try:
+            descriptor = os.open(supplied / LOCK_FILENAME, flags, 0o600)
+        except FileNotFoundError:
+            if create:
+                raise
+            directory_flags = (
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptor = os.open(supplied, directory_flags)
+            yield type("ReadOnlyJob", (), {
+                "path": supplied.resolve(strict=True), "descriptor": descriptor,
+            })()
+            return
         details = os.fstat(descriptor)
         if (not stat.S_ISREG(details.st_mode) or details.st_nlink != 1
                 or stat.S_IMODE(details.st_mode) != 0o600):
@@ -376,10 +391,30 @@ def _load_context(connection, private_root: Path, job_id: int, artifact_lock=Non
             job_dir, job_fd, entry.get("output_relative_path"), entry, snapshots
         )
         figures[number] = entry
+    anchor = connection.execute(
+        """SELECT status,input_candidate_sha256,input_manifest_sha256,output_sha256,
+                  completed_at FROM import_candidate_audit_runs WHERE import_job_id=?""",
+        (job_id,),
+    ).fetchone()
+    if anchor is None:
+        raise AdmissionError("AI审核清单缺少稳定完成时间")
+    try:
+        completed = datetime.fromisoformat(anchor["completed_at"])
+    except (TypeError, ValueError) as exc:
+        raise AdmissionError("AI审核清单缺少稳定完成时间") from exc
+    if (
+        anchor["status"] != "completed"
+        or anchor["input_candidate_sha256"] != candidate_snapshot.sha256
+        or anchor["input_manifest_sha256"] != _crops_snapshot.sha256
+        or anchor["output_sha256"] != _audit_snapshot.sha256
+        or completed.tzinfo is None or completed.utcoffset() is None
+        or completed.astimezone(timezone.utc) > datetime.now(timezone.utc) + timedelta(minutes=5)
+    ):
+        raise AdmissionError("AI审核清单未绑定稳定完成时间")
     return (
         job, job_dir, questions, audits, crops, figures,
         candidate_snapshot.sha256, _audit_snapshot.sha256,
-        _crops_snapshot.sha256, tuple(snapshots),
+        _crops_snapshot.sha256, tuple(snapshots), anchor["completed_at"],
     )
 
 
@@ -616,8 +651,8 @@ def assess_job(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1)
     database_path = Path(database_path)
     private_root = Path(private_root or database_path.parent)
     job_dir = private_root / "processing" / f"import_job_{job_id}"
-    with _job_artifact_lock(job_dir) as artifact_lock:
-        with sqlite3.connect(database_path) as connection:
+    with _job_artifact_lock(job_dir, create=False) as artifact_lock:
+        with closing(sqlite3.connect(database_path)) as connection:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
             context = _load_context(
@@ -632,7 +667,9 @@ def _code(source_sha: str, number: str) -> str:
     return f"Q-{source_sha[:16]}-{int(number):03d}"
 
 
-def _approval_review_metadata(approval, question, answer_note, audits, number):
+def _approval_review_metadata(
+    approval, question, answer_note, audits, number, stable_auto_reviewed_at=None,
+):
     if approval is not None:
         evidence = json.dumps(
             json.loads(approval["approval_evidence_json"]),
@@ -657,9 +694,10 @@ def _approval_review_metadata(approval, question, answer_note, audits, number):
             f"批准证据={evidence}；{answer_note}"
         )
         return reviewer, reviewed_at, review_note
+    if not isinstance(stable_auto_reviewed_at, str) or not stable_auto_reviewed_at:
+        raise AdmissionError("AI审核清单缺少稳定完成时间")
     reviewer = audits[number].get("auditor", "ai_audit")
-    reviewed_at = datetime.now(timezone.utc).isoformat()
-    return reviewer, reviewed_at, f"AI二审通过（auto_pass）；{answer_note}"
+    return reviewer, stable_auto_reviewed_at, f"AI二审通过（auto_pass）；{answer_note}"
 
 
 def _insert_one(connection, context, question, code, human_approval=None):
@@ -701,11 +739,12 @@ def _insert_one(connection, context, question, code, human_approval=None):
         sub_analysis_provided = isinstance(sub_analysis, str) and bool(sub_analysis.strip())
         connection.execute(
             """INSERT INTO subquestions
-               (question_id,display_order,stem_markdown,answer_markdown,answer_status,analysis_markdown)
-               VALUES(?,?,?,?,?,?)""",
+               (question_id,display_order,stem_markdown,answer_markdown,answer_status,
+                analysis_markdown,score)
+               VALUES(?,?,?,?,?,?,?)""",
             (qid, index, stem, sub_answer if sub_answer_provided else "",
              "provided" if sub_answer_provided else "missing",
-             sub_analysis if sub_analysis_provided else None),
+             sub_analysis if sub_analysis_provided else None, sub.get("score")),
         )
     for related in question.get("related_knowledge_point_codes", []):
         kid = connection.execute("SELECT id FROM knowledge_points WHERE code=?", (related,)).fetchone()[0]
@@ -726,7 +765,7 @@ def _insert_one(connection, context, question, code, human_approval=None):
         "原卷答案已通过审核" if any_answer_provided else "原卷未提供答案"
     )
     reviewer, reviewed_at, review_note = _approval_review_metadata(
-        human_approval, question, answer_note, audits, number
+        human_approval, question, answer_note, audits, number, context[10]
     )
     connection.execute(
         """INSERT INTO question_reviews(question_id,review_item,previous_status,new_status,reviewer,reviewed_at,notes)
@@ -736,7 +775,149 @@ def _insert_one(connection, context, question, code, human_approval=None):
     return qid
 
 
-def admit_questions(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1):
+def _validate_existing_question(
+    connection, context, question, code, human_approval=None,
+):
+    """Reject a deterministic-code collision unless content and provenance match."""
+    job = context[0]
+    number = question["source_question_no"]
+    expected_hash = hashlib.sha256(
+        json.dumps(question, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+    row = connection.execute(
+        """SELECT q.id,q.content_hash,q.stem_markdown,q.answer_markdown,
+                  q.answer_status,q.analysis_markdown,q.question_type_code,
+                  k.code AS primary_code,q.region_code,q.exam_year,q.exam_type_code,
+                  q.paper_name,q.source_question_no AS q_source_question_no,q.source_page,
+                  q.source_file_path,q.score,q.difficulty_level,q.difficulty_basis,
+                  q.ocr_review_status,q.formula_review_status,q.figure_review_status,
+                  q.answer_review_status,q.analysis_review_status,q.tag_review_status,
+                  q.usability_status,q.duplicate_group_id,q.deleted_at,q.deletion_reason,
+                  q.deletion_note,s.source_paper_id,s.import_job_id,
+                  s.source_question_no AS s_source_question_no,s.source_pages_json
+           FROM questions q LEFT JOIN question_sources s ON s.question_id=q.id
+           JOIN knowledge_points k ON k.id=q.primary_knowledge_point_id
+           WHERE q.question_code=?""",
+        (code,),
+    ).fetchone()
+    if row is None:
+        return None
+    expected = (
+        expected_hash, job["region_code"], job["exam_year"], job["exam_type_code"],
+        job["paper_name"], number, json.dumps(question.get("source_pages", [])),
+        job["stored_path"], None, None, None,
+        "passed", "passed",
+        "passed" if question.get("figure_required") else "not_applicable",
+        "passed" if isinstance(question.get("answer_markdown"), str)
+        and question.get("answer_markdown", "").strip() else "not_applicable",
+        "passed" if isinstance(question.get("analysis_markdown"), str)
+        and question.get("analysis_markdown", "").strip() else "not_applicable",
+        "passed", "pending_review", None, None, None, None,
+        job["source_paper_id"], job["id"], number,
+    )
+    actual = tuple(row[key] for key in (
+        "content_hash", "region_code", "exam_year", "exam_type_code", "paper_name",
+        "q_source_question_no", "source_page", "source_file_path", "score",
+        "difficulty_level", "difficulty_basis", "ocr_review_status",
+        "formula_review_status", "figure_review_status", "answer_review_status",
+        "analysis_review_status", "tag_review_status", "usability_status",
+        "duplicate_group_id", "deleted_at", "deletion_reason", "deletion_note",
+        "source_paper_id", "import_job_id", "s_source_question_no",
+    ))
+    if actual != expected:
+        raise AdmissionError(f"Q{number} 的已有正式题内容或来源冲突")
+    answer = question.get("answer_markdown", "")
+    analysis = question.get("analysis_markdown")
+    expected_content = (
+        question["stem_markdown"], answer if isinstance(answer, str) and answer.strip() else "",
+        "provided" if isinstance(answer, str) and answer.strip() else "missing",
+        analysis if isinstance(analysis, str) and analysis.strip() else None,
+        question["question_type_code"], question["primary_knowledge_point_code"],
+        json.dumps(question.get("source_pages", [])),
+    )
+    if tuple(row[key] for key in (
+        "stem_markdown", "answer_markdown", "answer_status", "analysis_markdown",
+        "question_type_code", "primary_code", "source_pages_json",
+    )) != expected_content:
+        raise AdmissionError(f"Q{number} 的已有正式题内容或来源冲突")
+    qid = row["id"]
+    expected_options = [
+        (option["code"], option.get("content", ""), index)
+        for index, option in enumerate(question.get("options", []), 1)
+        if option.get("content", "") != "见原页选项图"
+    ]
+    actual_options = [tuple(item) for item in connection.execute(
+        """SELECT option_code,content_markdown,display_order FROM question_options
+           WHERE question_id=? ORDER BY display_order""", (qid,)
+    )]
+    expected_subquestions = []
+    for index, subquestion in enumerate(question.get("subquestions", []), 1):
+        stem = " ".join(filter(None, [
+            subquestion.get("label", ""), subquestion.get("stem_markdown", "")
+        ])).strip()
+        sub_answer = subquestion.get("answer_markdown", "")
+        sub_analysis = subquestion.get("analysis_markdown")
+        expected_subquestions.append((
+            index, stem,
+            sub_answer if isinstance(sub_answer, str) and sub_answer.strip() else "",
+            "provided" if isinstance(sub_answer, str) and sub_answer.strip() else "missing",
+            sub_analysis if isinstance(sub_analysis, str) and sub_analysis.strip() else None,
+            subquestion.get("score"),
+        ))
+    actual_subquestions = [tuple(item) for item in connection.execute(
+        """SELECT display_order,stem_markdown,answer_markdown,answer_status,
+                  analysis_markdown,score FROM subquestions WHERE question_id=?
+           ORDER BY display_order""", (qid,)
+    )]
+    actual_related = [item[0] for item in connection.execute(
+        """SELECT k.code FROM question_related_knowledge_points r
+           JOIN knowledge_points k ON k.id=r.knowledge_point_id
+           WHERE r.question_id=? ORDER BY r.rowid""", (qid,)
+    )]
+    crops, figures = context[4], context[5]
+    expected_assets = [("complete_question", crops[number])]
+    if number in figures:
+        expected_assets.append(("question_figure", figures[number]))
+    expected_asset_rows = [(
+        kind, asset["output_relative_path"], asset["width"], asset["height"],
+        asset["byte_size"], asset["sha256"], "ai_review_passed", 1, job["id"],
+    ) for kind, asset in expected_assets]
+    actual_assets = [tuple(item) for item in connection.execute(
+        """SELECT asset_kind,relative_path,width,height,byte_size,sha256,
+                  review_status,display_order,import_job_id
+           FROM question_assets WHERE question_id=? ORDER BY asset_kind""", (qid,)
+    )]
+    any_answer_provided = _has_markdown(question, "answer_markdown")
+    answer_note = (
+        "原卷答案已通过审核" if any_answer_provided else "原卷未提供答案"
+    )
+    reviewer, reviewed_at, review_note = _approval_review_metadata(
+        human_approval, question, answer_note, context[3], number, context[10]
+    )
+    admission_review = connection.execute(
+        """SELECT 1 FROM question_reviews WHERE question_id=?
+           AND review_item='usability' AND previous_status='pending'
+           AND new_status='passed' AND reviewer=? AND reviewed_at=? AND notes=?""",
+        (qid, reviewer, reviewed_at, review_note),
+    ).fetchone()
+    unexpected_children = any(connection.execute(
+        f"SELECT 1 FROM {table} WHERE question_id=? LIMIT 1", (qid,)
+    ).fetchone() for table in ("question_formulas", "question_figures", "question_tags"))
+    if (
+        actual_options != expected_options
+        or actual_subquestions != expected_subquestions
+        or actual_related != question.get("related_knowledge_point_codes", [])
+        or sorted(actual_assets) != sorted(expected_asset_rows)
+        or admission_review is None or unexpected_children
+    ):
+        raise AdmissionError(f"Q{number} 的已有正式题内容或来源冲突")
+    return row["id"]
+
+
+def admit_questions(
+    database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1, *,
+    require_complete_batch=False, pre_apply_callback=None,
+):
     database_path = Path(database_path)
     private_root = Path(private_root or database_path.parent)
     job_dir = private_root / "processing" / f"import_job_{job_id}"
@@ -748,11 +929,22 @@ def admit_questions(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_
         connection.execute("PRAGMA busy_timeout=10000")
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if pre_apply_callback is not None:
+                pre_apply_callback(connection)
             context = _load_context(
                 connection, private_root, job_id, artifact_lock=artifact_lock
             )
             effective = _effective_questions(connection, context)
             assessment = _assess(connection, context, effective)
+            expected_numbers = {
+                question["source_question_no"] for question in context[2]
+            }
+            eligible_numbers = {item.question_no for item in assessment.eligible}
+            if require_complete_batch and (
+                assessment.ineligible or eligible_numbers != expected_numbers
+                or len(assessment.eligible) != len(expected_numbers)
+            ):
+                raise AdmissionError("整批候选题未全部通过严格准入评估")
             manifest_reasons = {
                 "empty_stem", "invalid_question_type", "missing_knowledge_point",
                 "missing_question_crop", "missing_approved_figure",
@@ -772,9 +964,15 @@ def admit_questions(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_
             for item in assessment.eligible:
                 code = _code(context[0]["sha256"], item.question_no)
                 codes.append(code)
-                if connection.execute(
+                existing = connection.execute(
                     "SELECT 1 FROM questions WHERE question_code=?", (code,)
-                ).fetchone():
+                ).fetchone()
+                if existing and require_complete_batch:
+                    _validate_existing_question(
+                        connection, context, effective[item.question_no][0], code,
+                        effective[item.question_no][1],
+                    )
+                if existing:
                     present += 1
                     continue
                 if effective[item.question_no][3]:
@@ -806,8 +1004,9 @@ def backup_database(database_path=DEFAULT_DATABASE_PATH, backup_dir=None):
     target_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     target = target_dir / f"question-bank-{stamp}.db"
-    with sqlite3.connect(source) as src, sqlite3.connect(target) as dst:
-        src.backup(dst)
+    with closing(sqlite3.connect(source)) as src:
+        with closing(sqlite3.connect(target)) as dst:
+            src.backup(dst)
     return target, _sha256(target)
 
 

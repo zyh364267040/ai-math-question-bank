@@ -623,6 +623,599 @@ BEGIN
     SELECT RAISE(ABORT, 'completed knowledge classification is immutable');
 END;
 
+CREATE TRIGGER IF NOT EXISTS candidate_knowledge_classifications_delete_immutable
+BEFORE DELETE ON candidate_knowledge_classifications
+BEGIN
+    SELECT RAISE(ABORT, 'completed knowledge classification is immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS import_knowledge_classification_runs (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending','processing','completed','failed')
+    ),
+    stage TEXT NOT NULL DEFAULT 'waiting' CHECK (
+        stage IN ('waiting','level2','proposal','verifier','publishing','review_ready')
+    ),
+    question_count INTEGER CHECK (question_count IS NULL OR question_count > 0),
+    processed_questions INTEGER NOT NULL DEFAULT 0 CHECK (processed_questions >= 0),
+    model TEXT NOT NULL DEFAULT 'qwen2.5:14b' CHECK (length(trim(model)) BETWEEN 1 AND 100),
+    input_digest TEXT CHECK (input_digest IS NULL OR (
+        length(input_digest)=64 AND input_digest NOT GLOB '*[^0-9a-f]*'
+    )),
+    taxonomy_digest TEXT CHECK (taxonomy_digest IS NULL OR (
+        length(taxonomy_digest)=64 AND taxonomy_digest NOT GLOB '*[^0-9a-f]*'
+    )),
+    output_sha256 TEXT CHECK (output_sha256 IS NULL OR (
+        length(output_sha256)=64 AND output_sha256 NOT GLOB '*[^0-9a-f]*'
+    )),
+    output_byte_size INTEGER CHECK (output_byte_size IS NULL OR output_byte_size > 0),
+    error_message TEXT CHECK (error_message IS NULL OR length(error_message) <= 100),
+    claim_token TEXT CHECK (claim_token IS NULL OR length(claim_token)=64),
+    started_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    applied_at TEXT,
+    CHECK (question_count IS NULL OR processed_questions <= question_count),
+    CHECK (status != 'completed' OR (
+        question_count IS NOT NULL AND processed_questions=question_count
+        AND input_digest IS NOT NULL AND taxonomy_digest IS NOT NULL
+        AND output_sha256 IS NOT NULL AND output_byte_size IS NOT NULL
+        AND completed_at IS NOT NULL AND error_message IS NULL
+    ))
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_classification_run_status
+ON import_knowledge_classification_runs(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS candidate_knowledge_classification_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_job_id INTEGER NOT NULL REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    source_question_no TEXT NOT NULL CHECK (length(trim(source_question_no)) BETWEEN 1 AND 3),
+    approved_draft_version INTEGER NOT NULL CHECK (approved_draft_version > 0),
+    edited_sha256 TEXT NOT NULL CHECK (length(edited_sha256)=64),
+    proposal_primary_code TEXT NOT NULL REFERENCES knowledge_points(code) ON DELETE RESTRICT,
+    proposal_related_codes_json TEXT NOT NULL CHECK (json_valid(proposal_related_codes_json)),
+    proposal_confidence TEXT NOT NULL CHECK (proposal_confidence IN ('low','medium','high')),
+    proposal_reason TEXT NOT NULL CHECK (length(proposal_reason) BETWEEN 1 AND 200),
+    verifier_primary_code TEXT NOT NULL REFERENCES knowledge_points(code) ON DELETE RESTRICT,
+    verifier_related_codes_json TEXT NOT NULL CHECK (json_valid(verifier_related_codes_json)),
+    verifier_confidence TEXT NOT NULL CHECK (verifier_confidence IN ('low','medium','high')),
+    verifier_reason TEXT NOT NULL CHECK (length(verifier_reason) BETWEEN 1 AND 200),
+    final_primary_code TEXT NOT NULL REFERENCES knowledge_points(code) ON DELETE RESTRICT,
+    final_related_codes_json TEXT NOT NULL CHECK (json_valid(final_related_codes_json)),
+    status TEXT NOT NULL CHECK (status IN ('pending','approved')),
+    approval_source TEXT CHECK (approval_source IN ('local_double_pass','human') OR approval_source IS NULL),
+    human_review_note TEXT NOT NULL DEFAULT '' CHECK (length(human_review_note) <= 200),
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(import_job_id, source_question_no),
+    CHECK ((status='pending' AND approval_source IS NULL) OR
+           (status='approved' AND approval_source IS NOT NULL AND reviewed_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_classification_draft_review
+ON candidate_knowledge_classification_drafts(import_job_id, status, source_question_no);
+
+CREATE TRIGGER IF NOT EXISTS knowledge_classification_applied_run_immutable
+BEFORE UPDATE ON import_knowledge_classification_runs
+WHEN OLD.applied_at IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'applied knowledge classification run is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS knowledge_classification_completed_run_delete_immutable
+BEFORE DELETE ON import_knowledge_classification_runs
+WHEN OLD.status='completed' OR OLD.applied_at IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'completed knowledge classification run is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS knowledge_classification_completed_output_immutable
+BEFORE UPDATE ON import_knowledge_classification_runs
+WHEN OLD.status='completed' AND (
+    NEW.status != OLD.status OR NEW.question_count != OLD.question_count
+    OR NEW.model != OLD.model OR NEW.input_digest != OLD.input_digest
+    OR NEW.taxonomy_digest != OLD.taxonomy_digest
+    OR NEW.output_sha256 != OLD.output_sha256
+    OR NEW.output_byte_size != OLD.output_byte_size
+    OR NEW.completed_at != OLD.completed_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'completed knowledge classification output is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS knowledge_classification_applied_draft_immutable
+BEFORE UPDATE ON candidate_knowledge_classification_drafts
+WHEN EXISTS (
+    SELECT 1 FROM import_knowledge_classification_runs r
+    WHERE r.import_job_id=OLD.import_job_id AND r.applied_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'applied knowledge classification draft is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS knowledge_classification_applied_draft_delete_immutable
+BEFORE DELETE ON candidate_knowledge_classification_drafts
+WHEN EXISTS (
+    SELECT 1 FROM import_knowledge_classification_runs r
+    WHERE r.import_job_id=OLD.import_job_id AND r.applied_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'applied knowledge classification draft is immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS import_web_admission_runs (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')),
+    stage TEXT NOT NULL CHECK (
+        stage IN ('preparing_backup','processing','admitted_pending_finalize','completed','failed')
+    ),
+    claim_token TEXT CHECK (
+        claim_token IS NULL OR (
+            length(claim_token)=64 AND claim_token NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    expected_count INTEGER NOT NULL CHECK (expected_count > 0),
+    backup_relative_path TEXT CHECK (
+        backup_relative_path IS NULL OR (
+        length(trim(backup_relative_path)) BETWEEN 1 AND 500
+        AND substr(backup_relative_path,1,1) <> '/'
+        AND backup_relative_path NOT LIKE '%..%'
+        AND backup_relative_path NOT LIKE '%\%'
+        )
+    ),
+    backup_sha256 TEXT CHECK (
+        backup_sha256 IS NULL OR (
+        length(backup_sha256)=64 AND backup_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    pre_backup_source_digest TEXT CHECK (
+        pre_backup_source_digest IS NULL OR length(pre_backup_source_digest)=64
+    ),
+    backup_snapshot_digest TEXT CHECK (
+        backup_snapshot_digest IS NULL OR length(backup_snapshot_digest)=64
+    ),
+    question_code_digest TEXT CHECK (
+        question_code_digest IS NULL OR (
+            length(question_code_digest)=64
+            AND question_code_digest NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    formal_batch_digest TEXT CHECK (
+        formal_batch_digest IS NULL OR (
+            length(formal_batch_digest)=64
+            AND formal_batch_digest NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    inserted_count INTEGER CHECK (inserted_count IS NULL OR inserted_count >= 0),
+    already_present_count INTEGER CHECK (
+        already_present_count IS NULL OR already_present_count >= 0
+    ),
+    eligible_count INTEGER CHECK (eligible_count IS NULL OR eligible_count >= 0),
+    finalize_backup_relative_path TEXT CHECK (
+        finalize_backup_relative_path IS NULL OR (
+            length(trim(finalize_backup_relative_path)) BETWEEN 1 AND 500
+            AND substr(finalize_backup_relative_path,1,1) <> '/'
+            AND finalize_backup_relative_path NOT LIKE '%..%'
+            AND finalize_backup_relative_path NOT LIKE '%\%'
+        )
+    ),
+    finalize_backup_sha256 TEXT CHECK (
+        finalize_backup_sha256 IS NULL OR (
+            length(finalize_backup_sha256)=64
+            AND finalize_backup_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    finalize_source_digest TEXT CHECK (
+        finalize_source_digest IS NULL OR length(finalize_source_digest)=64
+    ),
+    finalize_backup_snapshot_digest TEXT CHECK (
+        finalize_backup_snapshot_digest IS NULL OR length(finalize_backup_snapshot_digest)=64
+    ),
+    safe_error TEXT CHECK (safe_error IS NULL OR length(safe_error) <= 100),
+    claimed_at TEXT,
+    heartbeat_at TEXT,
+    lease_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    CHECK (
+        (status='processing' AND claim_token IS NOT NULL)
+        OR (status IN ('completed','failed') AND claim_token IS NULL)
+    ),
+    CHECK (status!='processing' OR (
+        claimed_at IS NOT NULL AND heartbeat_at IS NOT NULL
+        AND lease_expires_at IS NOT NULL
+    )),
+    CHECK (
+        (status='processing' AND stage IN ('preparing_backup','processing','admitted_pending_finalize'))
+        OR (status='failed' AND stage IN ('processing','failed','admitted_pending_finalize'))
+        OR (status='completed' AND stage='completed')
+    ),
+    CHECK (stage!='completed' OR (
+        status='completed' AND claim_token IS NULL AND completed_at IS NOT NULL
+        AND question_code_digest IS NOT NULL
+        AND formal_batch_digest IS NOT NULL
+        AND inserted_count IS NOT NULL AND already_present_count IS NOT NULL
+        AND eligible_count=expected_count
+        AND finalize_backup_relative_path IS NOT NULL
+        AND finalize_backup_sha256 IS NOT NULL AND safe_error IS NULL
+    )),
+    CHECK (stage NOT IN ('admitted_pending_finalize','completed') OR (
+        question_code_digest IS NOT NULL AND inserted_count IS NOT NULL
+        AND already_present_count IS NOT NULL AND eligible_count=expected_count
+    )),
+    CHECK (stage NOT IN ('processing','admitted_pending_finalize','completed') OR (
+        backup_relative_path IS NOT NULL AND backup_sha256 IS NOT NULL
+    )),
+    CHECK ((backup_relative_path IS NULL)=(backup_sha256 IS NULL)),
+    CHECK ((finalize_backup_relative_path IS NULL)=(finalize_backup_sha256 IS NULL)),
+    CHECK (status='processing' OR lease_expires_at IS NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_web_admission_run_claim
+ON import_web_admission_runs(status, lease_expires_at);
+
+CREATE TRIGGER IF NOT EXISTS web_admission_completed_immutable
+BEFORE UPDATE ON import_web_admission_runs
+WHEN OLD.status='completed'
+BEGIN
+    SELECT RAISE(ABORT, 'completed web admission run is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_completed_delete_immutable
+BEFORE DELETE ON import_web_admission_runs
+WHEN OLD.status='completed'
+BEGIN
+    SELECT RAISE(ABORT, 'completed web admission run is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_job_status_update
+BEFORE UPDATE OF status ON import_jobs
+WHEN OLD.status='completed' AND NEW.status!='completed' AND EXISTS (
+    SELECT 1 FROM import_web_admission_runs r
+    WHERE r.import_job_id=OLD.id AND r.status='completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'completed web admission job status is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_run_completed_job_insert
+BEFORE INSERT ON import_web_admission_runs
+WHEN NEW.status='completed' AND NOT EXISTS (
+    SELECT 1 FROM import_jobs j
+    WHERE j.id=NEW.import_job_id AND j.status='completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'completed web admission run requires completed job');
+END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_run_completed_job_update
+BEFORE UPDATE OF status ON import_web_admission_runs
+WHEN NEW.status='completed' AND NOT EXISTS (
+    SELECT 1 FROM import_jobs j
+    WHERE j.id=NEW.import_job_id AND j.status='completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'completed web admission run requires completed job');
+END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_questions_update
+BEFORE UPDATE ON questions
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.id AND r.status='completed'
+) AND (
+    NEW.id IS NOT OLD.id OR NEW.question_code IS NOT OLD.question_code
+    OR NEW.stem_markdown IS NOT OLD.stem_markdown
+    OR NEW.answer_markdown IS NOT OLD.answer_markdown
+    OR NEW.answer_status IS NOT OLD.answer_status
+    OR NEW.analysis_markdown IS NOT OLD.analysis_markdown
+    OR NEW.region_code IS NOT OLD.region_code
+    OR NEW.exam_year IS NOT OLD.exam_year
+    OR NEW.exam_type_code IS NOT OLD.exam_type_code
+    OR NEW.paper_name IS NOT OLD.paper_name
+    OR NEW.source_question_no IS NOT OLD.source_question_no
+    OR NEW.source_page IS NOT OLD.source_page
+    OR NEW.score IS NOT OLD.score
+    OR NEW.source_file_path IS NOT OLD.source_file_path
+    OR NEW.question_type_code IS NOT OLD.question_type_code
+    OR NEW.difficulty_level IS NOT OLD.difficulty_level
+    OR NEW.difficulty_basis IS NOT OLD.difficulty_basis
+    OR NEW.primary_knowledge_point_id IS NOT OLD.primary_knowledge_point_id
+    OR NEW.ocr_review_status IS NOT OLD.ocr_review_status
+    OR NEW.formula_review_status IS NOT OLD.formula_review_status
+    OR NEW.figure_review_status IS NOT OLD.figure_review_status
+    OR NEW.answer_review_status IS NOT OLD.answer_review_status
+    OR NEW.analysis_review_status IS NOT OLD.analysis_review_status
+    OR NEW.tag_review_status IS NOT OLD.tag_review_status
+    OR NEW.usability_status IS NOT OLD.usability_status
+    OR NEW.content_hash IS NOT OLD.content_hash
+    OR NEW.duplicate_group_id IS NOT OLD.duplicate_group_id
+    OR NEW.created_at IS NOT OLD.created_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'completed web admission question is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_questions_delete
+BEFORE DELETE ON questions
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.id AND r.status='completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'completed web admission question is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_sources_insert
+BEFORE INSERT ON question_sources
+WHEN EXISTS (
+    SELECT 1 FROM import_web_admission_runs r
+    WHERE r.import_job_id=NEW.import_job_id AND r.status='completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'completed web admission source is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_sources_update
+BEFORE UPDATE ON question_sources
+WHEN EXISTS (
+    SELECT 1 FROM import_web_admission_runs r
+    WHERE r.import_job_id IN (OLD.import_job_id,NEW.import_job_id) AND r.status='completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'completed web admission source is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_sources_delete
+BEFORE DELETE ON question_sources
+WHEN EXISTS (
+    SELECT 1 FROM import_web_admission_runs r
+    WHERE r.import_job_id=OLD.import_job_id AND r.status='completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'completed web admission source is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_options_insert
+BEFORE INSERT ON question_options
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=NEW.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission option is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_options_update
+BEFORE UPDATE ON question_options
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id IN (OLD.question_id,NEW.question_id) AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission option is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_options_delete
+BEFORE DELETE ON question_options
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission option is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_subquestions_insert
+BEFORE INSERT ON subquestions
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=NEW.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission subquestion is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_subquestions_update
+BEFORE UPDATE ON subquestions
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.question_id AND r.status='completed'
+)
+OR EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=NEW.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission subquestion is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_subquestions_delete
+BEFORE DELETE ON subquestions
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission subquestion is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_formulas_insert
+BEFORE INSERT ON question_formulas
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=NEW.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission formula is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_formulas_update
+BEFORE UPDATE ON question_formulas
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id IN (OLD.question_id,NEW.question_id) AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission formula is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_formulas_delete
+BEFORE DELETE ON question_formulas
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission formula is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_figures_insert
+BEFORE INSERT ON question_figures
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=NEW.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission figure is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_figures_update
+BEFORE UPDATE ON question_figures
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id IN (OLD.question_id,NEW.question_id) AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission figure is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_figures_delete
+BEFORE DELETE ON question_figures
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission figure is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_tags_insert
+BEFORE INSERT ON question_tags
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=NEW.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission tag is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_tags_update
+BEFORE UPDATE ON question_tags
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id IN (OLD.question_id,NEW.question_id) AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission tag is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_tags_delete
+BEFORE DELETE ON question_tags
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission tag is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_knowledge_insert
+BEFORE INSERT ON question_related_knowledge_points
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=NEW.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission knowledge relation is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_knowledge_update
+BEFORE UPDATE ON question_related_knowledge_points
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id IN (OLD.question_id,NEW.question_id) AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission knowledge relation is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_knowledge_delete
+BEFORE DELETE ON question_related_knowledge_points
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission knowledge relation is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_assets_insert
+BEFORE INSERT ON question_assets
+WHEN EXISTS (
+    SELECT 1 FROM import_web_admission_runs r
+    WHERE r.import_job_id=NEW.import_job_id AND r.status='completed'
+)
+OR EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=NEW.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission asset is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_assets_update
+BEFORE UPDATE ON question_assets
+WHEN EXISTS (
+    SELECT 1 FROM import_web_admission_runs r
+    WHERE r.import_job_id IN (OLD.import_job_id,NEW.import_job_id) AND r.status='completed'
+)
+OR EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id IN (OLD.question_id,NEW.question_id) AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission asset is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_assets_delete
+BEFORE DELETE ON question_assets
+WHEN EXISTS (
+    SELECT 1 FROM import_web_admission_runs r
+    WHERE r.import_job_id=OLD.import_job_id AND r.status='completed'
+)
+OR EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r
+      ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission asset is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_reviews_insert
+BEFORE INSERT ON question_reviews
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=NEW.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission review is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_reviews_update
+BEFORE UPDATE ON question_reviews
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r ON r.import_job_id=s.import_job_id
+    WHERE s.question_id IN (OLD.question_id,NEW.question_id) AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission review is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_reviews_delete
+BEFORE DELETE ON question_reviews
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission review is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_versions_insert
+BEFORE INSERT ON question_versions
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=NEW.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission version is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_versions_update
+BEFORE UPDATE ON question_versions
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r ON r.import_job_id=s.import_job_id
+    WHERE s.question_id IN (OLD.question_id,NEW.question_id) AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission version is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS web_admission_protect_versions_delete
+BEFORE DELETE ON question_versions
+WHEN EXISTS (
+    SELECT 1 FROM question_sources s JOIN import_web_admission_runs r ON r.import_job_id=s.import_job_id
+    WHERE s.question_id=OLD.question_id AND r.status='completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed web admission version is immutable'); END;
+
 CREATE INDEX IF NOT EXISTS idx_questions_content_hash ON questions(content_hash);
 CREATE INDEX IF NOT EXISTS idx_questions_source ON questions(region_code, exam_year, exam_type_code, paper_name, source_question_no);
 CREATE INDEX IF NOT EXISTS idx_questions_primary_knowledge ON questions(primary_knowledge_point_id);

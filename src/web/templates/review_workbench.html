@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}第 {{ number }} 题 · 题目审核工作台{% endblock %}
 {% block content %}
-<section class="review-heading compact"><a href="/papers">← 返回试卷列表</a><p class="eyebrow">候选题审核 · TASK #{{ job.id }}</p><h1>题目审核工作台</h1><p>{{ job.paper_name }} · 第 {{ number }} 题 {% if focus %}<span class="warning-pill">重点复核</span>{% endif %}</p></section>
+<section class="review-heading compact"><a href="/papers">← 返回试卷列表</a><p class="eyebrow">候选题审核 · TASK #{{ job.id }}</p><h1>题目审核工作台</h1><p>{{ job.paper_name }} · 第 {{ number }} 题 {% if focus %}<span class="warning-pill">重点复核</span>{% endif %}</p><a class="button" href="/imports/{{ job.id }}/classification">本地知识点分类</a></section>
 {% if saved %}<div class="save-feedback" role="status">保存成功，当前版本 {{ draft.version }}</div>{% endif %}
 {% if quick_feedback %}<div class="save-feedback" role="status">{{ quick_feedback }}</div>{% endif %}
 <div class="save-feedback inline-feedback" role="status" aria-live="polite" data-inline-feedback hidden></div>

@@ -253,6 +253,86 @@ class AdmitQuestionsTests(unittest.TestCase):
         self.assertEqual(["12"], [item.question_no for item in report.ineligible])
         self.assertIn("human_required", report.ineligible[0].reasons)
 
+    def test_strict_complete_batch_rejects_any_ineligible_before_inserting(self):
+        with self.assertRaises(AdmissionError):
+            admit_questions(
+                self.db, self.private, 1, require_complete_batch=True
+            )
+        with sqlite3.connect(self.db) as con:
+            self.assertEqual(0, con.execute("SELECT COUNT(*) FROM questions").fetchone()[0])
+
+    def test_strict_complete_batch_rejects_conflicting_deterministic_question(self):
+        self._approve_human_draft()
+        admitted = admit_questions(
+            self.db, self.private, 1, require_complete_batch=True
+        )
+        self.assertEqual(23, admitted.inserted)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                "UPDATE questions SET stem_markdown='conflicting formal content' "
+                "WHERE question_code=?",
+                (admitted.question_codes[0],),
+            )
+        with self.assertRaises(AdmissionError):
+            admit_questions(
+                self.db, self.private, 1, require_complete_batch=True
+            )
+
+    def test_strict_existing_question_checks_protected_fields_and_child_sets(self):
+        self._approve_human_draft()
+        admitted = admit_questions(
+            self.db, self.private, 1, require_complete_batch=True
+        )
+        code = admitted.question_codes[0]
+        cases = (
+            (
+                "question review status",
+                "UPDATE questions SET ocr_review_status='rejected' WHERE question_code=?",
+                "UPDATE questions SET ocr_review_status='passed' WHERE question_code=?",
+            ),
+            (
+                "question source page anchor",
+                "UPDATE questions SET source_page='[]' WHERE question_code=?",
+                "UPDATE questions SET source_page='[1]' WHERE question_code=?",
+            ),
+            (
+                "asset display order",
+                "UPDATE question_assets SET display_order=2 WHERE question_id=(SELECT id FROM questions WHERE question_code=?)",
+                "UPDATE question_assets SET display_order=1 WHERE question_id=(SELECT id FROM questions WHERE question_code=?)",
+            ),
+            (
+                "admission review evidence",
+                "DELETE FROM question_reviews WHERE question_id=(SELECT id FROM questions WHERE question_code=?)",
+                None,
+            ),
+        )
+        for label, mutation, restore in cases:
+            with self.subTest(label=label):
+                with sqlite3.connect(self.db) as con:
+                    if label == "admission review evidence":
+                        saved = con.execute(
+                            "SELECT review_item,previous_status,new_status,reviewer,reviewed_at,notes FROM question_reviews WHERE question_id=(SELECT id FROM questions WHERE question_code=?)",
+                            (code,),
+                        ).fetchone()
+                    con.execute(mutation, (code,))
+                with self.assertRaises(AdmissionError):
+                    admit_questions(
+                        self.db, self.private, 1, require_complete_batch=True
+                    )
+                with sqlite3.connect(self.db) as con:
+                    if restore is not None:
+                        con.execute(restore, (code,))
+                    else:
+                        qid = con.execute(
+                            "SELECT id FROM questions WHERE question_code=?", (code,)
+                        ).fetchone()[0]
+                        con.execute(
+                            """INSERT INTO question_reviews
+                               (question_id,review_item,previous_status,new_status,reviewer,reviewed_at,notes)
+                               VALUES(?,?,?,?,?,?,?)""",
+                            (qid, *saved),
+                        )
+
     def test_human_approved_candidate_is_eligible_and_first_admission_uses_edited_json(self):
         _, approved = self._approve_human_draft(
             mutate=lambda question: question.update(
@@ -1665,6 +1745,63 @@ class AdmitQuestionsTests(unittest.TestCase):
         self.assertEqual(("missing", "not_applicable", "not_applicable"), parent_statuses)
         self.assertNotIn("未提供答案", review_note)
         self.assertIn("答案已通过审核", review_note)
+
+    def test_complete_batch_rejects_tampered_subquestion_score_atomically(self):
+        self._approve_human_draft("12")
+        admit_questions(self.db, self.private, 1, require_complete_batch=True)
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                """UPDATE subquestions SET score=9
+                   WHERE id=(SELECT s.id FROM subquestions s JOIN questions q
+                             ON q.id=s.question_id WHERE q.source_question_no='22'
+                             ORDER BY s.display_order LIMIT 1)"""
+            )
+            before = connection.execute(
+                "SELECT stem_markdown FROM questions WHERE source_question_no='1'"
+            ).fetchone()[0]
+        with self.assertRaisesRegex(AdmissionError, "Q22 .*冲突"):
+            admit_questions(self.db, self.private, 1, require_complete_batch=True)
+        with sqlite3.connect(self.db) as connection:
+            self.assertEqual(9, connection.execute(
+                """SELECT s.score FROM subquestions s JOIN questions q
+                   ON q.id=s.question_id WHERE q.source_question_no='22'
+                   ORDER BY s.display_order LIMIT 1"""
+            ).fetchone()[0])
+            self.assertEqual(before, connection.execute(
+                "SELECT stem_markdown FROM questions WHERE source_question_no='1'"
+            ).fetchone()[0])
+            self.assertEqual(23, connection.execute("SELECT COUNT(*) FROM questions").fetchone()[0])
+
+    def test_mixed_no_draft_auto_pass_retry_uses_stable_review_evidence(self):
+        self._approve_human_draft("12")
+        first = admit_questions(self.db, self.private, 1, require_complete_batch=True)
+        with sqlite3.connect(self.db) as connection:
+            before = connection.execute(
+                """SELECT q.question_code,r.reviewer,r.reviewed_at,r.notes
+                   FROM questions q JOIN question_reviews r ON r.question_id=q.id
+                   ORDER BY q.question_code,r.id"""
+            ).fetchall()
+            before_counts = tuple(connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0] for table in (
+                "questions", "question_versions", "question_reviews",
+            ))
+        second = admit_questions(self.db, self.private, 1, require_complete_batch=True)
+        with sqlite3.connect(self.db) as connection:
+            after = connection.execute(
+                """SELECT q.question_code,r.reviewer,r.reviewed_at,r.notes
+                   FROM questions q JOIN question_reviews r ON r.question_id=q.id
+                   ORDER BY q.question_code,r.id"""
+            ).fetchall()
+            after_counts = tuple(connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0] for table in (
+                "questions", "question_versions", "question_reviews",
+            ))
+        self.assertEqual((23, 0), (first.inserted, first.already_present))
+        self.assertEqual((0, 23), (second.inserted, second.already_present))
+        self.assertEqual(before, after)
+        self.assertEqual(before_counts, after_counts)
 
     def test_non_string_answer_or_analysis_rejects_and_rolls_back_batch(self):
         candidate_path, original = self._json("candidate_questions.json")
