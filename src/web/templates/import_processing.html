@@ -38,7 +38,7 @@
   {% elif run.status == 'pending' and run.import_status == 'pending' %}
     <form method="post" action="/imports/{{ run.id }}/render">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="button" type="submit">开始页面处理</button>
+      <button class="button" type="submit">恢复页面处理</button>
     </form>
   {% elif run.status == 'processing' and run.import_status == 'pending' %}
     <p>页面处理在后台进行，本页会自动刷新。若服务曾重启，可显式继续。</p>

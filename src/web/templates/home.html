@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="hero">
-  <p class="eyebrow">LOCAL · READ ONLY</p>
+  <p class="eyebrow">LOCAL · PRIVATE</p>
   <h1>AI 数学题库</h1>
   <p>从试卷识别结果开始，把每一道题整理得清楚、可靠、可追溯。</p>
 </section>
@@ -15,6 +15,6 @@
   <a class="feature active" href="/questions"><span>01</span><h2>我的题库</h2><p>浏览 {{ stats.questions }} 道正式题目。</p><b>立即进入 →</b></a>
   <a class="feature active" href="/papers"><span>02</span><h2>试卷与审核</h2><p>查看试卷、候选识别和原始页面。</p><b>立即进入 →</b></a>
   <a class="feature active" href="/basket"><span>03</span><h2>选题篮</h2><p>已选 {{ stats.basket }} 道题，组合并导出练习。</p><b>立即进入 →</b></a>
-  <article class="feature muted"><span>04</span><h2>数据与设置</h2><p>维护本地数据和偏好。</p><b>开发中</b></article>
+  <a class="feature active" href="/imports/new"><span>04</span><h2>导入新试卷</h2><p>上传 PDF，确认后进入自动页面处理与 Codex 切题。</p><b>立即上传 →</b></a>
 </section>
 {% endblock %}

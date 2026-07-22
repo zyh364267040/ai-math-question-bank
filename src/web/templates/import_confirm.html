@@ -4,7 +4,7 @@
 <section class="page-heading">
   <p class="eyebrow">CONFIRM IMPORT</p>
   <h1>确认导入</h1>
-  <p><strong>上传预览不会入库，点击确认后才创建任务。</strong></p>
+  <p><strong>上传预览不会入库；确认后将创建任务，并在后台自动完成页面处理与 Codex 切题。</strong></p>
 </section>
 <section class="paper-card">
   {% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
@@ -23,7 +23,7 @@
   <label>年份（可空） <input name="exam_year" value="{{ exam_year or '' }}" inputmode="numeric"></label>
   <label>考试类型 <select name="exam_type_code">{% for item in exam_types %}<option value="{{ item.code }}"{% if item.code == exam_type_code %} selected{% endif %}>{{ item.name }}</option>{% endfor %}</select></label>
   <label>页码范围 <input name="page_range" value="{{ page_range }}" required></label>
-  <button type="submit">确认导入</button>
+  <button type="submit">确认导入并自动处理</button>
 </form>
 <form method="post" action="/imports/{{ manifest.token }}/cancel">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

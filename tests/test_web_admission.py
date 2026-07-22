@@ -1248,7 +1248,7 @@ class WebAdmissionTests(unittest.TestCase):
         self._approve_and_classify_all()
         forbidden = mock.Mock(side_effect=AssertionError("forbidden dependency"))
         app = create_app(
-            self.db, self.private, weekly_checker=forbidden,
+            self.db, self.private,
             candidate_runner=forbidden, audit_runner=forbidden,
             classification_runner=forbidden,
         )

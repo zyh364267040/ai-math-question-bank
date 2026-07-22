@@ -10,6 +10,8 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import threading
+from functools import partial
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, unquote, urlsplit
@@ -23,6 +25,10 @@ from PIL import Image, UnidentifiedImageError
 from src.database import baskets as basket_store
 from src.database.initialize import initialize_database
 from src.importing.pdf_intake import PdfIntakeError, has_intake_receipt, intake_pdf
+from src.pipeline.automatic_import import (
+    resume_interrupted_automatic_imports,
+    run_automatic_import,
+)
 from src.importing.upload_confirmation import (
     MANIFEST_HMAC_KEY_FILENAME,
     MAX_UPLOAD_BYTES,
@@ -50,8 +56,6 @@ from src.processing.question_splitter import (
     SAFE_EXISTING_ERROR as SAFE_SPLIT_EXISTING_ERROR,
     SAFE_RENDER_REQUIRED,
     SAFE_SPLIT_ERROR,
-    SAFE_WEEKLY_LOW,
-    SAFE_WEEKLY_UNAVAILABLE,
     QuestionSplitError,
     claim_split_job,
     completed_split_result_valid,
@@ -1075,12 +1079,31 @@ def _safe_basket_next(value, question_code, default="/questions"):
     return default
 
 
+def _start_daemon_worker(callback):
+    """Start one process-local worker without delaying the HTTP response."""
+    thread = threading.Thread(target=callback, daemon=True, name="automatic-import")
+    thread.start()
+    return thread
+
+
+def _receipt_job_id(database_path, token):
+    with _connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT import_job_id FROM import_upload_receipts WHERE token=?",
+            (token,),
+        ).fetchone()
+    return row[0] if row is not None else None
+
+
 def create_app(
     database_path=DEFAULT_DATABASE_PATH,
     private_root=DEFAULT_PRIVATE_ROOT,
     preview_request_max_bytes=MAX_PREVIEW_REQUEST_BYTES,
     split_runner=None,
-    weekly_checker=None,
+    auto_submit=None,
+    automatic_import_runner=run_automatic_import,
+    render_worker=run_claimed_render,
+    split_worker=run_claimed_split,
     candidate_runner=None,
     audit_runner=None,
     corrected_audit_runner=None,
@@ -1096,17 +1119,41 @@ def create_app(
     application.state.database_path = database_path
     application.state.private_root = private_root
     application.state.split_runner = split_runner
+    application.state.auto_submit = auto_submit or _start_daemon_worker
+    application.state.automatic_import_runner = automatic_import_runner
+    application.state.render_worker = render_worker
+    application.state.split_worker = split_worker
     application.state.candidate_runner = candidate_runner
     application.state.audit_runner = audit_runner
     application.state.corrected_audit_runner = corrected_audit_runner or audit_runner
-    application.state.weekly_checker = weekly_checker
     application.state.classification_runner = classification_runner
     application.state.web_admission_service = web_admission_service
-    if not _initialize_schema:
-        @application.on_event("startup")
-        def initialize_schema_on_server_start():
-            """Migrate the production database before serving any request."""
+
+    def enqueue_automatic_import(job_id):
+        application.state.auto_submit(partial(
+            application.state.automatic_import_runner,
+            database_path,
+            private_root,
+            job_id,
+            split_runner=application.state.split_runner,
+            render_worker=application.state.render_worker,
+            split_worker=application.state.split_worker,
+        ))
+
+    @application.on_event("startup")
+    def initialize_and_recover_on_server_start():
+        """Migrate first, then submit one serial recovery coordinator."""
+        if not _initialize_schema:
             initialize_database(database_path).close()
+        application.state.auto_submit(partial(
+            resume_interrupted_automatic_imports,
+            database_path,
+            private_root,
+            automatic_import_runner=application.state.automatic_import_runner,
+            split_runner=application.state.split_runner,
+            render_worker=application.state.render_worker,
+            split_worker=application.state.split_worker,
+        ))
     def common_context(request):
         try:
             with _connect(database_path) as connection:
@@ -1410,15 +1457,12 @@ def create_app(
             claim = claim_split_job(
                 database_path, private_root, job_id,
                 runner=application.state.split_runner,
-                weekly_checker=application.state.weekly_checker,
             )
         except QuestionSplitError as error:
             message = str(error)
             if message == "未找到导入任务":
                 return _error(request, templates, message, 404)
             if message in {SAFE_RENDER_REQUIRED, SAFE_CODEX_MISSING}:
-                return _error(request, templates, message, 409)
-            if message in {SAFE_WEEKLY_LOW, SAFE_WEEKLY_UNAVAILABLE}:
                 return _error(request, templates, message, 409)
             return _error(request, templates, "自动切题任务暂时无法启动", 500)
         if claim is not None:
@@ -1433,6 +1477,9 @@ def create_app(
                 row = connection.execute(
                     """SELECT j.id,j.status AS import_status,s.paper_name,
                               s.original_filename,r.status AS render_status,
+                              r.error_message AS render_error_message,
+                              r.total_pages AS render_total_pages,
+                              r.rendered_pages,
                               q.status,q.question_count,q.processed_pages,
                               q.error_message,q.codex_run_id,q.updated_at,
                               q.result_manifest_sha256,q.crop_manifest_sha256,
@@ -1450,9 +1497,29 @@ def create_app(
             return _error(request, templates, "自动切题状态暂时无法读取", 500)
         if row is None:
             return _error(request, templates, "未找到导入任务", 404)
-        if row["import_status"] != "pending" or row["render_status"] != "completed":
+        if row["import_status"] != "pending":
             return _error(request, templates, SAFE_RENDER_REQUIRED, 409)
         run = dict(row)
+        if run["render_status"] != "completed":
+            render_status = run["render_status"] or "pending"
+            run["phase"] = "render"
+            run["status"] = render_status
+            run["status_name"] = RENDER_STATUS_NAMES[render_status]
+            run["rendered_pages"] = run["rendered_pages"] or 0
+            if run["render_error_message"] not in SAFE_RENDER_ERRORS:
+                run["error_message"] = (
+                    "页面处理失败，请重试"
+                    if render_status == "failed" else None
+                )
+            else:
+                run["error_message"] = run["render_error_message"]
+            return templates.TemplateResponse(
+                request=request,
+                name="import_split.html",
+                context={"run": run, "crops": []},
+                headers={"Cache-Control": "no-store"},
+            )
+        run["phase"] = "split"
         run["status"] = run["status"] or "pending"
         run["processed_pages"] = run["processed_pages"] or 0
         run["status_name"] = SPLIT_STATUS_NAMES[run["status"]]
@@ -1534,7 +1601,6 @@ def create_app(
             claim = claim_candidate_extraction(
                 database_path, private_root, job_id,
                 runner=application.state.candidate_runner,
-                weekly_checker=application.state.weekly_checker,
             )
         except CandidateExtractionError as error:
             message = str(error)
@@ -1542,7 +1608,7 @@ def create_app(
                 return _error(request, templates, message, 404)
             if message in {
                 SAFE_CANDIDATE_INPUT_REQUIRED, SAFE_CANDIDATE_INPUT_INVALID,
-                SAFE_CODEX_MISSING, SAFE_WEEKLY_LOW, SAFE_WEEKLY_UNAVAILABLE,
+                SAFE_CODEX_MISSING,
             }:
                 return _error(request, templates, message, 409)
             return _error(request, templates, "候选题识别任务暂时无法启动", 500)
@@ -1611,7 +1677,6 @@ def create_app(
             claim = claim_candidate_audit(
                 database_path, private_root, job_id,
                 runner=application.state.audit_runner,
-                weekly_checker=application.state.weekly_checker,
             )
         except CandidateAuditError as error:
             message = str(error)
@@ -1620,7 +1685,7 @@ def create_app(
             if message in {
                 SAFE_AUDIT_INPUT_REQUIRED, SAFE_AUDIT_INPUT_INVALID,
                 SAFE_EXISTING_UNANCHORED, SAFE_AUDIT_EXISTING_ERROR,
-                SAFE_CODEX_MISSING, SAFE_WEEKLY_LOW, SAFE_WEEKLY_UNAVAILABLE,
+                SAFE_CODEX_MISSING,
             }:
                 return _error(request, templates, message, 409)
             return _error(request, templates, "独立视觉二审任务暂时无法启动", 500)
@@ -1901,16 +1966,29 @@ def create_app(
         if form is None:
             return _error(request, templates, "CSRF 校验失败", 403)
         try:
-            manifest, stored_path = load_verified_upload(private_root, token)
+            try:
+                manifest, stored_path = load_verified_upload(private_root, token)
+            except UploadConfirmationError:
+                if has_intake_receipt(database_path, token):
+                    job_id = _receipt_job_id(database_path, token)
+                    enqueue_automatic_import(job_id)
+                    return RedirectResponse(
+                        f"/imports/{job_id}/split", status_code=303
+                    )
+                raise
             metadata = validate_import_metadata(form, manifest.page_count)
             with pending_upload_operation(private_root, token):
                 try:
                     manifest, stored_path = load_verified_upload(private_root, token)
                 except UploadConfirmationError:
                     if has_intake_receipt(database_path, token):
-                        return RedirectResponse("/papers", status_code=303)
+                        job_id = _receipt_job_id(database_path, token)
+                        enqueue_automatic_import(job_id)
+                        return RedirectResponse(
+                            f"/imports/{job_id}/split", status_code=303
+                        )
                     raise
-                intake_pdf(
+                intake_result = intake_pdf(
                     pdf_path=stored_path,
                     region_code=metadata.region_code,
                     exam_year=metadata.exam_year,
@@ -1921,6 +1999,7 @@ def create_app(
                     private_storage_root=private_root,
                     idempotency_key=token,
                 )
+                job_id = intake_result["import_job_id"]
                 discard_staged_upload(private_root, token)
         except (UploadConfirmationError, PdfIntakeError) as error:
             error_message = str(error)
@@ -1957,7 +2036,8 @@ def create_app(
                 context=context,
                 status_code=400,
             )
-        return RedirectResponse("/papers", status_code=303)
+        enqueue_automatic_import(job_id)
+        return RedirectResponse(f"/imports/{job_id}/split", status_code=303)
 
     @application.post("/imports/{token}/cancel", response_class=HTMLResponse)
     async def cancel_import(request: Request, token: str):
@@ -2116,14 +2196,12 @@ def create_app(
             claim = claim_corrected_draft_audit(
                 database_path, private_root, job_id, question_no,
                 runner=application.state.corrected_audit_runner,
-                weekly_checker=application.state.weekly_checker,
                 expected_draft_version=int(version_text),
                 expected_edited_sha256=edited_sha256,
             )
         except CandidateAuditError as error:
             status = 409 if str(error) in {
-                SAFE_REAUDIT_INPUT, SAFE_REAUDIT_BUSY, SAFE_WEEKLY_LOW,
-                SAFE_WEEKLY_UNAVAILABLE,
+                SAFE_REAUDIT_INPUT, SAFE_REAUDIT_BUSY,
             } else 500
             return _review_error(request, templates, str(error), status)
         if claim is not None:

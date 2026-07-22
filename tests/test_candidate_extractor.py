@@ -13,7 +13,6 @@ from src.processing.candidate_extractor import (
     CandidateExtractionError,
     CandidateExtractionRunResult,
     CandidateCodexCliRunner,
-    SAFE_WEEKLY_LOW,
     _candidate_output_schema,
     _prompt,
     claim_candidate_extraction,
@@ -253,7 +252,6 @@ class CandidateExtractorTests(unittest.TestCase):
     def test_claim_run_publishes_and_anchors_without_drafts_or_formal_questions(self):
         claim = claim_candidate_extraction(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 30.0,
         )
         result = run_claimed_candidate_extraction(claim)
         self.assertEqual(23, result["question_count"])
@@ -274,14 +272,12 @@ class CandidateExtractorTests(unittest.TestCase):
             self.assertEqual(0, connection.execute("SELECT count(*) FROM questions").fetchone()[0])
             self.assertEqual(0, connection.execute("SELECT count(*) FROM candidate_review_drafts").fetchone()[0])
 
-    def test_completed_is_idempotent_and_gate_blocks_before_runner_without_write_lock(self):
+    def test_completed_is_idempotent_and_failed_run_can_retry(self):
         run_claimed_candidate_extraction(claim_candidate_extraction(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         ))
         self.assertIsNone(claim_candidate_extraction(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: (_ for _ in ()).throw(AssertionError("gate should not run")),
         ))
         self.assertEqual(1, len(self.runner.calls))
 
@@ -290,25 +286,13 @@ class CandidateExtractorTests(unittest.TestCase):
                 "UPDATE import_candidate_extraction_runs SET status='failed' WHERE import_job_id=?",
                 (self.job_id,),
             )
-        observed = []
-        def checker():
-            other = sqlite3.connect(self.database, timeout=0.1)
-            try:
-                other.execute("BEGIN IMMEDIATE")
-                observed.append(True)
-                other.rollback()
-            finally:
-                other.close()
-            return 29.9
-        with self.assertRaisesRegex(CandidateExtractionError, SAFE_WEEKLY_LOW):
-            claim_candidate_extraction(
-                self.database, self.private, self.job_id, runner=self.runner,
-                weekly_checker=checker,
-            )
-        self.assertEqual([True], observed)
-        self.assertEqual(1, len(self.runner.calls))
+        retry = claim_candidate_extraction(
+            self.database, self.private, self.job_id, runner=self.runner
+        )
+        run_claimed_candidate_extraction(retry)
+        self.assertEqual(2, len(self.runner.calls))
         with sqlite3.connect(self.database) as connection:
-            self.assertEqual("failed", connection.execute(
+            self.assertEqual("completed", connection.execute(
                 "SELECT status FROM import_candidate_extraction_runs WHERE import_job_id=?",
                 (self.job_id,),
             ).fetchone()[0])
@@ -318,7 +302,6 @@ class CandidateExtractorTests(unittest.TestCase):
         with self.assertRaises(CandidateExtractionError):
             claim_candidate_extraction(
                 self.database, self.private, self.job_id, runner=self.runner,
-                weekly_checker=lambda: 100.0,
             )
         self.assertEqual([], self.runner.calls)
 
@@ -339,18 +322,15 @@ class CandidateExtractorTests(unittest.TestCase):
         with self.assertRaises(CandidateExtractionError):
             claim_candidate_extraction(
                 self.database, self.private, self.job_id, runner=self.runner,
-                weekly_checker=lambda: 100.0,
             )
         self.assertEqual([], self.runner.calls)
 
     def test_concurrent_claim_is_deduplicated_and_stale_processing_can_resume(self):
         first = claim_candidate_extraction(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         )
         self.assertIsNone(claim_candidate_extraction(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         ))
         first.close()
         with sqlite3.connect(self.database) as connection:
@@ -360,7 +340,6 @@ class CandidateExtractorTests(unittest.TestCase):
             ).fetchone()[0])
         resumed = claim_candidate_extraction(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         )
         self.assertIsNotNone(resumed)
         run_claimed_candidate_extraction(resumed)
@@ -369,7 +348,6 @@ class CandidateExtractorTests(unittest.TestCase):
     def test_changed_signed_generation_does_not_reuse_completed_result(self):
         run_claimed_candidate_extraction(claim_candidate_extraction(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         ))
         manifest_path = self.job_dir / "question_crops.json"
         manifest = json.loads(manifest_path.read_text())
@@ -388,7 +366,6 @@ class CandidateExtractorTests(unittest.TestCase):
             )
         claim = claim_candidate_extraction(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         )
         self.assertIsNotNone(claim)
         run_claimed_candidate_extraction(claim)

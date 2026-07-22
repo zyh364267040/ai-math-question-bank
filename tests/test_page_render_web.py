@@ -51,7 +51,7 @@ class PageRenderWebTests(unittest.TestCase):
 
     def test_pending_paper_requires_explicit_csrf_post_and_schedules_one_worker(self):
         papers = self.client.get("/papers")
-        self.assertIn("开始页面处理", papers.text)
+        self.assertIn("恢复页面处理", papers.text)
         self.assertIn(f'action="/imports/{self.job_id}/render"', papers.text)
 
         with patch("src.web.app.run_claimed_render") as worker:
@@ -126,7 +126,7 @@ class PageRenderWebTests(unittest.TestCase):
         self.assertIn("1–1", pending.text)
         self.assertIn("300 DPI", pending.text)
         self.assertIn("0 / 1 页", pending.text)
-        self.assertIn("开始页面处理", pending.text)
+        self.assertIn("恢复页面处理", pending.text)
 
         with sqlite3.connect(self.database_path) as connection:
             connection.execute(

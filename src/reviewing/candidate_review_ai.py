@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 from src.processing.candidate_extractor import _open_job_and_lock
-from src.processing.question_splitter import QuestionSplitError, _require_weekly_capacity
 from src.processing.secure_crop_artifacts import SecureCropArtifactError, read_file_at
 from src.reviewing.candidate_auditor import (
     MAX_AUDIT_BYTES,
@@ -418,7 +417,7 @@ def _crop_anchor(job_fd: int, manifest: dict, question_no: str):
 
 
 def claim_corrected_draft_audit(database_path, private_root, job_id, question_no,
-                                runner=None, weekly_checker=None, *,
+                                runner=None, *,
                                 expected_draft_version=None, expected_edited_sha256=None):
     database_path, private_root = Path(database_path), Path(private_root)
     question_no = str(question_no)
@@ -497,10 +496,6 @@ def claim_corrected_draft_audit(database_path, private_root, job_id, question_no
                 or existing["approved_draft_version"] == draft["version"]
             ):
                 return None
-        try:
-            _require_weekly_capacity(weekly_checker)
-        except QuestionSplitError as exc:
-            raise CandidateAuditError(str(exc)) from exc
         if runner is None:
             runner = CandidateAuditCodexCliRunner()
         relative, crop_sha, crop_size = _crop_anchor(job_fd, manifest, question_no)
@@ -669,7 +664,7 @@ def adopt_corrected_draft_audit(database_path, private_root, job_id, question_no
         raise CandidateAuditError(SAFE_REAUDIT_INPUT)
     claim = claim_corrected_draft_audit(
         database_path, private_root, job_id, question_no,
-        runner=object(), weekly_checker=lambda: 100.0,
+        runner=object(),
         expected_draft_version=reviewed_draft_version,
         expected_edited_sha256=edited_sha256,
     )

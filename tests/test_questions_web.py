@@ -77,6 +77,15 @@ class QuestionsWebTests(unittest.TestCase):
         self.assertEqual(22, listing.text.count('class="question-list-item"'))
         self.assertNotIn("原题号 12", listing.text)
 
+    def test_listing_heading_has_import_link_and_filters_still_work(self):
+        listing = self.client.get("/questions?question_type=single_choice")
+
+        self.assertEqual(200, listing.status_code)
+        self.assertIn('class="button" href="/imports/new"', listing.text)
+        self.assertIn("导入新试卷", listing.text)
+        self.assertIn('name="question_type"', listing.text)
+        self.assertGreater(listing.text.count('class="question-list-item"'), 0)
+
     def test_filters_and_invalid_parameters_are_safe(self):
         self.assertGreater(self.client.get("/questions?question_type=single_choice").text.count('class="question-list-item"'), 0)
         self.assertGreater(self.client.get("/questions?knowledge=01.01.06").text.count('class="question-list-item"'), 0)

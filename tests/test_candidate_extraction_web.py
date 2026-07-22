@@ -82,7 +82,6 @@ class CandidateExtractionWebTests(unittest.TestCase):
         self.runner = WebCandidateRunner(self.job_id, self.source_id)
         self.client = TestClient(create_app(
             self.database, self.private, candidate_runner=self.runner,
-            weekly_checker=lambda: 100.0,
         ))
         self.client.get("/imports/new")
         self.csrf = self.client.cookies.get("basket_csrf")

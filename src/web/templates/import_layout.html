@@ -28,7 +28,7 @@
     </form>
   {% elif run.status == 'completed' %}
     <p>版面分析已完成。候选仅供审核，不会自动切题或修改题库。</p>
-    <a class="button" href="/imports/{{ run.id }}/split">下一步：调用 Codex 自动切题</a>
+    <a class="button" href="/imports/{{ run.id }}/split">查看 Codex 自动切题状态</a>
   {% endif %}
 </section>
 {% if manifest %}

@@ -13,7 +13,43 @@ import pymupdf
 from fastapi.testclient import TestClient
 
 from src.database.initialize import initialize_database
+from src.pipeline.automatic_import import (
+    AutomaticImportOutcome,
+    resume_interrupted_automatic_imports,
+    run_automatic_import,
+)
+from src.processing.pdf_page_renderer import claim_render_job, run_claimed_render
+from src.processing.question_splitter import (
+    SAFE_CODEX_MISSING,
+    CodexExecutionError,
+    CodexRunResult,
+    claim_split_job,
+    run_claimed_split,
+)
 from src.web.app import PreviewUploadBodyLimitMiddleware, create_app
+
+
+class OneQuestionSplitRunner:
+    def __init__(self):
+        self.calls = []
+
+    def run(self, *, image_paths, prompt):
+        self.calls.append((tuple(image_paths), prompt))
+        job_id = int(re.search(r"import_job_id=(\d+)", prompt).group(1))
+        return CodexRunResult(json.dumps({
+            "version": 1,
+            "import_job_id": job_id,
+            "question_count": 1,
+            "questions": [{
+                "question_no": 1,
+                "regions": [{
+                    "page_number": 1,
+                    "bbox_normalized": [0.05, 0.05, 0.95, 0.95],
+                }],
+                "warnings": [],
+                "confidence": 0.9,
+            }],
+        }), "automatic-test-run")
 
 
 class PreviewUploadBodyLimitMiddlewareTests(unittest.IsolatedAsyncioTestCase):
@@ -100,7 +136,7 @@ class PreviewUploadBodyLimitMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(413, sent[0]["status"])
 
 
-class UploadConfirmationWebTests(unittest.TestCase):
+class UploadConfirmationWebTestCases:
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
@@ -111,6 +147,7 @@ class UploadConfirmationWebTests(unittest.TestCase):
             create_app(
                 database_path=self.database_path,
                 private_root=self.private_root,
+                auto_submit=lambda callback: None,
             )
         )
 
@@ -155,7 +192,7 @@ class UploadConfirmationWebTests(unittest.TestCase):
         self.assertIn('type="file"', response.text)
         self.assertIn('name="csrf_token"', response.text)
         self.assertIn("上传预览不会入库", response.text)
-        self.assertIn("点击确认后才创建任务", response.text)
+        self.assertIn("确认后才创建任务并自动处理页面与切题", response.text)
 
     def test_papers_page_has_prominent_import_link(self):
         response = self.client.get("/papers")
@@ -224,7 +261,9 @@ class UploadConfirmationWebTests(unittest.TestCase):
         self.assertEqual(0o600, stat.S_IMODE(key_path.stat().st_mode))
         original_key = key_path.read_bytes()
 
-        with TestClient(create_app(self.database_path, self.private_root)) as restarted:
+        with TestClient(create_app(
+            self.database_path, self.private_root, auto_submit=lambda callback: None
+        )) as restarted:
             restarted.cookies.set("basket_csrf", self.client.cookies.get("basket_csrf"))
             response = restarted.post(
                 f"/imports/{token}/confirm",
@@ -323,7 +362,9 @@ class UploadConfirmationWebTests(unittest.TestCase):
         external_key.write_bytes(b"k" * 32)
         self.private_root.mkdir(parents=True, exist_ok=True)
         (self.private_root / ".upload_manifest_hmac.key").symlink_to(external_key)
-        with TestClient(create_app(self.database_path, self.private_root)) as client:
+        with TestClient(create_app(
+            self.database_path, self.private_root, auto_submit=lambda callback: None
+        )) as client:
             csrf = client.get("/imports/new").cookies.get("basket_csrf") or client.cookies.get(
                 "basket_csrf"
             )
@@ -340,7 +381,9 @@ class UploadConfirmationWebTests(unittest.TestCase):
         external_pending = self.root / "external-pending"
         external_pending.mkdir()
         (self.private_root / "pending_uploads").symlink_to(external_pending, target_is_directory=True)
-        with TestClient(create_app(self.database_path, self.private_root)) as client:
+        with TestClient(create_app(
+            self.database_path, self.private_root, auto_submit=lambda callback: None
+        )) as client:
             csrf = client.get("/imports/new").cookies.get("basket_csrf") or client.cookies.get(
                 "basket_csrf"
             )
@@ -370,7 +413,8 @@ class UploadConfirmationWebTests(unittest.TestCase):
         )
 
         self.assertEqual(303, response.status_code)
-        self.assertEqual("/papers", response.headers["location"])
+        self.assertRegex(response.headers["location"], r"\A/imports/\d+/split\Z")
+        self.assertEqual((1, 1), self.database_counts())
         self.assertEqual((1, 1), self.database_counts())
         with sqlite3.connect(self.database_path) as connection:
             paper = connection.execute(
@@ -391,6 +435,201 @@ class UploadConfirmationWebTests(unittest.TestCase):
         self.assertFalse((self.private_root / "processing").exists())
         self.assertFalse((self.private_root / "pending_uploads" / token).exists())
 
+    def test_one_confirm_returns_before_and_enqueues_render_then_split(self):
+        queued = []
+        events = []
+
+        class SplitRunner:
+            def run(inner_self, *, image_paths, prompt):
+                events.append("codex")
+                job_id = int(re.search(r"import_job_id=(\d+)", prompt).group(1))
+                return CodexRunResult(json.dumps({
+                    "version": 1,
+                    "import_job_id": job_id,
+                    "question_count": 1,
+                    "questions": [{
+                        "question_no": 1,
+                        "regions": [{
+                            "page_number": 1,
+                            "bbox_normalized": [0.05, 0.05, 0.95, 0.95],
+                        }],
+                        "warnings": [],
+                        "confidence": 0.9,
+                    }],
+                }), "auto-confirm-run")
+
+        def render_worker(claim):
+            events.append("render")
+            return run_claimed_render(claim)
+
+        def split_worker(claim):
+            events.append("split")
+            return run_claimed_split(claim)
+
+        self.client.close()
+        self.client = TestClient(create_app(
+            self.database_path,
+            self.private_root,
+            split_runner=SplitRunner(),
+            auto_submit=queued.append,
+            render_worker=render_worker,
+            split_worker=split_worker,
+        ))
+        _, token = self.preview_pdf(filename="自动流水线.pdf", page_count=1)
+
+        response = self.client.post(
+            f"/imports/{token}/confirm",
+            data=self.confirm_values(),
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, response.status_code)
+        self.assertRegex(response.headers["location"], r"\A/imports/\d+/split\Z")
+        self.assertEqual([], events, "确认请求不应等待后台 runner")
+        self.assertEqual(1, len(queued))
+        job_id = int(response.headers["location"].split("/")[2])
+        waiting = self.client.get(response.headers["location"])
+        self.assertEqual(200, waiting.status_code)
+        self.assertIn("后台自动处理", waiting.text)
+        self.assertIn("页面处理中", waiting.text)
+
+        queued.pop()()
+
+        self.assertEqual(["render", "split", "codex"], events)
+        completed = self.client.get(f"/imports/{job_id}/split")
+        self.assertEqual(200, completed.status_code)
+        self.assertIn("共切分 1 题", completed.text)
+        with sqlite3.connect(self.database_path) as connection:
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM questions"
+            ).fetchone()[0])
+
+    def test_automatic_render_failure_never_calls_split_and_is_retryable(self):
+        queued = []
+        split_calls = []
+
+        def fail_render(claim):
+            job_id = claim.job_id
+            claim.close()
+            with sqlite3.connect(self.database_path) as connection:
+                connection.execute(
+                    """UPDATE import_page_render_runs
+                       SET status='failed', error_message='页面处理失败，请重试'
+                       WHERE import_job_id=?""",
+                    (job_id,),
+                )
+            return None
+
+        self.client.close()
+        self.client = TestClient(create_app(
+            self.database_path,
+            self.private_root,
+            split_runner=object(),
+            auto_submit=queued.append,
+            render_worker=fail_render,
+            split_worker=lambda claim: split_calls.append(claim),
+        ))
+        _, token = self.preview_pdf(filename="渲染失败.pdf", page_count=1)
+        response = self.client.post(
+            f"/imports/{token}/confirm",
+            data=self.confirm_values(),
+            follow_redirects=False,
+        )
+
+        queued.pop()()
+
+        self.assertEqual([], split_calls)
+        failed = self.client.get(response.headers["location"])
+        self.assertEqual(200, failed.status_code)
+        self.assertIn("页面处理失败，请重试", failed.text)
+        self.assertIn("重试页面处理", failed.text)
+        with sqlite3.connect(self.database_path) as connection:
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM import_question_split_runs"
+            ).fetchone()[0])
+
+    def test_missing_codex_after_render_has_safe_failed_state(self):
+        queued = []
+
+        class MissingCodexRunner:
+            def run(inner_self, *, image_paths, prompt):
+                raise FileNotFoundError(
+                    f"Codex executable is missing under {self.root}"
+                )
+
+        self.client.close()
+        self.client = TestClient(create_app(
+            self.database_path,
+            self.private_root,
+            split_runner=MissingCodexRunner(),
+            auto_submit=queued.append,
+        ))
+        _, token = self.preview_pdf(filename="缺少Codex.pdf", page_count=1)
+        response = self.client.post(
+            f"/imports/{token}/confirm",
+            data=self.confirm_values(),
+            follow_redirects=False,
+        )
+
+        queued.pop()()
+
+        failed = self.client.get(response.headers["location"])
+        self.assertEqual(200, failed.status_code)
+        self.assertIn("自动切题失败", failed.text)
+        self.assertIn("可手动重试 Codex 自动切题", failed.text)
+        self.assertNotIn(str(self.root), failed.text)
+        with sqlite3.connect(self.database_path) as connection:
+            split_status, error_message = connection.execute(
+                """SELECT status,error_message FROM import_question_split_runs
+                   WHERE import_job_id=(
+                       SELECT import_job_id FROM import_upload_receipts WHERE token=?
+                   )""",
+                (token,),
+            ).fetchone()
+        self.assertEqual("failed", split_status)
+        self.assertEqual("Codex 自动切题失败，请重试", error_message)
+
+    def test_claim_stage_missing_codex_is_failed_and_manually_retryable(self):
+        queued = []
+        self.client.close()
+        self.client = TestClient(create_app(
+            self.database_path,
+            self.private_root,
+            auto_submit=queued.append,
+        ))
+        _, token = self.preview_pdf(filename="领取阶段缺少Codex.pdf", page_count=1)
+        response = self.client.post(
+            f"/imports/{token}/confirm",
+            data=self.confirm_values(),
+            follow_redirects=False,
+        )
+        job_id = int(response.headers["location"].split("/")[2])
+
+        with patch(
+            "src.processing.question_splitter._resolve_codex_bin",
+            side_effect=CodexExecutionError(SAFE_CODEX_MISSING),
+        ):
+            queued.pop()()
+
+        failed = self.client.get(f"/imports/{job_id}/split")
+        self.assertEqual(200, failed.status_code)
+        self.assertIn(SAFE_CODEX_MISSING, failed.text)
+        self.assertIn("重试调用 Codex 自动切题", failed.text)
+        self.assertNotIn("即将开始", failed.text)
+        self.assertNotIn('http-equiv="refresh"', failed.text)
+        self.assertNotIn(str(self.root), failed.text)
+        with sqlite3.connect(self.database_path) as connection:
+            split_run = connection.execute(
+                """SELECT status,error_message FROM import_question_split_runs
+                   WHERE import_job_id=?""",
+                (job_id,),
+            ).fetchone()
+            question_count = connection.execute(
+                "SELECT COUNT(*) FROM questions"
+            ).fetchone()[0]
+        self.assertEqual(("failed", SAFE_CODEX_MISSING), split_run)
+        self.assertEqual(0, question_count)
+
     def test_concurrent_confirm_requests_create_at_most_one_job(self):
         _, token = self.preview_pdf(filename="并发确认.pdf", page_count=2)
         csrf = self.client.cookies.get("basket_csrf")
@@ -405,6 +644,8 @@ class UploadConfirmationWebTests(unittest.TestCase):
         barrier = threading.Barrier(2)
         responses = []
         errors = []
+        queued = []
+        runner = OneQuestionSplitRunner()
         from src.importing.upload_confirmation import validate_import_metadata as real_validate
 
         def synchronized_validate(form, page_count):
@@ -415,7 +656,12 @@ class UploadConfirmationWebTests(unittest.TestCase):
         def confirm():
             try:
                 with TestClient(
-                    create_app(self.database_path, self.private_root)
+                    create_app(
+                        self.database_path,
+                        self.private_root,
+                        split_runner=runner,
+                        auto_submit=queued.append,
+                    )
                 ) as client:
                     client.cookies.set("basket_csrf", csrf)
                     responses.append(
@@ -440,6 +686,9 @@ class UploadConfirmationWebTests(unittest.TestCase):
         self.assertEqual(2, len(responses))
         self.assertTrue(all(response.status_code in (303, 409) for response in responses))
         self.assertEqual((1, 1), self.database_counts())
+        for callback in queued:
+            callback()
+        self.assertEqual(1, len(runner.calls))
 
     def test_retry_after_commit_before_staging_cleanup_is_idempotent(self):
         _, token = self.preview_pdf(filename="提交后重试.pdf", page_count=1)
@@ -463,6 +712,34 @@ class UploadConfirmationWebTests(unittest.TestCase):
         self.assertEqual(303, second.status_code)
         self.assertEqual((1, 1), self.database_counts())
 
+    def test_repeat_confirm_after_staging_cleanup_redirects_same_job_once(self):
+        queued = []
+        runner = OneQuestionSplitRunner()
+        self.client.close()
+        self.client = TestClient(create_app(
+            self.database_path,
+            self.private_root,
+            split_runner=runner,
+            auto_submit=queued.append,
+        ))
+        _, token = self.preview_pdf(filename="清理后重复确认.pdf", page_count=1)
+        values = self.confirm_values()
+
+        first = self.client.post(
+            f"/imports/{token}/confirm", data=values, follow_redirects=False
+        )
+        second = self.client.post(
+            f"/imports/{token}/confirm", data=values, follow_redirects=False
+        )
+
+        self.assertEqual(303, first.status_code)
+        self.assertEqual(303, second.status_code)
+        self.assertEqual(first.headers["location"], second.headers["location"])
+        self.assertEqual((1, 1), self.database_counts())
+        for callback in queued:
+            callback()
+        self.assertEqual(1, len(runner.calls))
+
     def test_confirm_cancel_race_has_only_one_successful_operation(self):
         _, token = self.preview_pdf(filename="确认取消竞争.pdf", page_count=1)
         csrf = self.client.cookies.get("basket_csrf")
@@ -480,7 +757,11 @@ class UploadConfirmationWebTests(unittest.TestCase):
 
         def confirm():
             try:
-                with TestClient(create_app(self.database_path, self.private_root)) as client:
+                with TestClient(create_app(
+                    self.database_path,
+                    self.private_root,
+                    auto_submit=lambda callback: None,
+                )) as client:
                     client.cookies.set("basket_csrf", csrf)
                     responses["confirm"] = client.post(
                         f"/imports/{token}/confirm",
@@ -500,7 +781,11 @@ class UploadConfirmationWebTests(unittest.TestCase):
         def cancel():
             try:
                 self.assertTrue(committed.wait(timeout=5))
-                with TestClient(create_app(self.database_path, self.private_root)) as client:
+                with TestClient(create_app(
+                    self.database_path,
+                    self.private_root,
+                    auto_submit=lambda callback: None,
+                )) as client:
                     client.cookies.set("basket_csrf", csrf)
                     responses["cancel"] = client.post(
                         f"/imports/{token}/cancel",
@@ -618,6 +903,445 @@ class UploadConfirmationWebTests(unittest.TestCase):
         self.assertEqual((0, 0), self.database_counts())
         self.assertTrue((self.private_root / "pending_uploads" / token).is_dir())
 
+
+class AutomaticImportRestartRecoveryTests(unittest.TestCase):
+    """Recover only persisted, user-authorized render-to-split work."""
+
+    @staticmethod
+    def pdf_bytes():
+        document = pymupdf.open()
+        document.new_page(width=72, height=72)
+        content = document.tobytes()
+        document.close()
+        return content
+
+    def confirm_one_import(self, database_path, private_root):
+        queued = []
+        client = TestClient(create_app(
+            database_path,
+            private_root,
+            auto_submit=queued.append,
+        ))
+        client.get("/imports/new")
+        csrf = client.cookies.get("basket_csrf")
+        preview = client.post(
+            "/imports/preview",
+            data={"csrf_token": csrf},
+            files={"pdf_file": ("restart.pdf", self.pdf_bytes(), "application/pdf")},
+        )
+        token = re.search(r"/imports/([0-9a-f]{64})/confirm", preview.text).group(1)
+        response = client.post(
+            f"/imports/{token}/confirm",
+            data={
+                "csrf_token": csrf,
+                "paper_name": "服务重启恢复测试",
+                "region_code": "TJ",
+                "exam_year": "2026",
+                "exam_type_code": "YK",
+                "page_range": "1",
+            },
+            follow_redirects=False,
+        )
+        client.close()
+        self.assertEqual(303, response.status_code)
+        self.assertEqual(1, len(queued), "确认提交本身只应提交自动流水线")
+        return int(response.headers["location"].split("/")[2])
+
+    def test_startup_recovers_all_four_crash_windows_with_one_coordinator(self):
+        for crash_window in (
+            "after_confirmation",
+            "during_render",
+            "between_render_and_split",
+            "during_split",
+        ):
+            with self.subTest(crash_window=crash_window), tempfile.TemporaryDirectory() as root:
+                root = Path(root)
+                database_path = root / "question-bank.db"
+                private_root = root / "private"
+                initialize_database(database_path).close()
+                job_id = self.confirm_one_import(database_path, private_root)
+
+                if crash_window != "after_confirmation":
+                    render_claim = claim_render_job(database_path, private_root, job_id)
+                    self.assertIsNotNone(render_claim)
+                    if crash_window == "during_render":
+                        render_claim.close()
+                    else:
+                        self.assertIsNotNone(run_claimed_render(render_claim))
+                        if crash_window == "during_split":
+                            split_claim = claim_split_job(
+                                database_path,
+                                private_root,
+                                job_id,
+                                runner=OneQuestionSplitRunner(),
+                            )
+                            self.assertIsNotNone(split_claim)
+                            split_claim.close()
+
+                startup_callbacks = []
+                runner = OneQuestionSplitRunner()
+                with TestClient(create_app(
+                    database_path,
+                    private_root,
+                    auto_submit=startup_callbacks.append,
+                    split_runner=runner,
+                )) as restarted:
+                    self.assertEqual(200, restarted.get("/health").status_code)
+                    self.assertEqual(
+                        1,
+                        len(startup_callbacks),
+                        "startup 必须只提交一个串行恢复协调器",
+                    )
+                    coordinator = startup_callbacks[0]
+                    coordinator()
+                    coordinator()
+
+                with sqlite3.connect(database_path) as connection:
+                    statuses = connection.execute(
+                        """SELECT r.status,s.status
+                           FROM import_page_render_runs r
+                           JOIN import_question_split_runs s
+                             ON s.import_job_id=r.import_job_id
+                           WHERE r.import_job_id=?""",
+                        (job_id,),
+                    ).fetchone()
+                self.assertEqual(("completed", "completed"), statuses)
+                self.assertEqual(1, len(runner.calls))
+
+    def test_stale_processing_claim_initialization_failure_becomes_failed(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            database_path = root / "question-bank.db"
+            private_root = root / "private"
+            initialize_database(database_path).close()
+            job_id = self.confirm_one_import(database_path, private_root)
+            self.assertIsNotNone(run_claimed_render(
+                claim_render_job(database_path, private_root, job_id)
+            ))
+            stale_claim = claim_split_job(
+                database_path,
+                private_root,
+                job_id,
+                runner=OneQuestionSplitRunner(),
+            )
+            stale_claim.close()
+
+            with patch(
+                "src.processing.question_splitter._resolve_codex_bin",
+                side_effect=CodexExecutionError(SAFE_CODEX_MISSING),
+            ):
+                outcome = run_automatic_import(database_path, private_root, job_id)
+
+            self.assertEqual(AutomaticImportOutcome.FAILED, outcome)
+            with sqlite3.connect(database_path) as connection:
+                self.assertEqual(("failed", SAFE_CODEX_MISSING), connection.execute(
+                    """SELECT status,error_message FROM import_question_split_runs
+                       WHERE import_job_id=?""",
+                    (job_id,),
+                ).fetchone())
+
+    def test_busy_global_render_lock_is_rescanned_without_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            database_path = root / "question-bank.db"
+            private_root = root / "private"
+            initialize_database(database_path).close()
+            blocker_id = self.confirm_one_import(database_path, private_root)
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    "DELETE FROM import_upload_receipts WHERE import_job_id=?",
+                    (blocker_id,),
+                )
+            blocker = claim_render_job(database_path, private_root, blocker_id)
+            remaining_ids = [
+                self.confirm_one_import(database_path, private_root)
+                for _ in range(2)
+            ]
+            runner = OneQuestionSplitRunner()
+            sleep_calls = []
+
+            self.assertEqual(
+                AutomaticImportOutcome.BUSY,
+                run_automatic_import(
+                    database_path, private_root, remaining_ids[0], split_runner=runner
+                ),
+            )
+
+            def release_after_first_busy(delay):
+                sleep_calls.append(delay)
+                blocker.close()
+
+            resume_interrupted_automatic_imports(
+                database_path,
+                private_root,
+                split_runner=runner,
+                sleep=release_after_first_busy,
+                backoff_seconds=0.25,
+                max_rounds=3,
+            )
+
+            self.assertEqual([0.25], sleep_calls)
+            with sqlite3.connect(database_path) as connection:
+                statuses = connection.execute(
+                    """SELECT r.import_job_id,r.status,s.status
+                       FROM import_page_render_runs r
+                       JOIN import_question_split_runs s
+                         ON s.import_job_id=r.import_job_id
+                       WHERE r.import_job_id IN (?,?) ORDER BY r.import_job_id""",
+                    remaining_ids,
+                ).fetchall()
+            self.assertEqual(
+                [(job_id, "completed", "completed") for job_id in remaining_ids],
+                statuses,
+            )
+            self.assertEqual(2, len(runner.calls))
+
+    def test_recovery_busy_backoff_does_not_spin(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            database_path = root / "question-bank.db"
+            selected = self.make_selection_database(database_path)
+            calls = []
+            sleeps = []
+
+            def always_busy(_database, _private, job_id, **_kwargs):
+                calls.append(job_id)
+                return AutomaticImportOutcome.BUSY
+
+            resume_interrupted_automatic_imports(
+                database_path,
+                root / "private",
+                automatic_import_runner=always_busy,
+                sleep=sleeps.append,
+                backoff_seconds=2.0,
+                max_rounds=3,
+            )
+
+            self.assertEqual(selected * 3, calls)
+            self.assertEqual([2.0, 2.0], sleeps)
+
+    def test_active_job_completion_during_backoff_is_not_repeated(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            database_path = root / "question-bank.db"
+            selected = self.make_selection_database(database_path)
+            active_id = selected[-1]
+            calls = []
+            sleeps = []
+
+            def active_then_completed(_database, _private, job_id, **_kwargs):
+                calls.append(job_id)
+                if job_id != active_id:
+                    return AutomaticImportOutcome.NOOP
+                with sqlite3.connect(database_path) as connection:
+                    connection.execute(
+                        """UPDATE import_question_split_runs
+                           SET status='completed',question_count=1,processed_pages=1,
+                               codex_run_id='active-worker',result_manifest_sha256=?,
+                               render_manifest_sha256=?,source_pdf_sha256=?,
+                               crop_manifest_sha256=?,crop_generation_id=?,
+                               crop_manifest_signature=?,completed_at=CURRENT_TIMESTAMP
+                           WHERE import_job_id=?""",
+                        (
+                            "c" * 64, "a" * 64, "b" * 64,
+                            "d" * 64, "e" * 32, "f" * 64, job_id,
+                        ),
+                    )
+                return AutomaticImportOutcome.BUSY
+
+            resume_interrupted_automatic_imports(
+                database_path,
+                root / "private",
+                automatic_import_runner=active_then_completed,
+                sleep=sleeps.append,
+                backoff_seconds=1.0,
+                max_rounds=3,
+            )
+
+            self.assertEqual(1, calls.count(active_id))
+            self.assertEqual([], sleeps)
+
+    @staticmethod
+    def add_job(connection, source_id, *, receipt=True, import_status="pending"):
+        job_id = connection.execute(
+            """INSERT INTO import_jobs
+               (source_paper_id,page_start,page_end,status) VALUES (?,1,1,?)""",
+            (source_id, import_status),
+        ).lastrowid
+        if receipt:
+            connection.execute(
+                """INSERT INTO import_upload_receipts
+                   (token,source_paper_id,import_job_id) VALUES (?,?,?)""",
+                (f"receipt-{job_id}", source_id, job_id),
+            )
+        return job_id
+
+    @staticmethod
+    def add_render(connection, job_id, status):
+        values = (
+            ("a" * 64, 10, "batch", "b" * 64)
+            if status == "completed" else (None, None, None, None)
+        )
+        connection.execute(
+            """INSERT INTO import_page_render_runs
+               (import_job_id,status,dpi,total_pages,rendered_pages,
+                manifest_sha256,manifest_byte_size,published_batch_id,source_pdf_sha256)
+               VALUES (?,?,300,1,?,?,?,?,?)""",
+            (job_id, status, 1 if status == "completed" else 0, *values),
+        )
+
+    @staticmethod
+    def add_split(connection, job_id, status):
+        if status == "completed":
+            connection.execute(
+                """INSERT INTO import_question_split_runs
+                   (import_job_id,status,question_count,processed_pages,codex_run_id,
+                    result_manifest_sha256,render_manifest_sha256,source_pdf_sha256,
+                    crop_manifest_sha256,crop_generation_id,crop_manifest_signature,
+                    completed_at)
+                   VALUES (?,'completed',1,1,'run',?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                (job_id, "c" * 64, "a" * 64, "b" * 64, "d" * 64, "e" * 32, "f" * 64),
+            )
+        else:
+            connection.execute(
+                """INSERT INTO import_question_split_runs
+                   (import_job_id,status,processed_pages) VALUES (?,?,0)""",
+                (job_id, status),
+            )
+
+    def make_selection_database(self, database_path):
+        initialize_database(database_path).close()
+        with sqlite3.connect(database_path) as connection:
+            source_id = connection.execute(
+                """INSERT INTO source_papers
+                   (sha256,file_size,original_filename,stored_path,region_code,
+                    exam_year,exam_type_code,paper_name)
+                   VALUES (?,1,'scan.pdf','raw_papers/TJ/scan.pdf','TJ',2026,'YK','scan')""",
+                ("0" * 64,),
+            ).lastrowid
+            selected = []
+            selected.append(self.add_job(connection, source_id))
+            job_id = self.add_job(connection, source_id)
+            self.add_render(connection, job_id, "processing")
+            selected.append(job_id)
+            for split_status in (None, "pending", "processing"):
+                job_id = self.add_job(connection, source_id)
+                self.add_render(connection, job_id, "completed")
+                if split_status is not None:
+                    self.add_split(connection, job_id, split_status)
+                selected.append(job_id)
+
+            self.add_job(connection, source_id, receipt=False)
+            job_id = self.add_job(connection, source_id)
+            self.add_render(connection, job_id, "failed")
+            for split_status in ("failed", "completed"):
+                job_id = self.add_job(connection, source_id)
+                self.add_render(connection, job_id, "completed")
+                self.add_split(connection, job_id, split_status)
+            for split_status in ("failed", "completed"):
+                job_id = self.add_job(connection, source_id)
+                self.add_render(connection, job_id, "processing")
+                self.add_split(connection, job_id, split_status)
+            self.add_job(connection, source_id, import_status="needs_review")
+            job_id = self.add_job(connection, source_id, import_status="completed")
+            self.add_render(connection, job_id, "processing")
+        return selected
+
+    def test_startup_selection_is_receipt_gated_and_serial_in_stable_id_order(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            database_path = root / "question-bank.db"
+            expected = self.make_selection_database(database_path)
+            callbacks = []
+            events = []
+            active = 0
+            maximum_active = 0
+
+            def fake_automatic_import(_database, _private, job_id, **_kwargs):
+                nonlocal active, maximum_active
+                active += 1
+                maximum_active = max(maximum_active, active)
+                events.append(job_id)
+                active -= 1
+
+            with TestClient(create_app(
+                database_path,
+                root / "private",
+                auto_submit=callbacks.append,
+                automatic_import_runner=fake_automatic_import,
+            )) as client:
+                self.assertEqual(200, client.get("/health").status_code)
+                self.assertEqual(1, len(callbacks))
+                callbacks[0]()
+
+            self.assertEqual(expected, events)
+            self.assertEqual(1, maximum_active)
+
+    def test_recovery_errors_are_contained_and_do_not_block_startup_or_leak_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            database_path = root / "question-bank.db"
+            selected = self.make_selection_database(database_path)[:2]
+            callbacks = []
+            calls = []
+
+            def failing_runner(_database, private_root, job_id, **_kwargs):
+                calls.append(job_id)
+                with sqlite3.connect(database_path) as connection:
+                    connection.execute(
+                        "UPDATE import_jobs SET status='failed' WHERE id=?",
+                        (job_id,),
+                    )
+                raise OSError(f"private failure at {private_root}")
+
+            with TestClient(create_app(
+                database_path,
+                root / "private-secret",
+                auto_submit=callbacks.append,
+                automatic_import_runner=failing_runner,
+            )) as client:
+                response = client.get("/health")
+                self.assertEqual(200, response.status_code)
+                self.assertNotIn(str(root), response.text)
+                callbacks[0]()
+                self.assertEqual(200, client.get("/health").status_code)
+
+            self.assertEqual(selected, calls[:2])
+
+            with patch(
+                "src.pipeline.automatic_import.sqlite3.connect",
+                side_effect=sqlite3.OperationalError(f"database at {root}"),
+            ):
+                callbacks[0]()
+
+    def test_production_startup_migrates_before_submitting_recovery(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            database_path = root / "question-bank.db"
+            initialize_database(database_path).close()
+            with sqlite3.connect(database_path) as connection:
+                connection.execute("DROP TABLE import_upload_receipts")
+            callbacks = []
+
+            with TestClient(create_app(
+                database_path,
+                root / "private",
+                auto_submit=callbacks.append,
+                automatic_import_runner=lambda *_args, **_kwargs: None,
+                _initialize_schema=False,
+            )) as client:
+                self.assertEqual(200, client.get("/health").status_code)
+                self.assertEqual(1, len(callbacks))
+                callbacks[0]()
+
+            with sqlite3.connect(database_path) as connection:
+                table = connection.execute(
+                    """SELECT name FROM sqlite_master
+                       WHERE type='table' AND name='import_upload_receipts'"""
+                ).fetchone()
+            self.assertEqual(("import_upload_receipts",), table)
+
+class UploadConfirmationWebTests(UploadConfirmationWebTestCases, unittest.TestCase):
     def test_invalid_tokens_tampering_and_repeated_confirm_are_safe(self):
         csrf = self.csrf()
         for token in ("not-a-token", "a" * 63, "g" * 64):
@@ -683,7 +1407,8 @@ class UploadConfirmationWebTests(unittest.TestCase):
             f"/imports/{repeated_token}/confirm", data=confirm_data, follow_redirects=False
         )
         self.assertEqual(303, first.status_code)
-        self.assertEqual(400, second.status_code)
+        self.assertEqual(303, second.status_code)
+        self.assertEqual(first.headers["location"], second.headers["location"])
         self.assertEqual((1, 1), self.database_counts())
 
     def test_invalid_metadata_keeps_confirmation_recoverable_without_import(self):

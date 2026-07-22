@@ -53,14 +53,6 @@ SAFE_SPLIT_ERROR = "Codex 自动切题失败，请重试"
 SAFE_CODEX_MISSING = "未配置 Codex：请设置 CODEX_BIN 或安装 Codex CLI"
 SAFE_RENDER_REQUIRED = "页面处理完成后才能调用 Codex 自动切题"
 SAFE_EXISTING_ERROR = "现有切题结果校验失败，请点击重试"
-SAFE_WEEKLY_LOW = "Codex weekly剩余低于30%，已停止新的自动切题任务"
-SAFE_WEEKLY_UNAVAILABLE = (
-    "无法读取精确的 Codex weekly 额度，已停止新的自动切题任务；"
-    "请在 Codex 中运行 /status 检查后重试"
-)
-WEEKLY_WINDOW_MINUTES = 10_080
-MIN_WEEKLY_REMAINING_PERCENT = 30.0
-MAX_SESSION_EVENT_BYTES = 4 * 1024 * 1024
 
 LOGGER = logging.getLogger(__name__)
 
@@ -317,88 +309,6 @@ def _bounded_communicate(process, timeout, stdout_limit, stderr_limit):
 
 def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def _event_timestamp(value):
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(timezone.utc)
-
-
-def read_codex_weekly_remaining(sessions_root=None):
-    """Return remaining seven-day Codex percentage from the newest valid event."""
-    root = Path(sessions_root) if sessions_root is not None else Path.home() / ".codex/sessions"
-    if not root.is_dir():
-        return None
-    newest = None
-    sequence = 0
-    for path in root.rglob("*.jsonl"):
-        descriptor = None
-        try:
-            descriptor = os.open(
-                path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
-            details = os.fstat(descriptor)
-            if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
-                continue
-            with os.fdopen(descriptor, "rb") as stream:
-                descriptor = None
-                while True:
-                    raw = stream.readline(MAX_SESSION_EVENT_BYTES + 1)
-                    if not raw:
-                        break
-                    if len(raw) > MAX_SESSION_EVENT_BYTES:
-                        while raw and not raw.endswith(b"\n"):
-                            raw = stream.readline(MAX_SESSION_EVENT_BYTES + 1)
-                        continue
-                    try:
-                        event = json.loads(raw)
-                    except (UnicodeError, json.JSONDecodeError):
-                        continue
-                    payload = event.get("payload") if isinstance(event, dict) else None
-                    if not isinstance(payload, dict) or payload.get("type") != "token_count":
-                        continue
-                    limits = payload.get("rate_limits")
-                    timestamp = _event_timestamp(event.get("timestamp"))
-                    if not isinstance(limits, dict) or timestamp is None:
-                        continue
-                    for window in limits.values():
-                        if (
-                            not isinstance(window, dict)
-                            or window.get("window_minutes") != WEEKLY_WINDOW_MINUTES
-                        ):
-                            continue
-                        used = window.get("used_percent")
-                        if not _number(used) or not 0 <= used <= 100:
-                            continue
-                        sequence += 1
-                        candidate = (timestamp, sequence, 100.0 - float(used))
-                        if newest is None or candidate[:2] > newest[:2]:
-                            newest = candidate
-        except OSError:
-            continue
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-    return newest[2] if newest is not None else None
-
-
-def _require_weekly_capacity(checker):
-    try:
-        remaining = (checker or read_codex_weekly_remaining)()
-    except Exception:
-        raise QuestionSplitError(SAFE_WEEKLY_UNAVAILABLE) from None
-    if not _number(remaining) or not 0 <= remaining <= 100:
-        raise QuestionSplitError(SAFE_WEEKLY_UNAVAILABLE)
-    if remaining < MIN_WEEKLY_REMAINING_PERCENT:
-        raise QuestionSplitError(SAFE_WEEKLY_LOW)
 
 
 def parse_codex_question_plan(raw, job_id, page_sizes):
@@ -788,9 +698,68 @@ def read_completed_split_image(
                 os.close(descriptor)
 
 
-def claim_split_job(
-    database_path, private_root, job_id, runner=None, weekly_checker=None
-):
+def record_split_claim_failure(database_path, private_root, job_id, error):
+    """Fail an inactive split claim while proving no worker owns its locks."""
+    if type(job_id) is not int or job_id < 1:
+        return False
+    message = str(error)
+    if message not in {SAFE_CODEX_MISSING, SAFE_SPLIT_ERROR}:
+        message = SAFE_SPLIT_ERROR
+    global_stream = job_stream = None
+    try:
+        global_stream, job_stream = _prepare_locks(Path(private_root), job_id)
+        try:
+            fcntl.flock(global_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(job_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        now = _now()
+        with closing(sqlite3.connect(Path(database_path), timeout=10)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                """SELECT j.status,r.status,s.status
+                   FROM import_jobs j
+                   LEFT JOIN import_page_render_runs r ON r.import_job_id=j.id
+                   LEFT JOIN import_question_split_runs s ON s.import_job_id=j.id
+                   WHERE j.id=?""",
+                (job_id,),
+            ).fetchone()
+            if (
+                current is None or current[0] != "pending"
+                or current[1] != "completed" or current[2] == "completed"
+            ):
+                connection.rollback()
+                return False
+            connection.execute(
+                """INSERT INTO import_question_split_runs
+                   (import_job_id,status,processed_pages,error_message,updated_at)
+                   VALUES (?,'failed',0,?,?)
+                   ON CONFLICT(import_job_id) DO UPDATE SET
+                     status='failed',error_message=excluded.error_message,
+                     updated_at=excluded.updated_at
+                   WHERE import_question_split_runs.status
+                         IN ('pending','processing','failed')""",
+                (job_id, message, now),
+            )
+            connection.commit()
+            return True
+    except (OSError, sqlite3.Error):
+        return False
+    finally:
+        for stream in (job_stream, global_stream):
+            if stream is None:
+                continue
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def claim_split_job(database_path, private_root, job_id, runner=None):
     if type(job_id) is not int or job_id < 1:
         raise QuestionSplitError("切题任务参数无效")
     database_path, private_root = Path(database_path), Path(private_root)
@@ -857,7 +826,6 @@ def claim_split_job(
                         stream.close()
                 return None
             connection.rollback()
-            _require_weekly_capacity(weekly_checker)
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
                 """SELECT j.status,r.status,s.status,s.question_count,

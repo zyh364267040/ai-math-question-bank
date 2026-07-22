@@ -20,7 +20,6 @@ from src.reviewing.candidate_auditor import (
     SAFE_EXISTING_ERROR,
     SAFE_EXISTING_UNANCHORED,
     SAFE_INPUT_INVALID,
-    SAFE_WEEKLY_LOW,
     CandidateAuditError,
     CandidateAuditCodexCliRunner,
     CandidateAuditRunResult,
@@ -108,7 +107,6 @@ class CandidateAuditorTests(unittest.TestCase):
         extraction = FakeExtractionRunner(self.candidate)
         run_claimed_candidate_extraction(claim_candidate_extraction(
             self.database, self.private, self.job_id, runner=extraction,
-            weekly_checker=lambda: 100.0,
         ))
         self.audit = self._audit_payload()
         self.runner = FakeRunner(self.audit)
@@ -282,7 +280,6 @@ class CandidateAuditorTests(unittest.TestCase):
     def test_full_success_anchors_inputs_and_creates_no_business_rows(self):
         result = run_claimed_candidate_audit(claim_candidate_audit(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 30.0,
         ))
         self.assertEqual(23, result["counts"]["auto_pass"])
         self.assertEqual(1, len(self.runner.calls))
@@ -305,46 +302,20 @@ class CandidateAuditorTests(unittest.TestCase):
             self.assertEqual(0, connection.execute("SELECT count(*) FROM questions").fetchone()[0])
             self.assertEqual(0, connection.execute("SELECT count(*) FROM candidate_review_drafts").fetchone()[0])
 
-    def test_weekly_gate_is_outside_write_transaction_and_low_is_zero_call(self):
-        observed = []
-
-        def checker():
-            with sqlite3.connect(self.database, timeout=0.1) as other:
-                other.execute("BEGIN IMMEDIATE")
-                observed.append(True)
-                other.rollback()
-            return 29.9
-
-        with self.assertRaisesRegex(CandidateAuditError, SAFE_WEEKLY_LOW):
-            claim_candidate_audit(
-                self.database, self.private, self.job_id, runner=self.runner,
-                weekly_checker=checker,
-            )
-        self.assertEqual([True], observed)
-        self.assertEqual([], self.runner.calls)
-        with sqlite3.connect(self.database) as connection:
-            self.assertEqual(0, connection.execute(
-                "SELECT count(*) FROM import_candidate_audit_runs"
-            ).fetchone()[0])
-
     def test_lock_deduplicates_stale_resumes_and_completed_is_zero_call(self):
         first = claim_candidate_audit(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         )
         self.assertIsNone(claim_candidate_audit(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         ))
         first.close()
         resumed = claim_candidate_audit(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         )
         run_claimed_candidate_audit(resumed)
         self.assertIsNone(claim_candidate_audit(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: (_ for _ in ()).throw(AssertionError("gate called")),
         ))
         self.assertEqual(1, len(self.runner.calls))
 
@@ -354,7 +325,6 @@ class CandidateAuditorTests(unittest.TestCase):
         with self.assertRaises(CandidateAuditError):
             claim_candidate_audit(
                 self.database, self.private, self.job_id, runner=self.runner,
-                weekly_checker=lambda: 100.0,
             )
         self.assertEqual([], self.runner.calls)
 
@@ -366,7 +336,6 @@ class CandidateAuditorTests(unittest.TestCase):
         with self.assertRaises(CandidateAuditError):
             claim_candidate_audit(
                 self.database, self.private, self.job_id, runner=self.runner,
-                weekly_checker=lambda: 100.0,
             )
         self.assertEqual([], self.runner.calls)
 
@@ -376,7 +345,6 @@ class CandidateAuditorTests(unittest.TestCase):
         with self.assertRaises(CandidateAuditError):
             claim_candidate_audit(
                 self.database, self.private, self.job_id, runner=self.runner,
-                weekly_checker=lambda: 100.0,
             )
         self.assertEqual([], self.runner.calls)
 
@@ -386,14 +354,12 @@ class CandidateAuditorTests(unittest.TestCase):
         with self.assertRaises(CandidateAuditError):
             claim_candidate_audit(
                 self.database, self.private, self.job_id, runner=self.runner,
-                weekly_checker=lambda: 100.0,
             )
         self.assertEqual([], self.runner.calls)
 
     def test_changed_but_reanchored_candidate_never_reuses_completed_audit(self):
         run_claimed_candidate_audit(claim_candidate_audit(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         ))
         candidate_path = self.job_dir / "candidate_questions.json"
         candidate = json.loads(candidate_path.read_text())
@@ -408,7 +374,6 @@ class CandidateAuditorTests(unittest.TestCase):
             )
         claim = claim_candidate_audit(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         )
         self.assertIsNotNone(claim)
         run_claimed_candidate_audit(claim)
@@ -425,7 +390,6 @@ class CandidateAuditorTests(unittest.TestCase):
             )
         claim = claim_candidate_audit(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         )
         with mock.patch(
             "src.reviewing.candidate_auditor._database_input_from_connection",
@@ -440,7 +404,6 @@ class CandidateAuditorTests(unittest.TestCase):
         with self.assertRaisesRegex(CandidateAuditError, SAFE_EXISTING_UNANCHORED):
             claim_candidate_audit(
                 self.database, self.private, self.job_id, runner=self.runner,
-                weekly_checker=lambda: 100.0,
             )
         adopt_existing_candidate_audit(self.database, self.private, self.job_id)
         with sqlite3.connect(self.database) as connection:
@@ -451,7 +414,6 @@ class CandidateAuditorTests(unittest.TestCase):
         bad = FakeRunner({"bad": True}, "bad-run")
         self.assertIsNone(run_claimed_candidate_audit(claim_candidate_audit(
             self.database, self.private, self.job_id, runner=bad,
-            weekly_checker=lambda: 100.0,
         )))
         self.assertEqual(previous, (self.job_dir / "ai_audit.json").read_bytes())
         with sqlite3.connect(self.database) as connection:
@@ -476,7 +438,6 @@ class CandidateAuditorTests(unittest.TestCase):
     def _complete_audit_and_seed_drafts(self):
         run_claimed_candidate_audit(claim_candidate_audit(
             self.database, self.private, self.job_id, runner=self.runner,
-            weekly_checker=lambda: 100.0,
         ))
         candidate_path = self.job_dir / "candidate_questions.json"
         digest = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
@@ -636,7 +597,7 @@ class CandidateAuditorTests(unittest.TestCase):
                 edited_sha256=evidence["edited_sha256"],
             )
 
-    def test_corrected_weekly_gate_and_nonpass_never_approve(self):
+    def test_corrected_nonpass_never_approves_and_new_version_can_retry(self):
         from src.reviewing.candidate_review_ai import (
             claim_corrected_draft_audit, run_claimed_corrected_draft_audit,
         )
@@ -657,21 +618,8 @@ class CandidateAuditorTests(unittest.TestCase):
             self._single_audit(edited, confidence="medium", issues=["仍不一致"]),
             run_id="corrected-fresh-run",
         )
-        with self.assertRaisesRegex(CandidateAuditError, SAFE_WEEKLY_LOW):
-            claim_corrected_draft_audit(
-                self.database, self.private, self.job_id, "2", runner=fresh_runner,
-                weekly_checker=lambda: 29.9,
-            )
-        self.assertEqual([], fresh_runner.calls)
-        with self.assertRaises(CandidateAuditError):
-            claim_corrected_draft_audit(
-                self.database, self.private, self.job_id, "2", runner=fresh_runner,
-                weekly_checker=lambda: (_ for _ in ()).throw(OSError("private detail")),
-            )
-        self.assertEqual([], fresh_runner.calls)
         claim = claim_corrected_draft_audit(
             self.database, self.private, self.job_id, "2", runner=fresh_runner,
-            weekly_checker=lambda: 30.0,
         )
         result = run_claimed_corrected_draft_audit(claim)
         self.assertFalse(result.approved)
@@ -687,7 +635,6 @@ class CandidateAuditorTests(unittest.TestCase):
             connection.commit()
         retry = claim_corrected_draft_audit(
             self.database, self.private, self.job_id, "2", runner=fresh_runner,
-            weekly_checker=lambda: 30.0,
         )
         self.assertIsNotNone(
             retry, "旧版本的未通过记录不得阻止新草稿版本重新复审"
@@ -825,7 +772,6 @@ class CandidateAuditorTests(unittest.TestCase):
         ), self.assertRaisesRegex(CandidateAuditError, SAFE_INPUT_INVALID):
             claim_candidate_audit(
                 self.database, self.private, self.job_id, runner=self.runner,
-                weekly_checker=lambda: 100.0,
             )
 
         (self.job_dir / "ai_audit.json").write_text(

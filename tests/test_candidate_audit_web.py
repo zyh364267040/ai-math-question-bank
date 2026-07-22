@@ -99,7 +99,7 @@ class CandidateAuditWebTests(unittest.TestCase):
         }
         run_claimed_candidate_extraction(claim_candidate_extraction(
             self.database, self.private, self.job_id,
-            runner=ExtractionRunner(candidate_payload), weekly_checker=lambda: 100.0,
+            runner=ExtractionRunner(candidate_payload),
         ))
         questions = []
         for candidate in candidates:
@@ -132,7 +132,6 @@ class CandidateAuditWebTests(unittest.TestCase):
         self.runner = AuditRunner(payload)
         self.client = TestClient(create_app(
             self.database, self.private, audit_runner=self.runner,
-            weekly_checker=lambda: 100.0,
         ))
         self.client.get("/imports/new")
         self.csrf = self.client.cookies.get("basket_csrf")

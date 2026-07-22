@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Codex 自动切题 · AI 数学题库{% endblock %}
-{% block head_extra %}{% if run.status == 'processing' %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block head_extra %}{% if run.status in ('pending', 'processing') %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
 {% block content %}
 <section class="page-heading">
   <p class="eyebrow">QUESTION SPLIT</p>
@@ -8,10 +8,21 @@
   <p>来源文件：{{ run.original_filename }}</p>
 </section>
 <section class="paper-card processing-card">
+  <h2>后台自动处理</h2>
   <p><span class="status {{ run.status }}">{{ run.status_name }}</span></p>
   {% if run.status == 'failed' %}<p class="form-error">{{ run.error_message }}</p>{% endif %}
-  {% if run.status in ('pending', 'failed') %}
-    <p><strong>点击后，原卷页面图片会发送给 OpenAI Codex。</strong>GET 浏览本页绝不会启动调用。</p>
+  {% if run.phase == 'render' %}
+    {% if run.status in ('pending', 'processing') %}
+      <p>页面处理中，完成后会自动调用 Codex 切题；本页会自动刷新。</p>
+    {% elif run.status == 'failed' %}
+      <p>渲染失败后不会启动 Codex。可使用下方入口安全重试。</p>
+      <form method="post" action="/imports/{{ run.id }}/render">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="button" type="submit">重试页面处理</button>
+      </form>
+    {% endif %}
+  {% elif run.status in ('pending', 'failed') %}
+    {% if run.status == 'pending' %}<p>页面处理已完成，Codex 切题任务即将开始。</p>{% else %}<p>可手动重试 Codex 自动切题。</p>{% endif %}
     <form method="post" action="/imports/{{ run.id }}/split">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button class="button" type="submit">{% if run.status == 'failed' %}重试调用 Codex 自动切题{% else %}调用 Codex 自动切题{% endif %}</button>

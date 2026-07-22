@@ -219,9 +219,12 @@ class WebAppTests(unittest.TestCase):
     def test_home_has_cards_and_real_statistics(self):
         response = self.client.get("/")
         self.assertEqual(200, response.status_code)
-        for text in ("AI 数学题库", "我的题库", "试卷与审核", "选题篮", "数据与设置"):
+        for text in ("AI 数学题库", "我的题库", "试卷与审核", "选题篮", "导入新试卷"):
             self.assertIn(text, response.text)
-        self.assertGreaterEqual(response.text.count("开发中"), 1)
+        self.assertIn('<a class="feature active" href="/imports/new"><span>04</span>', response.text)
+        self.assertNotIn("数据与设置", response.text)
+        self.assertNotIn("开发中", response.text)
+        self.assertIn("上传 PDF", response.text)
         self.assertIn('href="/basket"', response.text)
         self.assertIn('href="/questions"', response.text)
         for label in ("原始试卷数", "导入任务数", "待审核任务数", "正式题目数"):

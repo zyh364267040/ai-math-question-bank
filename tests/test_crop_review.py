@@ -127,7 +127,6 @@ class CropReviewTests(unittest.TestCase):
         self.assertEqual(images, self.image_state())
         claim = claim_candidate_extraction(
             self.database, self.private, self.job_id, runner=NeverRunner(),
-            weekly_checker=lambda: 100.0,
         )
         self.assertIsNotNone(claim)
         claim.close()
@@ -183,7 +182,6 @@ class CropReviewTests(unittest.TestCase):
         with self.assertRaises(CandidateExtractionError):
             claim_candidate_extraction(
                 self.database, self.private, self.job_id, runner=NeverRunner(),
-                weekly_checker=lambda: 100.0,
             )
 
     def test_identical_payload_is_idempotent_zero_write(self):
@@ -236,7 +234,6 @@ class CropReviewTests(unittest.TestCase):
         with self.assertRaises(CandidateExtractionError):
             claim_candidate_extraction(
                 self.database, self.private, self.job_id, runner=NeverRunner(),
-                weekly_checker=lambda: 100.0,
             )
 
     def test_database_failure_restores_old_manifest_and_old_evidence(self):

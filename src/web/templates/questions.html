@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="page-heading questions-heading"><p class="eyebrow">QUESTION BANK</p><h1>我的题库</h1><p>共 {{ questions|length }} 道符合当前条件的正式题目 · <a href="/questions/deleted">已删除题目</a></p></section>
+<section class="page-heading questions-heading"><p class="eyebrow">QUESTION BANK</p><h1>我的题库</h1><p>共 {{ questions|length }} 道符合当前条件的正式题目 · <a href="/questions/deleted">已删除题目</a></p><a class="button" href="/imports/new">导入新试卷</a></section>
 <form class="question-filters" method="get" action="/questions">
   <label><span>知识点</span><select name="knowledge"><option value="">全部</option>{% for item in filters.knowledge %}<option value="{{ item.code }}" {% if active.knowledge == item.code %}selected{% endif %}>{{ item.name }}</option>{% endfor %}</select></label>
   <label><span>题型</span><select name="question_type"><option value="">全部</option>{% for item in filters.types %}<option value="{{ item.code }}" {% if active.question_type == item.code %}selected{% endif %}>{{ item.name }}</option>{% endfor %}</select></label>

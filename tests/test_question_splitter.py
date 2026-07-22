@@ -5,26 +5,28 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
 from src.database.initialize import initialize_database
 from src.processing.question_splitter import (
+    SAFE_CODEX_MISSING,
+    SAFE_SPLIT_ERROR,
     CodexExecutionError,
     CodexCliRunner,
     CodexRunResult,
     QuestionSplitError,
-    SAFE_WEEKLY_LOW,
-    SAFE_WEEKLY_UNAVAILABLE,
     _codex_output_schema,
     _prompt,
     _snapshot_outputs,
     claim_split_job,
     parse_codex_question_plan,
-    read_codex_weekly_remaining,
+    record_split_claim_failure,
     run_claimed_split,
 )
 
@@ -114,7 +116,6 @@ class QuestionSplitterTests(unittest.TestCase):
             "page_start": 1, "page_end": 2, "page_count": 2, "pages": pages,
         }), encoding="utf-8")
         _anchor_render(self.db, self.job_id, self.job_dir)
-        self.weekly_checker = lambda: 100.0
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -199,7 +200,6 @@ class QuestionSplitterTests(unittest.TestCase):
             with self.subTest(index=index):
                 claim = claim_split_job(
                     self.db, self.private, self.job_id, runner=runner,
-                    weekly_checker=self.weekly_checker,
                 )
                 self.assertIsNone(run_claimed_split(claim))
                 with sqlite3.connect(self.db) as connection:
@@ -210,11 +210,167 @@ class QuestionSplitterTests(unittest.TestCase):
                 self.assertFalse((self.job_dir / "question_regions.json").exists())
                 self.assertFalse((self.job_dir / "question_crops.json").exists())
 
+    def test_claim_failure_recording_is_safe_and_idempotent(self):
+        error = CodexExecutionError(SAFE_CODEX_MISSING)
+
+        self.assertTrue(record_split_claim_failure(
+            self.db, self.private, self.job_id, error
+        ))
+        self.assertTrue(record_split_claim_failure(
+            self.db, self.private, self.job_id, error
+        ))
+
+        with sqlite3.connect(self.db) as connection:
+            row = connection.execute(
+                """SELECT status,processed_pages,error_message,question_count,
+                          codex_run_id,result_manifest_sha256
+                   FROM import_question_split_runs WHERE import_job_id=?""",
+                (self.job_id,),
+            ).fetchone()
+        self.assertEqual(
+            ("failed", 0, SAFE_CODEX_MISSING, None, None, None),
+            row,
+        )
+
+    def test_claim_failure_recording_normalizes_unknown_errors(self):
+        secret = str(self.root / "private/secret-codex-error")
+
+        self.assertTrue(record_split_claim_failure(
+            self.db, self.private, self.job_id, QuestionSplitError(secret)
+        ))
+
+        with sqlite3.connect(self.db) as connection:
+            row = connection.execute(
+                """SELECT status,error_message FROM import_question_split_runs
+                   WHERE import_job_id=?""",
+                (self.job_id,),
+            ).fetchone()
+        self.assertEqual(("failed", SAFE_SPLIT_ERROR), row)
+
+    def test_claim_failure_recording_downgrades_stale_processing_run(self):
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                """INSERT INTO import_question_split_runs
+                   (import_job_id,status,processed_pages,error_message)
+                   VALUES (?,'processing',0,NULL)""",
+                (self.job_id,),
+            )
+
+        self.assertTrue(record_split_claim_failure(
+            self.db, self.private, self.job_id,
+            CodexExecutionError(SAFE_CODEX_MISSING),
+        ))
+        with sqlite3.connect(self.db) as connection:
+            self.assertEqual(("failed", SAFE_CODEX_MISSING), connection.execute(
+                """SELECT status,error_message FROM import_question_split_runs
+                   WHERE import_job_id=?""",
+                (self.job_id,),
+            ).fetchone())
+
+    def test_claim_failure_recording_never_downgrades_active_split_claim(self):
+        claim = claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(self.valid())
+        )
+        try:
+            self.assertFalse(record_split_claim_failure(
+                self.db, self.private, self.job_id,
+                CodexExecutionError(SAFE_CODEX_MISSING),
+            ))
+            with sqlite3.connect(self.db) as connection:
+                self.assertEqual(("processing", None), connection.execute(
+                    """SELECT status,error_message FROM import_question_split_runs
+                       WHERE import_job_id=?""",
+                    (self.job_id,),
+                ).fetchone())
+        finally:
+            claim.close()
+
+    def test_claim_failure_recording_never_downgrades_completed_run(self):
+
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(self.valid())
+        ))
+        with sqlite3.connect(self.db) as connection:
+            completed_before = connection.execute(
+                """SELECT * FROM import_question_split_runs
+                   WHERE import_job_id=?""",
+                (self.job_id,),
+            ).fetchone()
+
+        self.assertFalse(record_split_claim_failure(
+            self.db, self.private, self.job_id,
+            CodexExecutionError(SAFE_CODEX_MISSING),
+        ))
+        with sqlite3.connect(self.db) as connection:
+            completed_after = connection.execute(
+                """SELECT * FROM import_question_split_runs
+                   WHERE import_job_id=?""",
+                (self.job_id,),
+            ).fetchone()
+        self.assertEqual(completed_before, completed_after)
+
+    def test_concurrent_claim_failure_recorders_are_idempotent(self):
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                """INSERT INTO import_question_split_runs
+                   (import_job_id,status,processed_pages,error_message)
+                   VALUES (?,'processing',0,NULL)""",
+                (self.job_id,),
+            )
+        barrier = threading.Barrier(4)
+        results = []
+        errors = []
+
+        def record():
+            try:
+                barrier.wait(timeout=5)
+                results.append(record_split_claim_failure(
+                    self.db, self.private, self.job_id,
+                    CodexExecutionError(SAFE_CODEX_MISSING),
+                ))
+            except Exception as error:  # pragma: no cover - assertion reports details
+                errors.append(error)
+
+        threads = [threading.Thread(target=record) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertFalse(errors)
+        self.assertEqual([False, False, False, True], sorted(results))
+        self.assertTrue(record_split_claim_failure(
+            self.db, self.private, self.job_id,
+            CodexExecutionError(SAFE_CODEX_MISSING),
+        ))
+        with sqlite3.connect(self.db) as connection:
+            self.assertEqual(("failed", SAFE_CODEX_MISSING), connection.execute(
+                """SELECT status,error_message FROM import_question_split_runs
+                   WHERE import_job_id=?""",
+                (self.job_id,),
+            ).fetchone())
+
+    def test_claim_failure_recording_requires_pending_job_and_completed_render(self):
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                "UPDATE import_page_render_runs SET status='failed' WHERE import_job_id=?",
+                (self.job_id,),
+            )
+        self.assertFalse(record_split_claim_failure(
+            self.db, self.private, self.job_id,
+            CodexExecutionError(SAFE_CODEX_MISSING),
+        ))
+        with sqlite3.connect(self.db) as connection:
+            self.assertIsNone(connection.execute(
+                """SELECT status FROM import_question_split_runs
+                   WHERE import_job_id=?""",
+                (self.job_id,),
+            ).fetchone())
+
     def test_claim_run_generates_crops_review_and_persists_completion(self):
         runner = FakeRunner(self.valid())
         claim = claim_split_job(
             self.db, self.private, self.job_id, runner=runner,
-            weekly_checker=self.weekly_checker,
         )
         result = run_claimed_split(claim)
         self.assertEqual(2, result["question_count"])
@@ -257,7 +413,6 @@ class QuestionSplitterTests(unittest.TestCase):
         result = run_claimed_split(
             claim_split_job(
                 self.db, self.private, self.job_id, runner=runner,
-                weekly_checker=self.weekly_checker,
             )
         )
         self.assertEqual(2, result["question_count"])
@@ -276,7 +431,6 @@ class QuestionSplitterTests(unittest.TestCase):
         with self.assertRaises(QuestionSplitError):
             claim_split_job(
                 self.db, self.private, self.job_id, runner=runner,
-                weekly_checker=self.weekly_checker,
             )
         self.assertEqual([], runner.calls)
         _anchor_render(self.db, self.job_id, self.job_dir)
@@ -289,7 +443,6 @@ class QuestionSplitterTests(unittest.TestCase):
         page.hardlink_to(other)
         claim = claim_split_job(
             self.db, self.private, self.job_id, runner=runner,
-            weekly_checker=self.weekly_checker,
         )
         self.assertIsNone(run_claimed_split(claim))
         self.assertEqual([], runner.calls)
@@ -304,7 +457,6 @@ class QuestionSplitterTests(unittest.TestCase):
         manifest.symlink_to(manifest_copy)
         claim = claim_split_job(
             self.db, self.private, self.job_id, runner=runner,
-            weekly_checker=self.weekly_checker,
         )
         self.assertIsNone(run_claimed_split(claim))
         self.assertEqual([], runner.calls)
@@ -312,7 +464,6 @@ class QuestionSplitterTests(unittest.TestCase):
     def test_failures_mark_failed_without_replacing_old_complete_results(self):
         first = claim_split_job(
             self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
-            weekly_checker=self.weekly_checker,
         )
         run_claimed_split(first)
         old_regions = (self.job_dir / "question_regions.json").read_bytes()
@@ -325,7 +476,6 @@ class QuestionSplitterTests(unittest.TestCase):
         bad = FakeRunner(error=CodexExecutionError("timeout"))
         retry = claim_split_job(
             self.db, self.private, self.job_id, runner=bad,
-            weekly_checker=self.weekly_checker,
         )
         self.assertIsNotNone(retry)
         self.assertIsNone(run_claimed_split(retry))
@@ -340,7 +490,6 @@ class QuestionSplitterTests(unittest.TestCase):
     def test_next_claim_recovers_interrupted_top_level_publication(self):
         run_claimed_split(claim_split_job(
             self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
-            weekly_checker=self.weekly_checker,
         ))
         old_regions = (self.job_dir / "question_regions.json").read_bytes()
         old_crop = (self.job_dir / "question_crops/Q001.png").read_bytes()
@@ -355,7 +504,6 @@ class QuestionSplitterTests(unittest.TestCase):
         runner = FakeRunner(self.valid())
         self.assertIsNone(claim_split_job(
             self.db, self.private, self.job_id, runner=runner,
-            weekly_checker=self.weekly_checker,
         ))
         self.assertEqual([], runner.calls)
         self.assertEqual(old_regions, (self.job_dir / "question_regions.json").read_bytes())
@@ -371,7 +519,6 @@ class QuestionSplitterTests(unittest.TestCase):
     def test_tampered_recovery_journal_fails_closed(self):
         run_claimed_split(claim_split_job(
             self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
-            weekly_checker=self.weekly_checker,
         ))
         old_regions = (self.job_dir / "question_regions.json").read_bytes()
         _snapshot_outputs(self.job_dir)
@@ -383,7 +530,6 @@ class QuestionSplitterTests(unittest.TestCase):
         with self.assertRaises(QuestionSplitError):
             claim_split_job(
                 self.db, self.private, self.job_id, runner=runner,
-                weekly_checker=self.weekly_checker,
             )
         self.assertEqual([], runner.calls)
         self.assertEqual(old_regions, (self.job_dir / "question_regions.json").read_bytes())
@@ -392,11 +538,9 @@ class QuestionSplitterTests(unittest.TestCase):
         runner = FakeRunner(self.valid())
         first = claim_split_job(
             self.db, self.private, self.job_id, runner=runner,
-            weekly_checker=self.weekly_checker,
         )
         second = claim_split_job(
             self.db, self.private, self.job_id, runner=runner,
-            weekly_checker=self.weekly_checker,
         )
         self.assertIsNone(second)
         run_claimed_split(first)
@@ -408,7 +552,6 @@ class QuestionSplitterTests(unittest.TestCase):
             )
         resumed = claim_split_job(
             self.db, self.private, self.job_id, runner=runner,
-            weekly_checker=self.weekly_checker,
         )
         self.assertIsNotNone(resumed)
         run_claimed_split(resumed)
@@ -437,140 +580,28 @@ class QuestionSplitterTests(unittest.TestCase):
         _anchor_render(self.db, other_id, other_dir)
         first = claim_split_job(
             self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
-            weekly_checker=self.weekly_checker,
         )
         try:
             second = claim_split_job(
                 self.db, self.private, other_id, runner=FakeRunner(self.valid()),
-                weekly_checker=self.weekly_checker,
             )
             self.assertIsNone(second)
         finally:
             first.close()
 
-    def test_weekly_gate_blocks_below_30_before_runner_and_preserves_results(self):
+    def test_claim_does_not_read_local_usage_sessions_before_running(self):
         runner = FakeRunner(self.valid())
-        completed = claim_split_job(
-            self.db, self.private, self.job_id, runner=runner,
-            weekly_checker=lambda: 100.0,
-        )
-        run_claimed_split(completed)
-        old_regions = (self.job_dir / "question_regions.json").read_bytes()
-        with sqlite3.connect(self.db) as connection:
-            connection.execute(
-                "UPDATE import_question_split_runs SET status='failed' WHERE import_job_id=?",
-                (self.job_id,),
+        with patch(
+            "src.processing.question_splitter.Path.home",
+            side_effect=AssertionError("local sessions must not be inspected"),
+        ):
+            claim = claim_split_job(
+                self.db, self.private, self.job_id, runner=runner
             )
-        blocked_runner = FakeRunner(self.valid())
-        with self.assertRaisesRegex(QuestionSplitError, SAFE_WEEKLY_LOW):
-            claim_split_job(
-                self.db, self.private, self.job_id, runner=blocked_runner,
-                weekly_checker=lambda: 29.999,
-            )
-        self.assertEqual([], blocked_runner.calls)
-        self.assertEqual(old_regions, (self.job_dir / "question_regions.json").read_bytes())
-        with sqlite3.connect(self.db) as connection:
-            self.assertEqual("failed", connection.execute(
-                "SELECT status FROM import_question_split_runs WHERE import_job_id=?",
-                (self.job_id,),
-            ).fetchone()[0])
 
-    def test_weekly_gate_allows_exactly_30_and_above(self):
-        for remaining in (30.0, 70.0):
-            with self.subTest(remaining=remaining):
-                runner = FakeRunner(self.valid())
-                claim = claim_split_job(
-                    self.db, self.private, self.job_id, runner=runner,
-                    weekly_checker=lambda value=remaining: value,
-                )
-                self.assertIsNotNone(claim)
-                run_claimed_split(claim)
-                self.assertEqual(1, len(runner.calls))
-                with sqlite3.connect(self.db) as connection:
-                    connection.execute(
-                        "UPDATE import_question_split_runs SET status='failed' "
-                        "WHERE import_job_id=?", (self.job_id,),
-                    )
-
-    def test_weekly_gate_fails_closed_when_exact_data_is_unavailable(self):
-        runner = FakeRunner(self.valid())
-        for checker in (lambda: None, lambda: float("nan"), lambda: 101.0):
-            with self.subTest(checker=checker), self.assertRaisesRegex(
-                QuestionSplitError, SAFE_WEEKLY_UNAVAILABLE
-            ):
-                claim_split_job(
-                    self.db, self.private, self.job_id, runner=runner,
-                    weekly_checker=checker,
-                )
-        self.assertEqual([], runner.calls)
-
-    def test_weekly_check_does_not_hold_sqlite_write_transaction(self):
-        def checker():
-            with sqlite3.connect(self.db, timeout=0) as connection:
-                connection.execute(
-                    "UPDATE import_jobs SET updated_at=updated_at WHERE id=?",
-                    (self.job_id,),
-                )
-            return 100.0
-
-        claim = claim_split_job(
-            self.db, self.private, self.job_id,
-            runner=FakeRunner(self.valid()), weekly_checker=checker,
-        )
         self.assertIsNotNone(claim)
-        claim.close()
-
-
-class CodexWeeklyUsageTests(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.sessions = Path(self.temporary.name) / "sessions"
-        self.sessions.mkdir()
-
-    def tearDown(self):
-        self.temporary.cleanup()
-
-    def write_events(self, *events):
-        path = self.sessions / "rollout.jsonl"
-        path.write_text("".join(json.dumps(event) + "\n" for event in events))
-
-    @staticmethod
-    def event(timestamp, rate_limits):
-        return {
-            "timestamp": timestamp,
-            "payload": {"type": "token_count", "rate_limits": rate_limits},
-            "message": "must never be exposed",
-        }
-
-    def test_reads_latest_valid_seven_day_window_without_assuming_primary(self):
-        self.write_events(
-            self.event("2026-07-01T00:00:00Z", {
-                "secondary": {"window_minutes": 10080, "used_percent": 40},
-            }),
-            self.event("2026-07-02T00:00:00Z", {
-                "primary": {"window_minutes": 300, "used_percent": 99},
-            }),
-            self.event("2026-07-03T00:00:00Z", {
-                "primary": {"window_minutes": 10080, "used_percent": 101},
-            }),
-            self.event("2026-07-04T00:00:00Z", {
-                "other": {"window_minutes": 10080, "used_percent": 65.5},
-            }),
-        )
-        self.assertEqual(34.5, read_codex_weekly_remaining(self.sessions))
-
-    def test_rejects_nonfinite_out_of_range_and_missing_exact_weekly_data(self):
-        cases = (
-            {"primary": {"window_minutes": 10080, "used_percent": float("nan")}},
-            {"primary": {"window_minutes": 10080, "used_percent": -0.1}},
-            {"primary": {"window_minutes": 10080, "used_percent": 100.1}},
-            {"primary": {"window_minutes": 10079, "used_percent": 20}},
-        )
-        for limits in cases:
-            with self.subTest(limits=limits):
-                self.write_events(self.event("2026-07-01T00:00:00Z", limits))
-                self.assertIsNone(read_codex_weekly_remaining(self.sessions))
-
+        run_claimed_split(claim)
+        self.assertEqual(1, len(runner.calls))
 
 class CodexCliRunnerTests(unittest.TestCase):
     def setUp(self):

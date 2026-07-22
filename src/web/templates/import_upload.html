@@ -4,7 +4,7 @@
 <section class="page-heading">
   <p class="eyebrow">IMPORT</p>
   <h1>导入新试卷</h1>
-  <p><strong>上传预览不会入库，点击确认后才创建任务。</strong></p>
+  <p><strong>上传预览不会入库；确认后才创建任务并自动处理页面与切题。</strong></p>
 </section>
 <form class="panel" method="post" action="/imports/preview" enctype="multipart/form-data">
   {% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}

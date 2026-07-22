@@ -942,10 +942,8 @@ class LocalKnowledgeClassificationTests(unittest.TestCase):
 
     def test_web_get_is_read_only_and_post_security_and_html_escape(self):
         runner = FakeRunner(conflict=True)
-        weekly_calls = []
         app = create_app(
             self.db, self.private, classification_runner=runner,
-            weekly_checker=lambda: weekly_calls.append(True),
         )
         client = TestClient(app)
         before = self.db.read_bytes()
@@ -974,7 +972,6 @@ class LocalKnowledgeClassificationTests(unittest.TestCase):
         self.assertNotIn("<b>1</b>", completed.text)
         self.assertIn("&lt;img src=x onerror=alert(1)&gt;", completed.text)
         self.assertNotIn("<img src=x onerror=alert(1)>", completed.text)
-        self.assertEqual([], weekly_calls)
 
     def test_web_review_post_contract_validation_and_optimistic_lock(self):
         self._complete(FakeRunner(conflict=True))
