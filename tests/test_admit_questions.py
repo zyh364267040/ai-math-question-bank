@@ -26,7 +26,10 @@ from src.importing.admit_questions import (
     assess_job,
 )
 from src.processing.secure_crop_artifacts import load_hmac_key, sign_manifest
-from tests.fixture_factory import create_import_job_fixture
+from tests.fixture_factory import (
+    anchor_synthetic_figure_reviews,
+    create_import_job_fixture,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +50,7 @@ class AdmitQuestionsTests(unittest.TestCase):
                 ("a" * 64, "测试卷"),
             ).lastrowid
             con.execute("INSERT INTO import_jobs(id,source_paper_id,page_start,page_end,status) VALUES(1,?,1,4,'needs_review')", (source,))
+        anchor_synthetic_figure_reviews(self.db, self.private)
         self._anchor_batch_audit()
 
     def tearDown(self):
@@ -57,9 +61,19 @@ class AdmitQuestionsTests(unittest.TestCase):
         return path, json.loads(path.read_text(encoding="utf-8"))
 
     def _write(self, path, data):
+        if path.name == "figure_assets.json" and isinstance(data, dict):
+            data = sign_manifest(
+                load_hmac_key(self.job),
+                {key: value for key, value in data.items() if key != "signature"},
+            )
         path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         if path.name in {"candidate_questions.json", "ai_audit.json", "question_crops.json"}:
             self._anchor_batch_audit()
+        if path.name == "candidate_questions.json":
+            try:
+                anchor_synthetic_figure_reviews(self.db, self.private)
+            except ValueError:
+                pass
 
     def _anchor_batch_audit(self):
         candidate = self.job / "candidate_questions.json"
@@ -1310,6 +1324,7 @@ class AdmitQuestionsTests(unittest.TestCase):
         lock = self.job / ".crop_artifacts.lock"
         target = self.job / ".lock-target"
         target.write_bytes(b"")
+        lock.unlink(missing_ok=True)
         lock.symlink_to(target.name)
         with self.assertRaisesRegex(AdmissionError, "文件锁"):
             admit_questions(self.db, self.private, 1)
@@ -1868,7 +1883,7 @@ class AdmitQuestionsTests(unittest.TestCase):
             ("ai_audit.json", lambda d: d["questions"].pop()),
             ("question_crops.json", lambda d: d["questions"].pop()),
             ("question_crops.json", lambda d: d["questions"][0].__setitem__("sha256", "0" * 64)),
-            ("figure_assets.json", lambda d: d["assets"][0].__setitem__("review_status", "pending_ai_review")),
+            ("figure_assets.json", lambda d: d["assets"][0].__setitem__("review_status", "ai_review_passed")),
             ("candidate_questions.json", lambda d: d["questions"][0].__setitem__("primary_knowledge_point_code", "missing.code")),
         ]
         for filename, mutate in mutations:
@@ -1887,6 +1902,42 @@ class AdmitQuestionsTests(unittest.TestCase):
                 admit_questions(self.db, self.private, 1)
         with sqlite3.connect(self.db) as con:
             self.assertEqual(0, con.execute("SELECT count(*) FROM questions").fetchone()[0])
+
+    def test_completion_callback_failure_rolls_back_the_entire_formal_batch(self):
+        observed = {}
+
+        def reject_anchor(connection, result):
+            observed["result"] = (result.inserted, result.already_present)
+            observed["questions"] = connection.execute(
+                "SELECT COUNT(*) FROM questions"
+            ).fetchone()[0]
+            observed["sources"] = connection.execute(
+                "SELECT COUNT(*) FROM question_sources WHERE import_job_id=1"
+            ).fetchone()[0]
+            raise RuntimeError("injected coordinator anchor failure")
+
+        with self.assertRaisesRegex(RuntimeError, "anchor failure"):
+            admit_questions(
+                self.db,
+                self.private,
+                1,
+                completion_callback=reject_anchor,
+            )
+
+        self.assertEqual((22, 0), observed["result"])
+        self.assertEqual((22, 22), (observed["questions"], observed["sources"]))
+        with sqlite3.connect(self.db) as connection:
+            for table in (
+                "questions",
+                "question_sources",
+                "question_assets",
+                "question_related_knowledge_points",
+            ):
+                self.assertEqual(
+                    0,
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],
+                    table,
+                )
 
     def test_later_sqlite_error_rolls_back_previously_inserted_answer(self):
         candidate_path, candidate = self._json("candidate_questions.json")

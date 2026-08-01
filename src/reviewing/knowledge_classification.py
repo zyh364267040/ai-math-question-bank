@@ -93,8 +93,13 @@ def _parse(raw: str, job_id: int) -> dict:
         ):
             _fail()
         if set(item) == ENRICHED_QUESTION_KEYS and (
-            item["approval_source"] not in {"local_double_pass", "human"}
+            item["approval_source"] not in {
+                "codex_double_pass", "codex_adjudicated",
+                "local_double_pass", "human",
+            }
             or item["reviewer"] != {
+                "codex_double_pass": "codex_double_pass",
+                "codex_adjudicated": "codex_adjudicator",
                 "local_double_pass": "local_double_pass",
                 "human": "teacher_human_review",
             }[item["approval_source"]]
@@ -182,10 +187,12 @@ def adopt_knowledge_classifications_in_connection(
                     number, draft["version"], _canonical_sha(edited), primary,
                     json.dumps(related, ensure_ascii=False, separators=(",", ":")),
                     item["reason"], item.get("reviewer", payload["reviewer"]),
+                    item.get("approval_source"),
                 ))
             inserted = 0
             for (
-                number, version, edited_sha, primary, related_json, reason, reviewer
+                number, version, edited_sha, primary, related_json, reason, reviewer,
+                approval_source,
             ) in prepared:
                 existing = connection.execute(
                     """SELECT * FROM candidate_knowledge_classifications
@@ -195,7 +202,7 @@ def adopt_knowledge_classifications_in_connection(
                 ).fetchone()
                 expected = (
                     primary, related_json, payload["source_classifier"],
-                    reviewer,
+                    reviewer, approval_source,
                     classifier_run_id, evidence_sha, reason,
                 )
                 if existing is not None:
@@ -203,6 +210,7 @@ def adopt_knowledge_classifications_in_connection(
                         existing["primary_knowledge_point_code"],
                         existing["related_knowledge_point_codes_json"],
                         existing["classifier"], existing["reviewer"],
+                        existing["approval_source"],
                         existing["classifier_run_id"], existing["evidence_sha256"],
                         existing["reason"],
                     )
@@ -214,12 +222,12 @@ def adopt_knowledge_classifications_in_connection(
                        (import_job_id,source_question_no,approved_draft_version,
                         edited_sha256,primary_knowledge_point_code,
                         related_knowledge_point_codes_json,classifier,reviewer,
-                        classifier_run_id,evidence_sha256,reason,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        approval_source,classifier_run_id,evidence_sha256,reason,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         job_id, number, version, edited_sha, primary, related_json,
                         payload["source_classifier"],
-                        reviewer,
+                        reviewer, approval_source,
                         classifier_run_id, evidence_sha, reason, now,
                     ),
                 )
@@ -279,4 +287,5 @@ def load_bound_knowledge_classification(
         "classification_id": row["id"],
         "classifier": row["classifier"],
         "reviewer": row["reviewer"],
+        "approval_source": row.get("approval_source"),
     }

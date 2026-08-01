@@ -1,4 +1,4 @@
-"""Explicit, local-only Ollama knowledge classification state machine."""
+"""Explicit Codex CLI knowledge-classification state machine."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ import os
 import secrets
 import sqlite3
 import stat
+import subprocess
+import tempfile
 import threading
-import urllib.error
-import urllib.request
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -27,13 +27,16 @@ from src.reviewing.knowledge_classification import (
 from src.reviewing.candidate_review_ai import validate_ai_approval
 
 
-SAFE_CLASSIFICATION_INPUT = "本地知识点分类输入或批准证据已变化"
-SAFE_CLASSIFICATION_BUSY = "本地知识点分类正在处理，请稍后刷新"
-SAFE_CLASSIFICATION_MODEL = "本地 Ollama 知识点分类失败，请确认服务可用后重试"
-SAFE_CLASSIFICATION_STORAGE = "本地知识点分类结果保存失败，请重试"
+SAFE_CLASSIFICATION_INPUT = "Codex 知识点分类输入或批准证据已变化"
+SAFE_CLASSIFICATION_BUSY = "Codex 知识点分类正在处理，请稍后刷新"
+SAFE_CLASSIFICATION_MODEL = "Codex 知识点分类失败，请稍后重试"
+SAFE_CLASSIFICATION_STORAGE = "Codex 知识点分类结果保存失败，请重试"
 MAX_MODEL_OUTPUT_BYTES = 512 * 1024
 MAX_PROMPT_BYTES = 2 * 1024 * 1024
-MODEL = "qwen2.5:14b"
+MODEL = "codex-cli"
+# Twenty-question taxonomy passes can legitimately take longer than two minutes.
+# Keep a hard bound while allowing the independent verifier to finish.
+CODEX_TIMEOUT_SECONDS = 300
 STALE_AFTER = timedelta(minutes=15)
 CONFIDENCES = {"low", "medium", "high"}
 OUTPUT_CONSTRAINT = "字段名必须逐字使用，题号必须字符串。"
@@ -50,6 +53,11 @@ STAGE_SYSTEM_MESSAGES = {
         "你是独立的三级数学知识点复核器。不得假定任何先前 proposal 正确；"
         "必须从题干重新分类，并主动寻找更合适的替代知识点。" + OUTPUT_CONSTRAINT
     ),
+    "adjudicator": (
+        "你是第三位独立的三级数学知识点仲裁分类器。必须从题干重新分类；"
+        "不得接收、推测或复述 proposal/verifier 的答案、理由或选择。"
+        + OUTPUT_CONSTRAINT
+    ),
 }
 STAGE_USER_INSTRUCTIONS = {
     "level2": (
@@ -64,14 +72,12 @@ STAGE_USER_INSTRUCTIONS = {
         "从题干重新完成三级分类并检查替代项，只能使用该题候选代码。字段名必须逐字使用："
         "source_question_no、primary_code、related_codes、confidence、reason；题号必须字符串。"
     ),
+    "adjudicator": (
+        "仅对给出的待仲裁题独立分类，只能使用每题给出的原始三级候选代码。"
+        "字段名必须逐字使用：source_question_no、primary_code、related_codes、"
+        "confidence、reason；题号必须字符串。"
+    ),
 }
-STAGE_OPTIONS = {
-    "level2": {"temperature": 0, "seed": 2102},
-    "proposal": {"temperature": 0, "seed": 3103},
-    "verifier": {"temperature": 0, "seed": 4104},
-}
-
-
 def _object_schema(properties: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "object",
@@ -97,7 +103,10 @@ _LEVEL3_ITEM_SCHEMA = _object_schema({
     "primary_code": {"type": "string"},
     "related_codes": {
         "type": "array", "items": {"type": "string"},
-        "maxItems": 2, "uniqueItems": True,
+        # OpenAI structured outputs reject the JSON Schema ``uniqueItems``
+        # keyword.  Duplicate codes are still rejected fail-closed by
+        # ``_validate_codex_shape`` and ``_parse_level3`` below.
+        "maxItems": 2,
     },
     "confidence": _COMMON_OUTPUT_PROPERTIES["confidence"],
     "reason": _COMMON_OUTPUT_PROPERTIES["reason"],
@@ -110,6 +119,7 @@ STAGE_OUTPUT_SCHEMAS = {
         "level2": _LEVEL2_ITEM_SCHEMA,
         "proposal": _LEVEL3_ITEM_SCHEMA,
         "verifier": _LEVEL3_ITEM_SCHEMA,
+        "adjudicator": _LEVEL3_ITEM_SCHEMA,
     }.items()
 }
 
@@ -133,6 +143,10 @@ class ClassificationClaim:
     taxonomy_digest: str
     questions: tuple[dict[str, Any], ...]
     taxonomy: tuple[dict[str, Any], ...]
+    replace_unapplied: bool = False
+    previous_output_sha256: str | None = None
+    previous_output_byte_size: int | None = None
+    replacement_backup_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -143,10 +157,16 @@ class ClassificationPage:
     question_count: int
     processed: int
     auto_approved: int
+    double_approved: int
+    adjudicated_approved: int
     pending: int
     approved: int
     applied: bool
     completed_evidence: bool
+    can_replace: bool
+    replacement_active: bool
+    replacement_result: str | None
+    replacement_completed_at: str | None
     error_message: str | None
     drafts: tuple[dict[str, Any], ...]
 
@@ -417,71 +437,286 @@ def _authoritative_input(
     return tuple(prepared), taxonomy, input_digest, taxonomy_digest
 
 
-class OllamaKnowledgeClassificationRunner:
-    """Bounded HTTP client for the fixed local Ollama endpoint; never invokes a shell."""
+def _validate_codex_shape(stage: str, raw: str) -> None:
+    """Validate the schema-level shape before taxonomy-specific parsing."""
+    try:
+        value, end = json.JSONDecoder().raw_decode(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise KnowledgeClassificationRunError(SAFE_CLASSIFICATION_MODEL) from exc
+    if raw[end:].strip() or not isinstance(value, dict) or set(value) != {"questions"}:
+        _fail(SAFE_CLASSIFICATION_MODEL)
+    rows = value["questions"]
+    expected = (
+        {"source_question_no", "level2_code", "confidence", "reason"}
+        if stage == "level2"
+        else {
+            "source_question_no", "primary_code", "related_codes",
+            "confidence", "reason",
+        }
+    )
+    if not isinstance(rows, list):
+        _fail(SAFE_CLASSIFICATION_MODEL)
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != expected:
+            _fail(SAFE_CLASSIFICATION_MODEL)
+        related = row.get("related_codes", [])
+        if (
+            not isinstance(row["source_question_no"], str)
+            or not isinstance(row.get("level2_code", row.get("primary_code")), str)
+            or row["confidence"] not in CONFIDENCES
+            or not isinstance(row["reason"], str)
+            or not 1 <= len(row["reason"]) <= 200
+            or not isinstance(related, list)
+            or len(related) > 2
+            or len(related) != len(set(related))
+            or any(not isinstance(code, str) for code in related)
+        ):
+            _fail(SAFE_CLASSIFICATION_MODEL)
 
-    endpoint = "http://127.0.0.1:11434/api/chat"
 
-    def __init__(self, model: str = MODEL, opener=None):
-        self.model = model
-        self._opener = opener or urllib.request.urlopen
+class CodexKnowledgeClassificationRunner:
+    """Run every classification stage in a fresh bounded Codex CLI process."""
+
+    def __init__(
+        self, *, subprocess_run=subprocess.run, timeout: int = CODEX_TIMEOUT_SECONDS,
+    ):
+        self._subprocess_run = subprocess_run
+        self._timeout = timeout
 
     def run(self, stage: str, prompt: str) -> str:
-        if stage not in {"level2", "proposal", "verifier"}:
+        if stage not in STAGE_OUTPUT_SCHEMAS or not isinstance(prompt, str):
             _fail(SAFE_CLASSIFICATION_MODEL)
         if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
             _fail(SAFE_CLASSIFICATION_MODEL)
-        body = json.dumps({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": STAGE_SYSTEM_MESSAGES[stage]},
-                {
-                    "role": "user",
-                    "content": STAGE_USER_INSTRUCTIONS[stage] + "\n" + prompt,
-                },
-            ],
-            "stream": False, "format": STAGE_OUTPUT_SCHEMAS[stage],
-            "options": STAGE_OPTIONS[stage],
-        }, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            self.endpoint, data=body, method="POST",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        instruction = (
+            STAGE_SYSTEM_MESSAGES[stage] + "\n"
+            + STAGE_USER_INSTRUCTIONS[stage] + "\n" + prompt
         )
+        if len(instruction.encode("utf-8")) > MAX_PROMPT_BYTES:
+            _fail(SAFE_CLASSIFICATION_MODEL)
         try:
-            with self._opener(request, timeout=120) as response:
-                raw = response.read(MAX_MODEL_OUTPUT_BYTES + 1)
-            if len(raw) > MAX_MODEL_OUTPUT_BYTES:
-                _fail(SAFE_CLASSIFICATION_MODEL)
-            envelope = json.loads(raw)
-            content = envelope["message"]["content"]
-            if not isinstance(content, str):
-                _fail(SAFE_CLASSIFICATION_MODEL)
-            return content
+            with tempfile.TemporaryDirectory(prefix=f"codex-kc-{stage}-") as temporary:
+                workdir = Path(temporary)
+                schema_path = workdir / "output.schema.json"
+                output_path = workdir / "output.json"
+                descriptor = os.open(
+                    schema_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                )
+                try:
+                    schema = _canonical(STAGE_OUTPUT_SCHEMAS[stage]).encode("utf-8")
+                    if os.write(descriptor, schema) != len(schema):
+                        _fail(SAFE_CLASSIFICATION_MODEL)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                command = [
+                    "codex", "exec", "--ephemeral", "-s", "read-only",
+                    "--output-schema", str(schema_path),
+                    "-o", str(output_path), "-C", str(workdir),
+                    "--skip-git-repo-check", "-",
+                ]
+                completed = self._subprocess_run(
+                    command,
+                    input=instruction,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=self._timeout,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if getattr(completed, "returncode", 0) != 0:
+                    _fail(SAFE_CLASSIFICATION_MODEL)
+                try:
+                    raw = _read_bounded(output_path, MAX_MODEL_OUTPUT_BYTES).decode("utf-8")
+                except (KnowledgeClassificationRunError, UnicodeError) as exc:
+                    raise KnowledgeClassificationRunError(
+                        SAFE_CLASSIFICATION_MODEL
+                    ) from exc
+                _validate_codex_shape(stage, raw)
+                return raw
         except KnowledgeClassificationRunError:
             raise
-        except (OSError, urllib.error.URLError, UnicodeError, json.JSONDecodeError,
-                KeyError, TypeError, ValueError) as exc:
+        except (
+            OSError, subprocess.SubprocessError, UnicodeError, TypeError, ValueError,
+        ) as exc:
             raise KnowledgeClassificationRunError(SAFE_CLASSIFICATION_MODEL) from exc
+
+
+def _snapshot_replacement_generation(connection, row, job_id, token, timestamp):
+    drafts = [dict(item) for item in connection.execute(
+        "SELECT * FROM candidate_knowledge_classification_drafts "
+        "WHERE import_job_id=? ORDER BY CAST(source_question_no AS INTEGER)",
+        (job_id,),
+    )]
+    backup_name = f".classification-replacement-{token}.bak"
+    connection.execute(
+        "DELETE FROM knowledge_classification_replacement_snapshots "
+        "WHERE import_job_id=?",
+        (job_id,),
+    )
+    connection.execute(
+        """INSERT INTO knowledge_classification_replacement_snapshots
+           (import_job_id,claim_token,run_snapshot_json,drafts_snapshot_json,
+            output_sha256,output_byte_size,backup_name,created_at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            job_id, token, _canonical(dict(row)), _canonical(drafts),
+            row["output_sha256"], row["output_byte_size"], backup_name, timestamp,
+        ),
+    )
+    return backup_name
+
+
+def _replacement_lease_is_stale(row, now):
+    try:
+        updated = datetime.fromisoformat(row["updated_at"])
+    except (TypeError, ValueError):
+        return True
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    return now - updated.astimezone(timezone.utc) > STALE_AFTER
+
+
+def _recover_replacement_artifact(private_root, job_id, snapshot):
+    trusted_job = _open_trusted_job_directory(private_root, job_id)
+    try:
+        expected = (snapshot["output_sha256"], snapshot["output_byte_size"])
+
+        def verified(name):
+            try:
+                content = _read_bounded(
+                    name, MAX_MODEL_OUTPUT_BYTES, directory_fd=trusted_job.job_fd
+                )
+            except KnowledgeClassificationRunError:
+                return False
+            return len(content) == expected[1] and hashlib.sha256(content).hexdigest() == expected[0]
+
+        if verified("knowledge_classification.json"):
+            trusted_job.verify()
+            return
+        backup_name = snapshot["backup_name"]
+        if not verified(backup_name):
+            _fail(SAFE_CLASSIFICATION_STORAGE)
+        try:
+            current = os.stat(
+                "knowledge_classification.json",
+                dir_fd=trusted_job.job_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            current = None
+        if current is not None:
+            if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+                _fail(SAFE_CLASSIFICATION_STORAGE)
+            os.unlink("knowledge_classification.json", dir_fd=trusted_job.job_fd)
+        os.replace(
+            backup_name,
+            "knowledge_classification.json",
+            src_dir_fd=trusted_job.job_fd,
+            dst_dir_fd=trusted_job.job_fd,
+        )
+        os.fsync(trusted_job.job_fd)
+        trusted_job.verify()
+    finally:
+        trusted_job.close()
+
+
+def _recover_stale_replacement(connection, private_root, job_id, row):
+    snapshot = connection.execute(
+        "SELECT * FROM knowledge_classification_replacement_snapshots "
+        "WHERE import_job_id=? AND claim_token=?",
+        (job_id, row["claim_token"]),
+    ).fetchone()
+    if snapshot is None:
+        _fail(SAFE_CLASSIFICATION_STORAGE)
+    try:
+        old_run = json.loads(snapshot["run_snapshot_json"])
+        old_drafts = json.loads(snapshot["drafts_snapshot_json"])
+    except (TypeError, json.JSONDecodeError):
+        _fail(SAFE_CLASSIFICATION_STORAGE)
+    if (
+        not isinstance(old_run, dict)
+        or not isinstance(old_drafts, list)
+        or old_run.get("status") != "completed"
+        or old_run.get("applied_at") is not None
+        or old_run.get("output_sha256") != snapshot["output_sha256"]
+        or old_run.get("output_byte_size") != snapshot["output_byte_size"]
+    ):
+        _fail(SAFE_CLASSIFICATION_STORAGE)
+    try:
+        _recover_replacement_artifact(private_root, job_id, snapshot)
+    except KnowledgeClassificationRunError:
+        connection.execute(
+            """UPDATE import_knowledge_classification_runs
+               SET status='failed',claim_token=NULL,replacement_active=0,
+                   replacement_result='failed',error_message=?,updated_at=?
+               WHERE import_job_id=? AND claim_token=? AND replacement_active=1""",
+            (SAFE_CLASSIFICATION_STORAGE, _now(), job_id, row["claim_token"]),
+        )
+        connection.commit()
+        return None
+    connection.execute(
+        "DELETE FROM candidate_knowledge_classification_drafts WHERE import_job_id=?",
+        (job_id,),
+    )
+    for draft in old_drafts:
+        if not isinstance(draft, dict) or draft.get("import_job_id") != job_id:
+            _fail(SAFE_CLASSIFICATION_STORAGE)
+        columns = list(draft)
+        column_sql = ",".join('"' + name.replace('"', '""') + '"' for name in columns)
+        connection.execute(
+            f"INSERT INTO candidate_knowledge_classification_drafts ({column_sql}) "
+            f"VALUES ({','.join('?' for _ in columns)})",
+            tuple(draft[name] for name in columns),
+        )
+    columns = [name for name in old_run if name != "import_job_id"]
+    assignments = ",".join(
+        '"' + name.replace('"', '""') + '"=?' for name in columns
+    )
+    connection.execute(
+        f"UPDATE import_knowledge_classification_runs SET {assignments} "
+        "WHERE import_job_id=?",
+        tuple(old_run[name] for name in columns) + (job_id,),
+    )
+    connection.execute(
+        "DELETE FROM knowledge_classification_replacement_snapshots "
+        "WHERE import_job_id=?",
+        (job_id,),
+    )
+    return connection.execute(
+        "SELECT * FROM import_knowledge_classification_runs WHERE import_job_id=?",
+        (job_id,),
+    ).fetchone()
 
 
 def claim_knowledge_classification(
     database_path: str | Path, private_root: str | Path, job_id: int,
-    *, runner=None,
+    *, runner=None, replace_unapplied: bool = False,
 ) -> ClassificationClaim | None:
     database_path, private_root = Path(database_path), Path(private_root)
-    if not isinstance(job_id, int) or job_id <= 0:
+    if (
+        not isinstance(job_id, int) or isinstance(job_id, bool) or job_id <= 0
+        or not isinstance(replace_unapplied, bool)
+    ):
         _fail()
     try:
         with closing(sqlite3.connect(database_path, timeout=10)) as connection:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("BEGIN IMMEDIATE")
-            if connection.execute(
+            evidence_exists = connection.execute(
                 "SELECT 1 FROM candidate_knowledge_classifications WHERE import_job_id=? LIMIT 1",
                 (job_id,),
-            ).fetchone():
+            ).fetchone()
+            if evidence_exists:
                 connection.commit()
                 return None
+            job = connection.execute(
+                "SELECT status FROM import_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if job is None:
+                raise KnowledgeClassificationRunError("未找到导入任务")
             questions, taxonomy, input_digest, taxonomy_digest = _authoritative_input(
                 connection, private_root, job_id
             )
@@ -491,9 +726,119 @@ def claim_knowledge_classification(
             ).fetchone()
             now = datetime.now(timezone.utc)
             if row is not None:
-                if row["status"] == "completed" or row["applied_at"] is not None:
+                if row["status"] == "processing" and row["replacement_active"]:
+                    if not _replacement_lease_is_stale(row, now):
+                        connection.commit()
+                        return None
+                    row = _recover_stale_replacement(
+                        connection, private_root, job_id, row
+                    )
+                    if row is None:
+                        return None
+                if row["applied_at"] is not None:
                     connection.commit()
                     return None
+                if row["status"] == "completed":
+                    if not replace_unapplied:
+                        connection.commit()
+                        return None
+                    if (
+                        job["status"] == "completed"
+                        or row["input_digest"] != input_digest
+                        or row["taxonomy_digest"] != taxonomy_digest
+                        or row["question_count"] != len(questions)
+                        or not row["output_sha256"]
+                        or not row["output_byte_size"]
+                        or connection.execute(
+                            "SELECT 1 FROM question_sources "
+                            "WHERE import_job_id=? LIMIT 1",
+                            (job_id,),
+                        ).fetchone()
+                    ):
+                        connection.commit()
+                        return None
+                    expected = {
+                        item["source_question_no"]: (
+                            item["approved_draft_version"],
+                            item["edited_sha256"],
+                        )
+                        for item in questions
+                    }
+                    old_drafts = connection.execute(
+                        """SELECT source_question_no,approved_draft_version,
+                                  edited_sha256
+                           FROM candidate_knowledge_classification_drafts
+                           WHERE import_job_id=?""",
+                        (job_id,),
+                    ).fetchall()
+                    if (
+                        len(old_drafts) != len(expected)
+                        or {
+                            draft["source_question_no"] for draft in old_drafts
+                        } != set(expected)
+                        or any(
+                            (
+                                draft["approved_draft_version"],
+                                draft["edited_sha256"],
+                            ) != expected[draft["source_question_no"]]
+                            for draft in old_drafts
+                        )
+                    ):
+                        connection.commit()
+                        return None
+                    trusted_job = None
+                    try:
+                        trusted_job = _open_trusted_job_directory(
+                            private_root, job_id
+                        )
+                        old_output = _read_bounded(
+                            "knowledge_classification.json",
+                            MAX_MODEL_OUTPUT_BYTES,
+                            directory_fd=trusted_job.job_fd,
+                        )
+                        trusted_job.verify()
+                    except KnowledgeClassificationRunError:
+                        connection.commit()
+                        return None
+                    finally:
+                        if trusted_job is not None:
+                            trusted_job.close()
+                    if (
+                        len(old_output) != row["output_byte_size"]
+                        or hashlib.sha256(old_output).hexdigest()
+                        != row["output_sha256"]
+                    ):
+                        connection.commit()
+                        return None
+                    token = secrets.token_hex(32)
+                    timestamp = now.isoformat(timespec="seconds")
+                    backup_name = _snapshot_replacement_generation(
+                        connection, row, job_id, token, timestamp
+                    )
+                    cursor = connection.execute(
+                        """UPDATE import_knowledge_classification_runs
+                           SET status='processing',stage='waiting',
+                               processed_questions=0,error_message=NULL,
+                               claim_token=?,started_at=?,updated_at=?,
+                               replacement_active=1,
+                               replacement_attempted_at=?,
+                               replacement_result='processing'
+                           WHERE import_job_id=? AND status='completed'
+                             AND applied_at IS NULL
+                             AND replacement_active=0""",
+                        (token, timestamp, timestamp, timestamp, job_id),
+                    )
+                    if cursor.rowcount != 1:
+                        connection.commit()
+                        return None
+                    connection.commit()
+                    return ClassificationClaim(
+                        database_path, private_root, job_id,
+                        runner or CodexKnowledgeClassificationRunner(), token,
+                        input_digest, taxonomy_digest, questions, taxonomy,
+                        True, row["output_sha256"], row["output_byte_size"],
+                        backup_name,
+                    )
                 if row["status"] == "processing":
                     try:
                         updated = datetime.fromisoformat(row["updated_at"])
@@ -515,14 +860,15 @@ def claim_knowledge_classification(
                      input_digest=excluded.input_digest,taxonomy_digest=excluded.taxonomy_digest,
                      output_sha256=NULL,output_byte_size=NULL,error_message=NULL,
                      claim_token=excluded.claim_token,started_at=excluded.started_at,
-                     completed_at=NULL,updated_at=excluded.updated_at,stage='waiting'""",
+                     completed_at=NULL,updated_at=excluded.updated_at,stage='waiting',
+                     replacement_active=0""",
                 (job_id, len(questions), MODEL, input_digest, taxonomy_digest,
                  token, timestamp, timestamp),
             )
             connection.commit()
         return ClassificationClaim(
             database_path, private_root, job_id,
-            runner or OllamaKnowledgeClassificationRunner(), token,
+            runner or CodexKnowledgeClassificationRunner(), token,
             input_digest, taxonomy_digest, questions, taxonomy,
         )
     except KnowledgeClassificationRunError:
@@ -584,6 +930,16 @@ def _parse_level3(
             _fail(SAFE_CLASSIFICATION_MODEL)
         result[row["source_question_no"]] = row
     return result
+
+
+def _normalize_level3(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    normalized["related_codes"] = sorted(row["related_codes"])
+    return normalized
+
+
+def _classification_vote(row: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+    return row["primary_code"], tuple(row["related_codes"])
 
 
 def _prompt(stage: str, questions: object, taxonomy: object) -> str:
@@ -651,6 +1007,8 @@ class _PublishedOutput:
 
 def _publish_output(
     job_dir: Path | int, content: bytes, *, retain_backup: bool = False,
+    expected_existing: tuple[str, int] | None = None,
+    replacement_backup_name: str | None = None,
 ) -> tuple[str, int] | _PublishedOutput:
     if not content or len(content) > MAX_MODEL_OUTPUT_BYTES:
         _fail(SAFE_CLASSIFICATION_STORAGE)
@@ -688,12 +1046,42 @@ def _publish_output(
             )
         except FileNotFoundError:
             existing_fd = None
+        if existing_fd is None and expected_existing is not None:
+            _fail(SAFE_CLASSIFICATION_STORAGE)
         if existing_fd is not None:
             try:
                 existing = os.fstat(existing_fd)
                 if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
                     _fail(SAFE_CLASSIFICATION_STORAGE)
-                backup_name = f".classification-{secrets.token_hex(16)}.bak"
+                if expected_existing is not None:
+                    expected_sha, expected_size = expected_existing
+                    digest = hashlib.sha256()
+                    remaining = existing.st_size
+                    while remaining:
+                        chunk = os.read(existing_fd, min(remaining, 64 * 1024))
+                        if not chunk:
+                            _fail(SAFE_CLASSIFICATION_STORAGE)
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                    verified = os.fstat(existing_fd)
+                    if (
+                        os.read(existing_fd, 1)
+                        or (verified.st_dev, verified.st_ino)
+                        != (existing.st_dev, existing.st_ino)
+                        or verified.st_size != existing.st_size
+                        or existing.st_size != expected_size
+                        or digest.hexdigest() != expected_sha
+                    ):
+                        _fail(SAFE_CLASSIFICATION_STORAGE)
+                backup_name = (
+                    replacement_backup_name
+                    or f".classification-{secrets.token_hex(16)}.bak"
+                )
+                if (
+                    "/" in backup_name or "\\" in backup_name
+                    or ".." in backup_name or len(backup_name) > 120
+                ):
+                    _fail(SAFE_CLASSIFICATION_STORAGE)
                 os.replace(
                     "knowledge_classification.json",
                     backup_name,
@@ -759,12 +1147,31 @@ def _publish_output(
 def _mark_failed(claim: ClassificationClaim, message: str) -> None:
     try:
         with closing(sqlite3.connect(claim.database_path)) as connection:
-            connection.execute(
-                """UPDATE import_knowledge_classification_runs
-                   SET status='failed',error_message=?,claim_token=NULL,updated_at=?
-                   WHERE import_job_id=? AND status='processing' AND claim_token=?""",
-                (message, _now(), claim.job_id, claim.claim_token),
-            )
+            if claim.replace_unapplied:
+                cursor = connection.execute(
+                    """UPDATE import_knowledge_classification_runs
+                       SET status='completed',stage='review_ready',
+                           processed_questions=question_count,error_message=NULL,
+                           claim_token=NULL,updated_at=?,replacement_active=0,
+                           replacement_result='failed'
+                       WHERE import_job_id=? AND status='processing'
+                         AND claim_token=? AND replacement_active=1""",
+                    (_now(), claim.job_id, claim.claim_token),
+                )
+                if cursor.rowcount == 1:
+                    connection.execute(
+                        "DELETE FROM knowledge_classification_replacement_snapshots "
+                        "WHERE import_job_id=? AND claim_token=?",
+                        (claim.job_id, claim.claim_token),
+                    )
+            else:
+                connection.execute(
+                    """UPDATE import_knowledge_classification_runs
+                       SET status='failed',error_message=?,claim_token=NULL,updated_at=?
+                       WHERE import_job_id=? AND status='processing'
+                         AND claim_token=?""",
+                    (message, _now(), claim.job_id, claim.claim_token),
+                )
             connection.commit()
     except sqlite3.Error:
         pass
@@ -814,7 +1221,7 @@ def _commit_completed_run(connection: sqlite3.Connection) -> None:
 
 
 def run_claimed_knowledge_classification(claim: ClassificationClaim) -> None:
-    """Run one claimed batch while serializing all local Ollama classification work."""
+    """Run one claimed batch while serializing classification publication."""
     publication = None
     database_committed = False
     trusted_job = None
@@ -822,7 +1229,7 @@ def run_claimed_knowledge_classification(claim: ClassificationClaim) -> None:
     try:
         trusted_job = _open_trusted_job_directory(claim.private_root, claim.job_id)
         lock_fd = os.open(
-            ".ollama-knowledge-classification.lock",
+            ".codex-knowledge-classification.lock",
             os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600,
             dir_fd=trusted_job.root_fd,
         )
@@ -861,34 +1268,103 @@ def run_claimed_knowledge_classification(claim: ClassificationClaim) -> None:
                     for row in level3_rows if row["code"] in allowed[number]
                 ],
             })
-        proposal = _parse_level3(
-            _run_model_stage(claim, "proposal", _prompt("proposal", scoped_questions, [])),
-            numbers, allowed,
-        )
-        verifier = _parse_level3(
-            _run_model_stage(claim, "verifier", _prompt("verifier", scoped_questions, [])),
-            numbers, allowed,
-        )
+        proposal = {
+            number: _normalize_level3(row)
+            for number, row in _parse_level3(
+                _run_model_stage(
+                    claim, "proposal", _prompt("proposal", scoped_questions, [])
+                ),
+                numbers, allowed,
+            ).items()
+        }
+        verifier = {
+            number: _normalize_level3(row)
+            for number, row in _parse_level3(
+                _run_model_stage(
+                    claim, "verifier", _prompt("verifier", scoped_questions, [])
+                ),
+                numbers, allowed,
+            ).items()
+        }
+        pending_numbers = {
+            number for number in numbers
+            if not (
+                level2[number]["confidence"] == "high"
+                and proposal[number]["confidence"] == "high"
+                and verifier[number]["confidence"] == "high"
+                and _classification_vote(proposal[number])
+                == _classification_vote(verifier[number])
+            )
+        }
+        adjudicator: dict[str, dict[str, Any]] = {}
+        if pending_numbers:
+            adjudication_questions = [
+                item for item in scoped_questions
+                if item["source_question_no"] in pending_numbers
+            ]
+            adjudicator = {
+                number: _normalize_level3(row)
+                for number, row in _parse_level3(
+                    _run_model_stage(
+                        claim,
+                        "adjudicator",
+                        _prompt("adjudicator", adjudication_questions, []),
+                    ),
+                    pending_numbers,
+                    {number: allowed[number] for number in pending_numbers},
+                ).items()
+            }
         now = _now()
         drafts = []
         for source in claim.questions:
             number = source["source_question_no"]
             first, second = proposal[number], verifier[number]
-            automatic = (
-                first["primary_code"] == second["primary_code"]
+            double_pass = (
+                level2[number]["confidence"] == "high"
                 and first["confidence"] == second["confidence"] == "high"
-                and first["related_codes"] == second["related_codes"]
+                and _classification_vote(first) == _classification_vote(second)
+            )
+            third = adjudicator.get(number)
+            adjudicated = (
+                not double_pass
                 and level2[number]["confidence"] == "high"
+                and third is not None
+                and third["confidence"] == "high"
+                and _classification_vote(third) in {
+                    _classification_vote(first), _classification_vote(second),
+                }
+            )
+            automatic = double_pass or adjudicated
+            final = third if adjudicated else first
+            approval_source = (
+                "codex_double_pass" if double_pass
+                else "codex_adjudicated" if adjudicated
+                else None
+            )
+            reviewer = (
+                "codex_double_pass" if double_pass
+                else "codex_adjudicator" if adjudicated
+                else None
             )
             drafts.append({
                 "source_question_no": number,
                 "approved_draft_version": source["approved_draft_version"],
                 "edited_sha256": source["edited_sha256"],
-                "proposal": first, "verifier": second,
-                "final_primary_code": first["primary_code"],
-                "final_related_codes": first["related_codes"],
+                "level2": level2[number],
+                "proposal": first, "verifier": second, "adjudicator": third,
+                "final_primary_code": final["primary_code"],
+                "final_related_codes": final["related_codes"],
+                "final_reason": final["reason"],
                 "status": "approved" if automatic else "pending",
-                "approval_source": "local_double_pass" if automatic else None,
+                "approval_source": approval_source,
+                "reviewer": reviewer,
+                "automatic_decision": ({
+                    "approval_source": approval_source,
+                    "reviewer": reviewer,
+                    "primary_code": final["primary_code"],
+                    "related_codes": final["related_codes"],
+                    "reason": final["reason"],
+                } if automatic else None),
                 "reviewed_at": now if automatic else None,
             })
         output = _canonical({
@@ -901,6 +1377,15 @@ def run_claimed_knowledge_classification(claim: ClassificationClaim) -> None:
         publication = _publish_output(
             trusted_job.job_fd, output,
             retain_backup=True,
+            expected_existing=(
+                (
+                    claim.previous_output_sha256,
+                    claim.previous_output_byte_size,
+                )
+                if claim.replace_unapplied
+                else None
+            ),
+            replacement_backup_name=claim.replacement_backup_name,
         )
         output_sha, output_size = publication
         with closing(sqlite3.connect(claim.database_path, timeout=10)) as connection:
@@ -912,12 +1397,15 @@ def run_claimed_knowledge_classification(claim: ClassificationClaim) -> None:
             )
             trusted_job.verify()
             row = connection.execute(
-                "SELECT status,claim_token,input_digest FROM import_knowledge_classification_runs WHERE import_job_id=?",
+                """SELECT status,claim_token,input_digest,replacement_active
+                   FROM import_knowledge_classification_runs
+                   WHERE import_job_id=?""",
                 (claim.job_id,),
             ).fetchone()
             if (
                 row is None or row["status"] != "processing" or row["claim_token"] != claim.claim_token
                 or row["input_digest"] != claim.input_digest
+                or bool(row["replacement_active"]) != claim.replace_unapplied
                 or current_digest != claim.input_digest or current_taxonomy != claim.taxonomy_digest
                 or len(current_questions) != len(drafts)
             ):
@@ -932,17 +1420,27 @@ def run_claimed_knowledge_classification(claim: ClassificationClaim) -> None:
                        (import_job_id,source_question_no,approved_draft_version,edited_sha256,
                         proposal_primary_code,proposal_related_codes_json,proposal_confidence,
                         proposal_reason,verifier_primary_code,verifier_related_codes_json,
-                        verifier_confidence,verifier_reason,final_primary_code,
-                        final_related_codes_json,status,approval_source,reviewed_at,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        verifier_confidence,verifier_reason,adjudicator_primary_code,
+                        adjudicator_related_codes_json,adjudicator_confidence,
+                        adjudicator_reason,final_primary_code,final_related_codes_json,
+                        final_reason,status,approval_source,reviewed_at,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         claim.job_id, item["source_question_no"], item["approved_draft_version"],
                         item["edited_sha256"], item["proposal"]["primary_code"],
                         _canonical(item["proposal"]["related_codes"]), item["proposal"]["confidence"],
                         item["proposal"]["reason"], item["verifier"]["primary_code"],
                         _canonical(item["verifier"]["related_codes"]), item["verifier"]["confidence"],
-                        item["verifier"]["reason"], item["final_primary_code"],
-                        _canonical(item["final_related_codes"]), item["status"],
+                        item["verifier"]["reason"],
+                        item["adjudicator"]["primary_code"] if item["adjudicator"] else None,
+                        (
+                            _canonical(item["adjudicator"]["related_codes"])
+                            if item["adjudicator"] else None
+                        ),
+                        item["adjudicator"]["confidence"] if item["adjudicator"] else None,
+                        item["adjudicator"]["reason"] if item["adjudicator"] else None,
+                        item["final_primary_code"],
+                        _canonical(item["final_related_codes"]), item["final_reason"], item["status"],
                         item["approval_source"], item["reviewed_at"], now, now,
                     ),
                 )
@@ -951,10 +1449,24 @@ def run_claimed_knowledge_classification(claim: ClassificationClaim) -> None:
                    SET status='completed',processed_questions=question_count,
                        stage='review_ready',
                        output_sha256=?,output_byte_size=?,error_message=NULL,
-                       claim_token=NULL,completed_at=?,updated_at=?
+                       claim_token=NULL,completed_at=?,updated_at=?,
+                       replacement_completed_at=CASE
+                           WHEN replacement_active=1 THEN ? ELSE replacement_completed_at END,
+                       replacement_result=CASE
+                           WHEN replacement_active=1 THEN 'completed' ELSE replacement_result END,
+                       replacement_active=0
                    WHERE import_job_id=? AND claim_token=?""",
-                (output_sha, output_size, now, now, claim.job_id, claim.claim_token),
+                (
+                    output_sha, output_size, now, now, now,
+                    claim.job_id, claim.claim_token,
+                ),
             )
+            if claim.replace_unapplied:
+                connection.execute(
+                    "DELETE FROM knowledge_classification_replacement_snapshots "
+                    "WHERE import_job_id=? AND claim_token=?",
+                    (claim.job_id, claim.claim_token),
+                )
             _commit_completed_run(connection)
             database_committed = True
         publication.finalize()
@@ -989,12 +1501,130 @@ def _decode_codes(raw: object) -> list[str]:
     return value if isinstance(value, list) else []
 
 
+def _anchored_artifact_questions(output, run, job_id, expected_numbers):
+    try:
+        artifact = json.loads(output)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        _fail()
+    if (
+        not isinstance(artifact, dict)
+        or artifact.get("version") != 1
+        or artifact.get("import_job_id") != job_id
+        or artifact.get("model") != run["model"]
+        or artifact.get("input_digest") != run["input_digest"]
+        or artifact.get("taxonomy_digest") != run["taxonomy_digest"]
+        or not isinstance(artifact.get("questions"), list)
+    ):
+        _fail()
+    questions = artifact["questions"]
+    numbers = [
+        item.get("source_question_no") if isinstance(item, dict) else None
+        for item in questions
+    ]
+    # The publication order is canonical authoritative question order.  This
+    # rejects missing/extra/duplicate and reordered evidence without guessing.
+    if numbers != list(expected_numbers) or len(numbers) != len(set(numbers)):
+        _fail()
+    return dict(zip(numbers, questions, strict=True))
+
+
+def _artifact_level3_matches_database(row, artifact, prefix):
+    vote = artifact.get(prefix)
+    if not isinstance(vote, dict):
+        return False
+    related = vote.get("related_codes")
+    return (
+        vote.get("primary_code") == row[f"{prefix}_primary_code"]
+        and related == _decode_codes(row[f"{prefix}_related_codes_json"])
+        and vote.get("confidence") == row[f"{prefix}_confidence"]
+        and vote.get("reason") == row[f"{prefix}_reason"]
+    )
+
+
+def _validate_draft_provenance(row, artifact):
+    if (
+        artifact.get("approved_draft_version") != row["approved_draft_version"]
+        or artifact.get("edited_sha256") != row["edited_sha256"]
+    ):
+        _fail()
+    source = row["approval_source"]
+    if source == "human":
+        if (
+            row["version"] < 2
+            or not row["reviewed_at"]
+            or not row["human_review_note"].startswith("教师复核")
+        ):
+            _fail()
+        return
+    if source not in {"codex_double_pass", "codex_adjudicated"}:
+        _fail()
+    decision = artifact.get("automatic_decision")
+    level2 = artifact.get("level2")
+    proposal = artifact.get("proposal")
+    verifier = artifact.get("verifier")
+    adjudicator = artifact.get("adjudicator")
+    reviewer = (
+        "codex_double_pass" if source == "codex_double_pass"
+        else "codex_adjudicator"
+    )
+    if (
+        not isinstance(decision, dict)
+        or not isinstance(level2, dict)
+        or level2.get("confidence") != "high"
+        or decision != {
+            "approval_source": source,
+            "reviewer": reviewer,
+            "primary_code": artifact.get("final_primary_code"),
+            "related_codes": artifact.get("final_related_codes"),
+            "reason": artifact.get("final_reason"),
+        }
+        or artifact.get("status") != "approved"
+        or artifact.get("approval_source") != source
+        or artifact.get("reviewer") != reviewer
+        or artifact.get("reviewed_at") != row["reviewed_at"]
+        or artifact.get("final_primary_code") != row["final_primary_code"]
+        or artifact.get("final_related_codes")
+        != _decode_codes(row["final_related_codes_json"])
+        or artifact.get("final_reason") != row["final_reason"]
+        or not _artifact_level3_matches_database(row, artifact, "proposal")
+        or not _artifact_level3_matches_database(row, artifact, "verifier")
+    ):
+        _fail()
+    proposal_vote = _classification_vote(proposal)
+    verifier_vote = _classification_vote(verifier)
+    if source == "codex_double_pass":
+        if (
+            proposal.get("confidence") != "high"
+            or verifier.get("confidence") != "high"
+            or proposal_vote != verifier_vote
+            or adjudicator is not None
+            or decision["primary_code"] != proposal["primary_code"]
+            or decision["related_codes"] != proposal["related_codes"]
+            or decision["reason"] != proposal["reason"]
+        ):
+            _fail()
+        return
+    if (
+        not isinstance(adjudicator, dict)
+        or adjudicator.get("confidence") != "high"
+        or not _artifact_level3_matches_database(row, artifact, "adjudicator")
+        or _classification_vote(adjudicator) not in {proposal_vote, verifier_vote}
+        or decision["primary_code"] != adjudicator["primary_code"]
+        or decision["related_codes"] != adjudicator["related_codes"]
+        or decision["reason"] != adjudicator["reason"]
+    ):
+        _fail()
+
+
 def load_classification_page(database_path: str | Path, job_id: int) -> ClassificationPage:
     """Read status and DB-backed UX data without creating rows, drafts, or files."""
     try:
         with closing(sqlite3.connect(database_path)) as connection:
             connection.row_factory = sqlite3.Row
-            if connection.execute("SELECT 1 FROM import_jobs WHERE id=?", (job_id,)).fetchone() is None:
+            job = connection.execute(
+                "SELECT status FROM import_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if job is None:
                 raise KnowledgeClassificationRunError("未找到导入任务")
             run = connection.execute(
                 "SELECT * FROM import_knowledge_classification_runs WHERE import_job_id=?", (job_id,)
@@ -1003,15 +1633,20 @@ def load_classification_page(database_path: str | Path, job_id: int) -> Classifi
                 "SELECT COUNT(*) FROM candidate_knowledge_classifications WHERE import_job_id=?",
                 (job_id,),
             ).fetchone()[0]
+            formal_count = connection.execute(
+                "SELECT COUNT(*) FROM question_sources WHERE import_job_id=?",
+                (job_id,),
+            ).fetchone()[0]
             rows = connection.execute(
                 """SELECT c.*,r.edited_json,k1.name AS final_name,k2.name AS proposal_name,
-                          k3.name AS verifier_name
+                          k3.name AS verifier_name,k4.name AS adjudicator_name
                    FROM candidate_knowledge_classification_drafts c
                    JOIN candidate_review_drafts r ON r.import_job_id=c.import_job_id
                      AND r.source_question_no=c.source_question_no
                    JOIN knowledge_points k1 ON k1.code=c.final_primary_code
                    JOIN knowledge_points k2 ON k2.code=c.proposal_primary_code
                    JOIN knowledge_points k3 ON k3.code=c.verifier_primary_code
+                   LEFT JOIN knowledge_points k4 ON k4.code=c.adjudicator_primary_code
                    WHERE c.import_job_id=?
                    ORDER BY CASE c.status WHEN 'pending' THEN 0 ELSE 1 END,
                             CAST(c.source_question_no AS INTEGER)""", (job_id,)
@@ -1021,12 +1656,33 @@ def load_classification_page(database_path: str | Path, job_id: int) -> Classifi
                 item = dict(row)
                 edited = _decode_object(item["edited_json"])
                 item["stem_markdown"] = str(edited.get("stem_markdown", ""))[:500]
-                for key in ("proposal_related_codes_json", "verifier_related_codes_json", "final_related_codes_json"):
+                for key in (
+                    "proposal_related_codes_json", "verifier_related_codes_json",
+                    "adjudicator_related_codes_json", "final_related_codes_json",
+                ):
                     item[key.removesuffix("_json")] = _decode_codes(item[key])
+                item["reviewer"] = {
+                    "codex_double_pass": "codex_double_pass",
+                    "codex_adjudicated": "codex_adjudicator",
+                    "local_double_pass": "local_double_pass",
+                    "human": "teacher_human_review",
+                }.get(item["approval_source"])
                 drafts.append(item)
             pending = sum(item["status"] == "pending" for item in drafts)
             approved = sum(item["status"] == "approved" for item in drafts)
-            auto = sum(item["approval_source"] == "local_double_pass" for item in drafts)
+            auto = sum(
+                item["approval_source"] in {
+                    "codex_double_pass", "codex_adjudicated", "local_double_pass",
+                }
+                for item in drafts
+            )
+            double = sum(
+                item["approval_source"] in {"codex_double_pass", "local_double_pass"}
+                for item in drafts
+            )
+            adjudicated_count = sum(
+                item["approval_source"] == "codex_adjudicated" for item in drafts
+            )
             if run is None:
                 return ClassificationPage(
                     exists=False,
@@ -1035,10 +1691,16 @@ def load_classification_page(database_path: str | Path, job_id: int) -> Classifi
                     question_count=evidence_count,
                     processed=evidence_count,
                     auto_approved=0,
+                    double_approved=0,
+                    adjudicated_approved=0,
                     pending=0,
                     approved=evidence_count,
                     applied=bool(evidence_count),
                     completed_evidence=bool(evidence_count),
+                    can_replace=False,
+                    replacement_active=False,
+                    replacement_result=None,
+                    replacement_completed_at=None,
                     error_message=None,
                     drafts=(),
                 )
@@ -1049,10 +1711,22 @@ def load_classification_page(database_path: str | Path, job_id: int) -> Classifi
                 question_count=run["question_count"] or 0,
                 processed=run["processed_questions"],
                 auto_approved=auto,
+                double_approved=double,
+                adjudicated_approved=adjudicated_count,
                 pending=pending,
                 approved=approved,
                 applied=run["applied_at"] is not None or bool(evidence_count),
                 completed_evidence=bool(evidence_count),
+                can_replace=bool(
+                    run["status"] == "completed"
+                    and run["applied_at"] is None
+                    and not evidence_count
+                    and not formal_count
+                    and job["status"] != "completed"
+                ),
+                replacement_active=bool(run["replacement_active"]),
+                replacement_result=run["replacement_result"],
+                replacement_completed_at=run["replacement_completed_at"],
                 error_message=run["error_message"],
                 drafts=tuple(drafts),
             )
@@ -1166,7 +1840,7 @@ def apply_classification_evidence(
                 or len(output) != run["output_byte_size"]
             ):
                 _fail()
-            _, _, input_digest, taxonomy_digest = _authoritative_input(
+            authoritative_questions, _, input_digest, taxonomy_digest = _authoritative_input(
                 connection, Path(private_root), job_id, trusted_job=trusted_job,
             )
             if input_digest != run["input_digest"] or taxonomy_digest != run["taxonomy_digest"]:
@@ -1178,10 +1852,43 @@ def apply_classification_evidence(
             ).fetchall()
             if len(rows) != run["question_count"] or any(row["status"] != "approved" for row in rows):
                 _fail()
+            expected_numbers = tuple(
+                item["source_question_no"] for item in authoritative_questions
+            )
+            artifacts = _anchored_artifact_questions(
+                output, run, job_id, expected_numbers
+            )
+            if tuple(row["source_question_no"] for row in rows) != expected_numbers:
+                _fail()
+            for row in rows:
+                _validate_draft_provenance(
+                    row, artifacts[row["source_question_no"]]
+                )
+            sources = {row["approval_source"] for row in rows}
+            source_classifier = (
+                "codex_double_pass"
+                if sources == {"codex_double_pass"}
+                else "codex_adjudicated"
+                if sources == {"codex_adjudicated"}
+                else "codex_multi_pass"
+            )
+            batch_reviewer = (
+                "codex_double_pass"
+                if sources == {"codex_double_pass"}
+                else "codex_adjudicator"
+                if sources == {"codex_adjudicated"}
+                else "mixed_classification_review"
+            )
+            reviewer_by_source = {
+                "codex_double_pass": "codex_double_pass",
+                "codex_adjudicated": "codex_adjudicator",
+                "local_double_pass": "local_double_pass",
+                "human": "teacher_human_review",
+            }
             payload = {
                 "version": 1, "import_job_id": job_id,
-                "source_classifier": f"ollama:{run['model']}",
-                "reviewer": "mixed_local_review",
+                "source_classifier": source_classifier,
+                "reviewer": batch_reviewer,
                 "scope": "knowledge_only_no_solution", "question_count": len(rows),
                 "questions": [{
                     "source_question_no": row["source_question_no"],
@@ -1190,13 +1897,9 @@ def apply_classification_evidence(
                     "reason": (
                         row["human_review_note"]
                         if row["approval_source"] == "human"
-                        else row["proposal_reason"]
+                        else row["final_reason"] or row["proposal_reason"]
                     ),
-                    "reviewer": (
-                        "teacher_human_review"
-                        if row["approval_source"] == "human"
-                        else "local_double_pass"
-                    ),
+                    "reviewer": reviewer_by_source[row["approval_source"]],
                     "approval_source": row["approval_source"],
                 } for row in rows],
             }

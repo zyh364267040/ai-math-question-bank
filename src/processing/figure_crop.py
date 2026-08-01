@@ -6,11 +6,19 @@ import hashlib
 import json
 import math
 import os
+import re
+import secrets
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from PIL import Image, ImageEnhance, ImageFilter, UnidentifiedImageError
+
+from src.processing.secure_crop_artifacts import (
+    SecureCropArtifactError,
+    load_hmac_key,
+    sign_manifest,
+)
 
 
 KINDS = {"question_figure", "review_evidence"}
@@ -108,19 +116,31 @@ def _write_png_atomic(image: Image.Image, output: Path) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _write_manifest(job_dir: Path, assets: list[dict[str, Any]]) -> None:
+def _job_id(job_dir: Path) -> int:
+    match = re.fullmatch(r"import_job_([1-9][0-9]*)", job_dir.name)
+    if match is None:
+        raise CropError("任务目录无效")
+    return int(match.group(1))
+
+
+def _write_manifest(job_dir: Path, assets: list[dict[str, Any]], generation_id: str) -> dict[str, Any]:
     path = job_dir / "figure_assets.json"
     descriptor, name = tempfile.mkstemp(prefix=".figure_assets.", suffix=".tmp", dir=job_dir)
     temporary = Path(name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump({"version": 1, "assets": assets}, stream, ensure_ascii=False, indent=2)
+            manifest = sign_manifest(load_hmac_key(job_dir), {
+                "version": 2, "import_job_id": _job_id(job_dir),
+                "generation_id": generation_id, "assets": assets,
+            })
+            json.dump(manifest, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
         json.loads(temporary.read_text(encoding="utf-8"))
         os.replace(temporary, path)
-    except (OSError, json.JSONDecodeError) as error:
+        return manifest
+    except (OSError, json.JSONDecodeError, SecureCropArtifactError) as error:
         raise CropError("无法原子写入配图清单") from error
     finally:
         temporary.unlink(missing_ok=True)
@@ -132,6 +152,8 @@ def crop_figure(*, job_dir, source_png, output_relative_path, crop_box, question
     """Crop one PNG and record a stable private asset manifest entry."""
     job_dir = Path(job_dir).resolve()
     source = Path(source_png).resolve()
+    if review_status is not None:
+        raise CropError("配图审核状态只能由独立审核服务写入")
     if kind not in KINDS:
         raise CropError("资源用途无效")
     if not job_dir.is_dir() or not source.is_file() or source.suffix.lower() != ".png":
@@ -171,6 +193,18 @@ def crop_figure(*, job_dir, source_png, output_relative_path, crop_box, question
     if manifest_path.exists():
         try:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(payload, dict) or payload.get("version") != 2
+                or payload.get("import_job_id") != _job_id(job_dir)
+                or not isinstance(payload.get("generation_id"), str)
+                or len(payload["generation_id"]) != 32
+            ):
+                raise TypeError
+            expected = sign_manifest(load_hmac_key(job_dir), {
+                key: value for key, value in payload.items() if key != "signature"
+            })["signature"]
+            if payload.get("signature") != expected:
+                raise TypeError
             assets = payload["assets"]
             if not isinstance(assets, list):
                 raise TypeError
@@ -196,16 +230,17 @@ def crop_figure(*, job_dir, source_png, output_relative_path, crop_box, question
     if process["sharpen"]:
         result = result.filter(ImageFilter.UnsharpMask(radius=1.2, percent=125, threshold=3))
     _write_png_atomic(result, output)
-    status = review_status or ("pending_ai_review" if kind == "question_figure" else "review_evidence")
+    status = "pending_ai_review" if kind == "question_figure" else "review_evidence"
     asset = {
         "question_no": question, "kind": kind, "source_page": page_number,
+        "source_relative_path": source.relative_to(job_dir).as_posix(),
         "source_page_sha256": source_hash, "crop_box_pixels": list(pixels),
         "crop_box_normalized": normalized_box, "output_relative_path": relative.as_posix(),
         "width": result.width, "height": result.height, "byte_size": output.stat().st_size,
         "sha256": _sha256(output), "processing": process, "review_status": status,
     }
     try:
-        _write_manifest(job_dir, [*assets, asset])
+        _write_manifest(job_dir, [*assets, asset], secrets.token_hex(16))
     except CropError:
         output.unlink(missing_ok=True)
         raise

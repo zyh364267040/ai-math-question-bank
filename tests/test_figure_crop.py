@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.processing.figure_crop import CropError, crop_figure
+from src.database.initialize import initialize_database
+from src.processing.figure_review import FigureReviewError, record_figure_review
 
 
 class FigureCropTests(unittest.TestCase):
@@ -25,6 +28,24 @@ class FigureCropTests(unittest.TestCase):
             for y in range(80):
                 image.putpixel((x, y), (x * 2, y * 3, 40))
         image.save(self.source, "PNG")
+        self.db = Path(self.temp_dir.name) / "question-bank.db"
+        initialize_database(self.db).close()
+        with sqlite3.connect(self.db) as connection:
+            source_id = connection.execute(
+                """INSERT INTO source_papers
+                   (sha256,file_size,original_filename,stored_path,region_code,
+                    exam_type_code,paper_name)
+                   VALUES (?,1,'fixture.pdf','raw_papers/TJ/unknown/fixture.pdf',
+                           'TJ','QT','fixture')""", ("a" * 64,),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO import_jobs(id,source_paper_id,status) VALUES (9,?,'pending')",
+                (source_id,),
+            )
+        (self.job_dir / "candidate_questions.json").write_text(json.dumps({
+            "version": 1, "import_job_id": 9, "question_count": 1,
+            "questions": [{"source_question_no": "3", "figure_required": True}],
+        }))
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -123,6 +144,46 @@ class FigureCropTests(unittest.TestCase):
             self.crop(kind="thumbnail")
         with self.assertRaises(CropError):
             self.crop(kind="question_figure", processing={"scale": 2})
+
+    def test_caller_cannot_mark_new_figure_as_review_passed(self):
+        with self.assertRaises(CropError):
+            self.crop(review_status="ai_review_passed")
+        self.assertFalse((self.job_dir / "assets/question_003_figure_01.png").exists())
+
+    def test_independent_figure_review_is_signed_and_recrop_invalidates_generation(self):
+        asset = self.crop()
+        manifest = json.loads((self.job_dir / "figure_assets.json").read_text())
+        evidence = record_figure_review(self.db, Path(self.temp_dir.name), {
+            "version": 1, "import_job_id": 9,
+            "input_generation_id": manifest["generation_id"], "question_no": 3,
+            "output_relative_path": asset["output_relative_path"],
+            "reviewer": "independent-figure-review-1", "decision": "approved",
+        })
+        self.assertEqual("approved", evidence["decision"])
+        self.assertRegex(evidence["signature"], r"\A[0-9a-f]{64}\Z")
+        with sqlite3.connect(self.db) as connection:
+            anchor = connection.execute(
+                """SELECT generation_id,artifact_sha256,evidence_signature
+                   FROM import_crop_security_reviews
+                   WHERE import_job_id=9 AND evidence_kind='figure'"""
+            ).fetchone()
+        self.assertEqual(manifest["generation_id"], anchor[0])
+        self.assertEqual(asset["sha256"], anchor[1])
+        self.assertEqual(evidence["signature"], anchor[2])
+
+        second = self.crop(
+            output_relative_path="assets/question_003_figure_02.png",
+            crop_box=(20, 20, 60, 50),
+        )
+        changed = json.loads((self.job_dir / "figure_assets.json").read_text())
+        self.assertNotEqual(manifest["generation_id"], changed["generation_id"])
+        with self.assertRaises(FigureReviewError):
+            record_figure_review(self.db, Path(self.temp_dir.name), {
+                "version": 1, "import_job_id": 9,
+                "input_generation_id": manifest["generation_id"], "question_no": 3,
+                "output_relative_path": second["output_relative_path"],
+                "reviewer": "independent-figure-review-2", "decision": "approved",
+            })
 
 
 if __name__ == "__main__":

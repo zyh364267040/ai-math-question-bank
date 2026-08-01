@@ -26,6 +26,7 @@ from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
+from src.processing.crop_review import CropReviewError, _load_current_crop_review_locked
 from src.processing.crop_review_sheet import generate_crop_review_sheets
 from src.processing.page_layout_analyzer import load_completed_layout
 from src.processing.pdf_page_renderer import (
@@ -38,6 +39,10 @@ from src.processing.question_crop import generate_question_crops_report
 from src.processing.secure_crop_artifacts import (
     SecureCropArtifactError,
     load_hmac_key,
+    locked_job,
+    open_directory_at,
+    read_file_at,
+    write_file_at,
     validate_signed_manifest,
 )
 
@@ -48,6 +53,8 @@ MAX_QUESTIONS = 200
 MAX_REGIONS = 1_000
 MAX_PROMPT_BYTES = 64 * 1024
 MAX_WARNINGS_PER_QUESTION = 100
+MAX_MASK_REGIONS_PER_QUESTION = 10
+MAX_MASK_REASON_LENGTH = 200
 CODEX_TIMEOUT_SECONDS = 300
 SAFE_SPLIT_ERROR = "Codex 自动切题失败，请重试"
 SAFE_CODEX_MISSING = "未配置 Codex：请设置 CODEX_BIN 或安装 Codex CLI"
@@ -65,6 +72,29 @@ class CodexExecutionError(QuestionSplitError):
     """The isolated Codex subprocess did not produce a bounded final message."""
 
 
+class SplitCommitUncertain(QuestionSplitError):
+    """The durable publish witness must be reconciled by the next claim."""
+
+
+def _close_split_locks(artifact_context, job_stream, global_stream):
+    try:
+        if artifact_context is not None:
+            artifact_context.__exit__(None, None, None)
+    finally:
+        # Acquired global -> per-job -> artifacts; release in reverse order.
+        for stream in (job_stream, global_stream):
+            if stream is None:
+                continue
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
 @dataclass(frozen=True)
 class CodexRunResult:
     final_message: str
@@ -78,23 +108,20 @@ class SplitClaim:
     job_id: int
     runner: Any
     replace_invalid: bool
+    review_feedback: tuple[dict[str, Any], ...]
+    frozen_regions: tuple[dict[str, Any], ...]
     lock_stream: Any
     global_lock_stream: Any
+    artifact_lock_context: Any
+    artifact_lock: Any
 
     def close(self):
-        streams = (self.lock_stream, self.global_lock_stream)
+        artifact_context = self.artifact_lock_context
+        self.artifact_lock_context = self.artifact_lock = None
+        job_stream = self.lock_stream
+        global_stream = self.global_lock_stream
         self.lock_stream = self.global_lock_stream = None
-        for stream in streams:
-            if stream is None:
-                continue
-            try:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-            try:
-                stream.close()
-            except OSError:
-                pass
+        _close_split_locks(artifact_context, job_stream, global_stream)
 
 
 def _now():
@@ -268,6 +295,23 @@ def _codex_output_schema():
                         "confidence": {
                             "type": "string", "enum": ["low", "medium", "high"]
                         },
+                        "mask_regions_normalized": {
+                            "type": "array", "maxItems": MAX_MASK_REGIONS_PER_QUESTION,
+                            "items": {
+                                "type": "object", "additionalProperties": False,
+                                "required": ["bbox_normalized", "reason"],
+                                "properties": {
+                                    "bbox_normalized": {
+                                        "type": "array", "minItems": 4, "maxItems": 4,
+                                        "items": coordinate,
+                                    },
+                                    "reason": {
+                                        "type": "string", "minLength": 1,
+                                        "maxLength": MAX_MASK_REASON_LENGTH,
+                                    },
+                                },
+                            },
+                        },
                     },
                 },
             },
@@ -336,10 +380,14 @@ def parse_codex_question_plan(raw, job_id, page_sizes):
         normalized = []
         total_regions = 0
         for expected, question in enumerate(questions, 1):
+            question_keys = {
+                "question_no", "regions", "warnings", "confidence",
+            }
             if (
                 not isinstance(question, dict)
-                or set(question) != {
-                    "question_no", "regions", "warnings", "confidence"
+                or set(question) not in {
+                    frozenset(question_keys),
+                    frozenset((*question_keys, "mask_regions_normalized")),
                 }
                 or type(question["question_no"]) is not int
                 or question["question_no"] != expected
@@ -388,9 +436,76 @@ def parse_codex_question_plan(raw, job_id, page_sizes):
                     "page_number": page, "bbox_normalized": list(box),
                     "bbox": pixels,
                 })
+            raw_masks = question.get("mask_regions_normalized", [])
+            if (
+                not isinstance(raw_masks, list)
+                or len(raw_masks) > MAX_MASK_REGIONS_PER_QUESTION
+            ):
+                raise TypeError
+            normalized_masks = []
+            pixel_masks = []
+            seen_masks = set()
+            for mask in raw_masks:
+                if (
+                    not isinstance(mask, dict)
+                    or set(mask) != {"bbox_normalized", "reason"}
+                ):
+                    raise TypeError
+                box = mask["bbox_normalized"]
+                reason = mask["reason"]
+                if (
+                    not isinstance(box, list) or len(box) != 4
+                    or not all(_number(value) for value in box)
+                    or not isinstance(reason, str)
+                    or not reason.strip()
+                    or len(reason) > MAX_MASK_REASON_LENGTH
+                ):
+                    raise TypeError
+                left, top, right, bottom = box
+                if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+                    raise TypeError
+                identity = tuple(box)
+                if identity in seen_masks:
+                    raise TypeError
+                seen_masks.add(identity)
+                containing = [
+                    region for region in converted
+                    if (
+                        region["bbox_normalized"][0] <= left
+                        and region["bbox_normalized"][1] <= top
+                        and right <= region["bbox_normalized"][2]
+                        and bottom <= region["bbox_normalized"][3]
+                    )
+                ]
+                containing_pages = {region["page_number"] for region in containing}
+                if len(containing) != 1 or len(containing_pages) != 1:
+                    raise TypeError
+                page = next(iter(containing_pages))
+                width, height = page_sizes[page]
+                pixels = [
+                    math.floor(left * width), math.floor(top * height),
+                    math.ceil(right * width), math.ceil(bottom * height),
+                ]
+                if not any(
+                    region["page_number"] == page
+                    and region["bbox"][0] <= pixels[0]
+                    and region["bbox"][1] <= pixels[1]
+                    and pixels[2] <= region["bbox"][2]
+                    and pixels[3] <= region["bbox"][3]
+                    for region in containing
+                ):
+                    raise TypeError
+                normalized_masks.append({
+                    "bbox_normalized": list(box), "reason": reason,
+                })
+                pixel_masks.append({
+                    "page_number": page, "bbox": pixels, "reason": reason,
+                })
             item = {
                 "question_no": expected, "regions": converted,
                 "warnings": list(warnings),
+                "mask_regions_normalized": normalized_masks,
+                "mask_regions": pixel_masks,
             }
             if confidence is not None:
                 item["confidence"] = confidence
@@ -513,8 +628,22 @@ def _load_render(database_path, private_root, job_id):
                 os.close(descriptor)
 
 
-def _prompt(job_id, pages, layout):
+def _prompt(job_id, pages, layout, review_feedback=(), frozen_regions=()):
     hint = json.dumps(layout, ensure_ascii=False, separators=(",", ":")) if layout else "null"
+    feedback = json.dumps(
+        list(review_feedback), ensure_ascii=False, separators=(",", ":")
+    )
+    recrop_numbers = ",".join(
+        str(item["question_no"]) for item in review_feedback
+    )
+    frozen_numbers = ",".join(
+        str(item["question_no"]) for item in frozen_regions
+    )
+    recrop_instruction = (
+        f"冻结题号={frozen_numbers or '无'}；冻结题不得改动；"
+        f"重点只修needs_recrop题号={recrop_numbers or '无'}；"
+        if review_feedback else ""
+    )
     return (
         "只分析随本请求附加的原卷页面图片，不读取或修改任何文件。原图是最终依据。"
         "只识别正式试卷中的连续规范题号；试卷后的答案和解析页不作为新题。"
@@ -526,9 +655,17 @@ def _prompt(job_id, pages, layout):
         "只输出一个JSON对象，禁止Markdown围栏和解释文字。结构必须严格为："
         '{"version":1,"import_job_id":整数,"question_count":整数,"questions":['
         '{"question_no":连续整数,"regions":[{"page_number":整数,'
-        '"bbox_normalized":[left,top,right,bottom]}],"warnings":[],"confidence":low、medium或high}]}'
+        '"bbox_normalized":[left,top,right,bottom]}],"warnings":[],"confidence":low、medium或high,'
+        '"mask_regions_normalized":[{"bbox_normalized":[left,top,right,bottom],'
+        '"reason":"原因"}]}]}。mask_regions_normalized可省略，默认空列表；'
+        "遮罩仅限经独立确认不覆盖试题内容的二维码、水印、群组或答案获取宣传层；"
+        "绝不能用于隐藏题干、选项、答案、解析，也不能用于掩盖相邻题边界错误；"
         f"。import_job_id={job_id}；允许页码={','.join(str(x[0]) for x in pages)}；"
-        f"可选版面提示={hint}"
+        f"可选版面提示={hint}；"
+        "以下审核反馈仅在非空时是当前数据库锚定且验签通过的重切依据；"
+        "逐题修正其中标记为needs_recrop的边界，同时仍须复核所有题的连续性；"
+        f"{recrop_instruction}"
+        f"可信审核反馈={feedback}"
     )
 
 
@@ -759,6 +896,199 @@ def record_split_claim_failure(database_path, private_root, job_id, error):
                 pass
 
 
+def _retained_review_context(current, review, private_root, job_id):
+    retained_valid = bool(
+        current[2] in {"completed", "failed", "processing"}
+        and current[9] == current[5] and current[10] == current[8]
+        and _completed_result_valid(
+            private_root, job_id, current[3], current[4],
+            current[11], current[12], current[13],
+        )
+    )
+    review_matches = bool(
+        retained_valid
+        and review
+        and review["input_generation_id"] == current[12]
+        and review["output_manifest_sha256"] == current[11]
+        and review["output_manifest_signature"] == current[13]
+    )
+    feedback = tuple(
+        {
+            "question_no": item["question_no"],
+            "status": item["status"],
+            "warnings": list(item["warnings"]),
+        }
+        for item in review["questions"]
+        if item["status"] == "needs_recrop"
+    ) if review_matches else ()
+    passed_numbers = tuple(
+        item["question_no"]
+        for item in review["questions"]
+        if item["status"] == "ai_review_passed"
+    ) if review_matches else ()
+    return retained_valid, review_matches, feedback, passed_numbers
+
+
+def _load_trusted_frozen_regions(
+    artifact_lock, job_id, question_count, expected_digest, passed_numbers, page_sizes,
+    crop_manifest_digest, crop_generation_id, crop_manifest_signature,
+):
+    """Read passed regions only from the DB-anchored current split artifact."""
+    try:
+        snapshot = read_file_at(
+            artifact_lock.descriptor,
+            "question_regions.json",
+            max_bytes=MAX_CODEX_OUTPUT_BYTES,
+        )
+        if snapshot.sha256 != expected_digest:
+            raise TypeError
+        stored = json.loads(snapshot.data.decode("utf-8"))
+        if (
+            not isinstance(stored, dict)
+            or set(stored) != {
+                "version", "import_job_id", "question_count", "questions",
+            }
+            or stored.get("version") != 1
+            or stored.get("import_job_id") != job_id
+            or stored.get("question_count") != question_count
+            or not isinstance(stored.get("questions"), list)
+        ):
+            raise TypeError
+        codex_questions = []
+        for question in stored["questions"]:
+            base_keys = {
+                "question_no", "regions", "warnings", "confidence",
+            }
+            mask_keys = {"mask_regions_normalized", "mask_regions"}
+            if (
+                not isinstance(question, dict)
+                or set(question) not in {
+                    frozenset(base_keys), frozenset((*base_keys, *mask_keys)),
+                }
+                or not isinstance(question["regions"], list)
+            ):
+                raise TypeError
+            regions = []
+            for region in question["regions"]:
+                if (
+                    not isinstance(region, dict)
+                    or set(region) != {
+                        "page_number", "bbox_normalized", "bbox",
+                    }
+                ):
+                    raise TypeError
+                regions.append({
+                    "page_number": region["page_number"],
+                    "bbox_normalized": region["bbox_normalized"],
+                })
+            codex_questions.append({
+                "question_no": question["question_no"],
+                "regions": regions,
+                "warnings": question["warnings"],
+                "confidence": question["confidence"],
+                "mask_regions_normalized": question.get(
+                    "mask_regions_normalized", []
+                ),
+            })
+        normalized = parse_codex_question_plan(json.dumps({
+            "version": stored["version"],
+            "import_job_id": stored["import_job_id"],
+            "question_count": stored["question_count"],
+            "questions": codex_questions,
+        }), job_id, page_sizes)
+        canonical_stored = json.loads(json.dumps(stored))
+        for question in canonical_stored["questions"]:
+            question.setdefault("mask_regions_normalized", [])
+            question.setdefault("mask_regions", [])
+        if normalized != canonical_stored:
+            raise TypeError
+        expected_numbers = tuple(range(1, question_count + 1))
+        if (
+            tuple(item["question_no"] for item in normalized["questions"])
+            != expected_numbers
+            or tuple(sorted(passed_numbers)) != tuple(passed_numbers)
+            or any(number not in expected_numbers for number in passed_numbers)
+        ):
+            raise TypeError
+        passed = set(passed_numbers)
+        manifest_snapshot = read_file_at(
+            artifact_lock.descriptor,
+            "question_crops.json",
+            max_bytes=16 * 1024 * 1024,
+        )
+        if manifest_snapshot.sha256 != crop_manifest_digest:
+            raise TypeError
+        manifest = validate_signed_manifest(
+            json.loads(manifest_snapshot.data.decode("utf-8")),
+            load_hmac_key(artifact_lock.path),
+            expected_job_id=job_id,
+            expected_question_nos=list(expected_numbers),
+        )
+        if (
+            manifest["generation_id"] != crop_generation_id
+            or manifest["signature"] != crop_manifest_signature
+        ):
+            raise TypeError
+        manifest_by_number = {
+            item["question_no"]: item for item in manifest["questions"]
+        }
+        for question in normalized["questions"]:
+            if question["question_no"] not in passed:
+                continue
+            crop = manifest_by_number[question["question_no"]]
+            if (
+                crop["review_status"] != "ai_review_passed"
+                or crop["regions"] != [
+                    {
+                        "page_number": region["page_number"],
+                        "bbox": region["bbox"],
+                    }
+                    for region in question["regions"]
+                ]
+                or crop.get("mask_regions_normalized", [])
+                != question["mask_regions_normalized"]
+                or crop.get("mask_regions", []) != question["mask_regions"]
+            ):
+                raise TypeError
+        frozen = tuple(
+            json.loads(json.dumps(item))
+            for item in normalized["questions"]
+            if item["question_no"] in passed
+        )
+        if len(frozen) != len(passed_numbers):
+            raise TypeError
+        return frozen
+    except (
+        OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError,
+        QuestionSplitError, SecureCropArtifactError,
+    ) as error:
+        raise QuestionSplitError(SAFE_EXISTING_ERROR) from error
+
+
+def _merge_frozen_regions(plan, review_feedback, frozen_regions):
+    if not review_feedback:
+        if frozen_regions:
+            raise QuestionSplitError(SAFE_EXISTING_ERROR)
+        return plan
+    recrop_numbers = tuple(item["question_no"] for item in review_feedback)
+    frozen_numbers = tuple(item["question_no"] for item in frozen_regions)
+    expected_numbers = tuple(range(1, plan["question_count"] + 1))
+    if (
+        len(set(recrop_numbers)) != len(recrop_numbers)
+        or len(set(frozen_numbers)) != len(frozen_numbers)
+        or set(recrop_numbers).intersection(frozen_numbers)
+        or tuple(sorted((*recrop_numbers, *frozen_numbers))) != expected_numbers
+    ):
+        raise QuestionSplitError(SAFE_EXISTING_ERROR)
+    merged = json.loads(json.dumps(plan))
+    for frozen in frozen_regions:
+        number = frozen["question_no"]
+        if number != merged["questions"][number - 1]["question_no"]:
+            raise QuestionSplitError(SAFE_EXISTING_ERROR)
+        merged["questions"][number - 1] = json.loads(json.dumps(frozen))
+    return merged
+
+
 def claim_split_job(database_path, private_root, job_id, runner=None):
     if type(job_id) is not int or job_id < 1:
         raise QuestionSplitError("切题任务参数无效")
@@ -781,8 +1111,10 @@ def claim_split_job(database_path, private_root, job_id, runner=None):
         value is None for value in row[5:9]
     ):
         raise QuestionSplitError(SAFE_RENDER_REQUIRED)
-    global_stream = job_stream = None
+    global_stream = job_stream = artifact_context = artifact_lock = None
     try:
+        # Canonical acquisition order: global split, per-job split, artifacts.
+        # Review writers acquire only artifacts, so no reverse edge can deadlock.
         global_stream, job_stream = _prepare_locks(private_root, job_id)
         try:
             fcntl.flock(global_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -792,7 +1124,20 @@ def claim_split_job(database_path, private_root, job_id, runner=None):
                 if stream:
                     stream.close()
             return None
+        artifact_context = locked_job(
+            private_root / "processing" / f"import_job_{job_id}"
+        )
+        artifact_lock = artifact_context.__enter__()
         _recover_split_transaction(database_path, private_root, job_id)
+        try:
+            review = _load_current_crop_review_locked(
+                database_path, artifact_lock, job_id, recover=True,
+            )
+        except (CropReviewError, OSError, SecureCropArtifactError):
+            review = None
+        feedback: tuple[dict[str, Any], ...] = ()
+        frozen_regions: tuple[dict[str, Any], ...] = ()
+        page_sizes = None
         now = _now()
         with closing(sqlite3.connect(database_path, timeout=10)) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -812,19 +1157,29 @@ def claim_split_job(database_path, private_root, job_id, runner=None):
                 or any(value is None for value in current[5:9])
             ):
                 raise QuestionSplitError(SAFE_RENDER_REQUIRED)
-            if (
-                current[2] == "completed"
-                and current[9] == current[5] and current[10] == current[8]
-                and _completed_result_valid(
-                    private_root, job_id, current[3], current[4],
-                    current[11], current[12], current[13],
+            retained_valid, review_matches, feedback, passed_numbers = (
+                _retained_review_context(
+                    current, review, private_root, job_id,
                 )
-            ):
+            )
+            if current[2] == "completed" and retained_valid and not feedback:
                 connection.rollback()
-                for stream in (job_stream, global_stream):
-                    if stream:
-                        stream.close()
+                closing_context = artifact_context
+                closing_job_stream = job_stream
+                closing_global_stream = global_stream
+                artifact_context = artifact_lock = None
+                job_stream = global_stream = None
+                _close_split_locks(
+                    closing_context, closing_job_stream, closing_global_stream,
+                )
                 return None
+            if review_matches and feedback:
+                pages = _load_render(database_path, private_root, job_id)
+                page_sizes = {item[0]: item[2] for item in pages}
+                frozen_regions = _load_trusted_frozen_regions(
+                    artifact_lock, job_id, current[3], current[4],
+                    passed_numbers, page_sizes, current[11], current[12], current[13],
+                )
             connection.rollback()
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
@@ -843,19 +1198,32 @@ def claim_split_job(database_path, private_root, job_id, runner=None):
                 or any(value is None for value in current[5:9])
             ):
                 raise QuestionSplitError(SAFE_RENDER_REQUIRED)
-            if (
-                current[2] == "completed"
-                and current[9] == current[5] and current[10] == current[8]
-                and _completed_result_valid(
-                    private_root, job_id, current[3], current[4],
-                    current[11], current[12], current[13],
+            retained_valid, review_matches, feedback, passed_numbers = (
+                _retained_review_context(
+                    current, review, private_root, job_id,
                 )
-            ):
+            )
+            if current[2] == "completed" and retained_valid and not feedback:
                 connection.rollback()
-                for stream in (job_stream, global_stream):
-                    if stream:
-                        stream.close()
+                closing_context = artifact_context
+                closing_job_stream = job_stream
+                closing_global_stream = global_stream
+                artifact_context = artifact_lock = None
+                job_stream = global_stream = None
+                _close_split_locks(
+                    closing_context, closing_job_stream, closing_global_stream,
+                )
                 return None
+            if review_matches and feedback:
+                if page_sizes is None:
+                    pages = _load_render(database_path, private_root, job_id)
+                    page_sizes = {item[0]: item[2] for item in pages}
+                frozen_regions = _load_trusted_frozen_regions(
+                    artifact_lock, job_id, current[3], current[4],
+                    passed_numbers, page_sizes, current[11], current[12], current[13],
+                )
+            else:
+                frozen_regions = ()
             if runner is None:
                 runner = CodexCliRunner()
             connection.execute(
@@ -869,35 +1237,153 @@ def claim_split_job(database_path, private_root, job_id, runner=None):
             )
             connection.commit()
         return SplitClaim(
-            database_path, private_root, job_id, runner, current[2] == "completed",
-            job_stream, global_stream
+            database_path, private_root, job_id, runner,
+            current[2] == "completed" or retained_valid,
+            feedback, frozen_regions, job_stream, global_stream,
+            artifact_context, artifact_lock,
         )
     except Exception:
-        for stream in (job_stream, global_stream):
-            if stream:
-                stream.close()
+        _close_split_locks(artifact_context, job_stream, global_stream)
         raise
 
 
-_FORMAL_OUTPUTS = ("question_regions.json", "question_crops", "question_crops.json", "review")
+_FORMAL_OUTPUTS = (
+    "question_regions.json", "question_crops", "question_crops.json",
+    "crop_ai_review.json", "review",
+)
 _SPLIT_BACKUP_NAME = ".split-backup-current"
 _SPLIT_JOURNAL_NAME = ".split-publish-journal.json"
 
 
-def _safe_backup_source(path, *, max_entries=5_000):
-    """Reject links and excessive trees before copying an old trusted generation."""
-    pending = [path]
-    seen = 0
-    while pending:
-        current = pending.pop()
-        details = current.lstat()
-        seen += 1
-        if seen > max_entries or stat.S_ISLNK(details.st_mode):
+def _backup_identity(details):
+    return (
+        details.st_dev, details.st_ino, stat.S_IFMT(details.st_mode),
+        details.st_nlink, details.st_size, details.st_mtime_ns, details.st_ctime_ns,
+    )
+
+
+def _entry_details(parent_fd, name):
+    return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+
+
+def _entry_still_bound(parent_fd, name, expected):
+    try:
+        return _backup_identity(_entry_details(parent_fd, name)) == expected
+    except FileNotFoundError:
+        return False
+
+
+def _remove_tree_at(parent_fd, name):
+    """Remove one controlled entry without ever following a replaced link."""
+    try:
+        details = _entry_details(parent_fd, name)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(details.st_mode):
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            if _backup_identity(os.fstat(descriptor)) != _backup_identity(details):
+                raise QuestionSplitError(SAFE_EXISTING_ERROR)
+            with os.scandir(descriptor) as entries:
+                children = [entry.name for entry in entries]
+            for child in children:
+                _remove_tree_at(descriptor, child)
+        finally:
+            os.close(descriptor)
+        os.rmdir(name, dir_fd=parent_fd)
+    else:
+        os.unlink(name, dir_fd=parent_fd)
+
+
+def _copy_bound_entry(
+    source_parent_fd, source_name, target_parent_fd, target_name, budget,
+):
+    """Copy from pinned descriptors and reject every entry identity race."""
+    before = _entry_details(source_parent_fd, source_name)
+    expected = _backup_identity(before)
+    budget[0] += 1
+    if budget[0] > budget[1] or stat.S_ISLNK(before.st_mode):
+        raise QuestionSplitError(SAFE_EXISTING_ERROR)
+    try:
+        if stat.S_ISREG(before.st_mode):
+            if before.st_nlink != 1:
+                raise QuestionSplitError(SAFE_EXISTING_ERROR)
+            source_fd = os.open(
+                source_name,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=source_parent_fd,
+            )
+            target_fd = None
+            try:
+                if _backup_identity(os.fstat(source_fd)) != expected:
+                    raise QuestionSplitError(SAFE_EXISTING_ERROR)
+                target_fd = os.open(
+                    target_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    stat.S_IMODE(before.st_mode) & 0o700,
+                    dir_fd=target_parent_fd,
+                )
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(target_fd, view)
+                        view = view[written:]
+                os.fsync(target_fd)
+                if (
+                    _backup_identity(os.fstat(source_fd)) != expected
+                    or not _entry_still_bound(source_parent_fd, source_name, expected)
+                ):
+                    raise QuestionSplitError(SAFE_EXISTING_ERROR)
+            finally:
+                if target_fd is not None:
+                    os.close(target_fd)
+                os.close(source_fd)
+            return
+        if not stat.S_ISDIR(before.st_mode):
             raise QuestionSplitError(SAFE_EXISTING_ERROR)
-        if current.is_dir():
-            pending.extend(current.iterdir())
-        elif not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
-            raise QuestionSplitError(SAFE_EXISTING_ERROR)
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        source_fd = os.open(source_name, flags, dir_fd=source_parent_fd)
+        target_fd = None
+        try:
+            if _backup_identity(os.fstat(source_fd)) != expected:
+                raise QuestionSplitError(SAFE_EXISTING_ERROR)
+            os.mkdir(target_name, stat.S_IMODE(before.st_mode) & 0o700, dir_fd=target_parent_fd)
+            target_fd = os.open(target_name, flags, dir_fd=target_parent_fd)
+            with os.scandir(source_fd) as entries:
+                names = sorted(entry.name for entry in entries)
+            for name in names:
+                _copy_bound_entry(source_fd, name, target_fd, name, budget)
+            os.fsync(target_fd)
+            if (
+                _backup_identity(os.fstat(source_fd)) != expected
+                or not _entry_still_bound(source_parent_fd, source_name, expected)
+            ):
+                raise QuestionSplitError(SAFE_EXISTING_ERROR)
+        finally:
+            if target_fd is not None:
+                os.close(target_fd)
+            os.close(source_fd)
+    except Exception as error:
+        try:
+            _remove_tree_at(target_parent_fd, target_name)
+        except (OSError, QuestionSplitError):
+            pass
+        if isinstance(error, QuestionSplitError):
+            raise
+        raise QuestionSplitError(SAFE_EXISTING_ERROR) from error
 
 
 def _journal_signature(key, payload):
@@ -930,77 +1416,221 @@ def _fsync_backup_tree(root):
             os.close(descriptor)
 
 
-def _snapshot_outputs(job_dir):
-    backup = job_dir / _SPLIT_BACKUP_NAME
+def _split_anchors(database_path, job_id):
+    with closing(sqlite3.connect(database_path)) as connection:
+        row = connection.execute(
+            """SELECT question_count,result_manifest_sha256,crop_manifest_sha256,
+                      crop_generation_id,crop_manifest_signature
+               FROM import_question_split_runs WHERE import_job_id=?""", (job_id,)
+        ).fetchone()
+    return tuple(row) if row is not None else (None, None, None, None, None)
+
+
+def _authoritative_split_commit_state(
+    database_path, private_root, job_id, old_anchors, new_anchors,
+):
+    """Classify a throwing commit through a fresh SQLite connection and artifacts."""
+    try:
+        current = _split_anchors(database_path, job_id)
+    except sqlite3.Error:
+        return "unknown"
+    if current == tuple(new_anchors):
+        try:
+            valid = _completed_result_valid(
+                private_root, job_id, new_anchors[0], new_anchors[1],
+                new_anchors[2], new_anchors[3], new_anchors[4],
+            )
+        except (OSError, QuestionSplitError, SecureCropArtifactError):
+            return "unknown"
+        return "committed" if valid else "unknown"
+    if current == tuple(old_anchors):
+        return "uncommitted"
+    return "unknown"
+
+
+def _write_split_journal(job_dir, payload):
+    unsigned = {key: payload[key] for key in (
+        "version", "saved_outputs", "old_anchors", "new_anchors",
+    )}
+    signed = {
+        **unsigned,
+        "signature": _journal_signature(load_hmac_key(job_dir), unsigned),
+    }
+    _atomic_json(job_dir / _SPLIT_JOURNAL_NAME, signed)
+
+
+def _valid_split_anchors(value, *, allow_none):
+    if value is None:
+        return allow_none
+    if not isinstance(value, list) or len(value) != 5:
+        return False
+    count, result_digest, crop_digest, generation, signature = value
+    if all(item is None for item in value):
+        return True
+    return bool(
+        type(count) is int and 1 <= count <= MAX_QUESTIONS
+        and all(isinstance(item, str) for item in value[1:])
+        and len(result_digest) == 64 and len(crop_digest) == 64
+        and len(generation) == 32 and len(signature) == 64
+    )
+
+
+def _read_split_journal(job_dir):
     journal = job_dir / _SPLIT_JOURNAL_NAME
-    if journal.exists() or journal.is_symlink():
+    details = journal.lstat()
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1 or details.st_size > 64 * 1024:
         raise QuestionSplitError(SAFE_EXISTING_ERROR)
-    if backup.exists() or backup.is_symlink():
-        if backup.is_dir() and not backup.is_symlink():
-            shutil.rmtree(backup)
+    try:
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise QuestionSplitError(SAFE_EXISTING_ERROR) from error
+    if not isinstance(payload, dict) or set(payload) != {
+        "version", "saved_outputs", "old_anchors", "new_anchors", "signature",
+    }:
+        raise QuestionSplitError(SAFE_EXISTING_ERROR)
+    unsigned = {key: payload[key] for key in (
+        "version", "saved_outputs", "old_anchors", "new_anchors",
+    )}
+    if (
+        payload["version"] != 2 or not isinstance(payload["saved_outputs"], list)
+        or any(not isinstance(name, str) for name in payload["saved_outputs"])
+        or len(set(payload["saved_outputs"])) != len(payload["saved_outputs"])
+        or any(name not in _FORMAL_OUTPUTS for name in payload["saved_outputs"])
+        or not _valid_split_anchors(payload["old_anchors"], allow_none=False)
+        or not _valid_split_anchors(payload["new_anchors"], allow_none=True)
+        or not isinstance(payload["signature"], str)
+        or not hmac.compare_digest(
+            payload["signature"], _journal_signature(load_hmac_key(job_dir), unsigned)
+        )
+    ):
+        raise QuestionSplitError(SAFE_EXISTING_ERROR)
+    return payload
+
+
+def _snapshot_outputs(job_dir, database_path, job_id):
+    backup = job_dir / _SPLIT_BACKUP_NAME
+    flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    job_fd = os.open(job_dir, flags)
+    backup_fd = None
+    try:
+        try:
+            _entry_details(job_fd, _SPLIT_JOURNAL_NAME)
+        except FileNotFoundError:
+            pass
         else:
             raise QuestionSplitError(SAFE_EXISTING_ERROR)
-    backup.mkdir(mode=0o700)
-    saved = []
-    try:
+        try:
+            _entry_details(job_fd, _SPLIT_BACKUP_NAME)
+        except FileNotFoundError:
+            pass
+        else:
+            _remove_tree_at(job_fd, _SPLIT_BACKUP_NAME)
+        os.mkdir(_SPLIT_BACKUP_NAME, 0o700, dir_fd=job_fd)
+        backup_fd = os.open(_SPLIT_BACKUP_NAME, flags, dir_fd=job_fd)
+        saved = []
+        budget = [0, 5_000]
         for name in _FORMAL_OUTPUTS:
-            source = job_dir / name
-            if not source.exists():
+            try:
+                _entry_details(job_fd, name)
+            except FileNotFoundError:
                 continue
-            _safe_backup_source(source)
-            if source.is_dir():
-                shutil.copytree(source, backup / name)
-            else:
-                shutil.copy2(source, backup / name, follow_symlinks=False)
+            _copy_bound_entry(job_fd, name, backup_fd, name, budget)
             saved.append(name)
-        _fsync_backup_tree(backup)
-        unsigned = {"version": 1, "saved_outputs": saved}
-        payload = {**unsigned, "signature": _journal_signature(
-            load_hmac_key(job_dir), unsigned
-        )}
-        _atomic_json(journal, payload)
+        os.fsync(backup_fd)
+        os.close(backup_fd)
+        backup_fd = None
+        _write_split_journal(job_dir, {
+            "version": 2,
+            "saved_outputs": saved,
+            "old_anchors": list(_split_anchors(database_path, job_id)),
+            "new_anchors": None,
+        })
         return backup
     except Exception:
-        shutil.rmtree(backup, ignore_errors=True)
         try:
-            journal.unlink()
+            _remove_tree_at(job_fd, _SPLIT_BACKUP_NAME)
+        except (OSError, QuestionSplitError):
+            pass
+        try:
+            os.unlink(_SPLIT_JOURNAL_NAME, dir_fd=job_fd)
         except FileNotFoundError:
             pass
         raise
+    finally:
+        if backup_fd is not None:
+            os.close(backup_fd)
+        os.close(job_fd)
+
+
+def _record_new_split_anchors(job_dir, new_anchors):
+    payload = _read_split_journal(job_dir)
+    if payload["new_anchors"] is not None:
+        raise QuestionSplitError(SAFE_EXISTING_ERROR)
+    _write_split_journal(job_dir, {
+        "version": 2,
+        "saved_outputs": payload["saved_outputs"],
+        "old_anchors": payload["old_anchors"],
+        "new_anchors": list(new_anchors),
+    })
 
 
 def _restore_outputs(job_dir, backup):
     """Idempotently restore from retained copies; backup survives interrupted recovery."""
-    for name in _FORMAL_OUTPUTS:
-        target = job_dir / name
-        saved = backup / name
-        stage = job_dir / f".split-restore-{name}"
-        for path in (stage,):
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
-            elif path.exists() or path.is_symlink():
-                path.unlink()
-        if saved.exists():
-            _safe_backup_source(saved)
-            if saved.is_dir():
-                shutil.copytree(saved, stage)
-            else:
-                shutil.copy2(saved, stage, follow_symlinks=False)
-        if target.is_dir() and not target.is_symlink():
-            shutil.rmtree(target)
-        elif target.exists() or target.is_symlink():
-            target.unlink()
-        if saved.exists():
-            os.replace(stage, target)
+    if Path(backup) != Path(job_dir) / _SPLIT_BACKUP_NAME:
+        raise QuestionSplitError(SAFE_EXISTING_ERROR)
+    payload = _read_split_journal(job_dir)
+    saved_names = set(payload["saved_outputs"])
+    flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    job_fd = os.open(job_dir, flags)
+    backup_fd = None
+    stages = []
     try:
-        (job_dir / _SPLIT_JOURNAL_NAME).unlink()
-    except FileNotFoundError:
-        pass
-    shutil.rmtree(backup, ignore_errors=True)
+        backup_fd = os.open(_SPLIT_BACKUP_NAME, flags, dir_fd=job_fd)
+        budget = [0, 5_000]
+        for name in _FORMAL_OUTPUTS:
+            stage = f".split-restore-{name}"
+            _remove_tree_at(job_fd, stage)
+            if name in saved_names:
+                _copy_bound_entry(backup_fd, name, job_fd, stage, budget)
+                stages.append((name, stage))
+            else:
+                try:
+                    _entry_details(backup_fd, name)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise QuestionSplitError(SAFE_EXISTING_ERROR)
+        for name in _FORMAL_OUTPUTS:
+            _remove_tree_at(job_fd, name)
+        for name, stage in stages:
+            os.replace(stage, name, src_dir_fd=job_fd, dst_dir_fd=job_fd)
+        os.fsync(job_fd)
+        os.unlink(_SPLIT_JOURNAL_NAME, dir_fd=job_fd)
+        os.close(backup_fd)
+        backup_fd = None
+        _remove_tree_at(job_fd, _SPLIT_BACKUP_NAME)
+        os.fsync(job_fd)
+    except Exception:
+        for _, stage in stages:
+            try:
+                _remove_tree_at(job_fd, stage)
+            except (OSError, QuestionSplitError):
+                pass
+        raise
+    finally:
+        if backup_fd is not None:
+            os.close(backup_fd)
+        os.close(job_fd)
 
 
 def _recover_split_transaction(database_path, private_root, job_id):
-    """Restore the previous complete generation left by a killed worker."""
+    """Finish a DB-committed generation or restore a pre-commit publication."""
     job_dir = Path(private_root) / "processing" / f"import_job_{job_id}"
     journal = job_dir / _SPLIT_JOURNAL_NAME
     backup = job_dir / _SPLIT_BACKUP_NAME
@@ -1008,24 +1638,30 @@ def _recover_split_transaction(database_path, private_root, job_id):
         if backup.exists() and backup.is_dir() and not backup.is_symlink():
             shutil.rmtree(backup)
         return False
-    details = journal.lstat()
-    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1 or details.st_size > 64 * 1024:
+    payload = _read_split_journal(job_dir)
+    current_anchors = _split_anchors(database_path, job_id)
+    new_anchors = (
+        tuple(payload["new_anchors"])
+        if payload["new_anchors"] is not None else None
+    )
+    if new_anchors is not None and current_anchors == new_anchors:
+        if not _completed_result_valid(
+            private_root, job_id, new_anchors[0], new_anchors[1],
+            new_anchors[2], new_anchors[3], new_anchors[4],
+        ):
+            raise QuestionSplitError(SAFE_EXISTING_ERROR)
+        if backup.exists() or backup.is_symlink():
+            if not backup.is_dir() or backup.is_symlink():
+                raise QuestionSplitError(SAFE_EXISTING_ERROR)
+            shutil.rmtree(backup)
+        try:
+            journal.unlink()
+        except FileNotFoundError:
+            pass
+        return True
+    if not backup.is_dir() or backup.is_symlink():
         raise QuestionSplitError(SAFE_EXISTING_ERROR)
-    payload = json.loads(journal.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or set(payload) != {
-        "version", "saved_outputs", "signature"
-    }:
-        raise QuestionSplitError(SAFE_EXISTING_ERROR)
-    unsigned = {"version": payload["version"], "saved_outputs": payload["saved_outputs"]}
-    if (
-        payload["version"] != 1 or not isinstance(payload["saved_outputs"], list)
-        or any(name not in _FORMAL_OUTPUTS for name in payload["saved_outputs"])
-        or not isinstance(payload["signature"], str)
-        or not hmac.compare_digest(
-            payload["signature"], _journal_signature(load_hmac_key(job_dir), unsigned)
-        )
-        or not backup.is_dir() or backup.is_symlink()
-    ):
+    if current_anchors != tuple(payload["old_anchors"]):
         raise QuestionSplitError(SAFE_EXISTING_ERROR)
     _restore_outputs(job_dir, backup)
     with closing(sqlite3.connect(database_path)) as connection:
@@ -1064,6 +1700,68 @@ def _remove_formal_output(job_dir, name):
         target.unlink()
 
 
+def _freeze_passed_crop_reviews(database_path, artifact_lock, job_id, recrop_numbers):
+    """Archive the exact signed review batch and anchor each untouched passed crop."""
+    review = _load_current_crop_review_locked(
+        database_path, artifact_lock, job_id, recover=True,
+    )
+    manifest_snapshot = read_file_at(
+        artifact_lock.descriptor, "question_crops.json", max_bytes=16 * 1024 * 1024,
+    )
+    manifest = validate_signed_manifest(
+        json.loads(manifest_snapshot.data), load_hmac_key(artifact_lock.path),
+        expected_job_id=job_id,
+    )
+    evidence_snapshot = read_file_at(
+        artifact_lock.descriptor, "crop_ai_review.json", max_bytes=4 * 1024 * 1024,
+    )
+    passed = {
+        item["question_no"] for item in review["questions"]
+        if item["status"] == "ai_review_passed"
+    }
+    if passed.intersection(recrop_numbers):
+        raise QuestionSplitError(SAFE_EXISTING_ERROR)
+    try:
+        os.mkdir("frozen_crop_reviews", 0o700, dir_fd=artifact_lock.descriptor)
+    except FileExistsError:
+        pass
+    archive_fd = open_directory_at(artifact_lock.descriptor, "frozen_crop_reviews")
+    archive_name = f"evidence_{evidence_snapshot.sha256}.json"
+    try:
+        try:
+            write_file_at(archive_fd, archive_name, evidence_snapshot.data)
+        except FileExistsError:
+            existing = read_file_at(
+                archive_fd, archive_name, max_bytes=4 * 1024 * 1024,
+            )
+            if existing.sha256 != evidence_snapshot.sha256:
+                raise QuestionSplitError(SAFE_EXISTING_ERROR)
+    finally:
+        os.close(archive_fd)
+    entries = {item["question_no"]: item for item in manifest["questions"]}
+    now = _now()
+    with closing(sqlite3.connect(database_path)) as connection:
+        for number in sorted(passed):
+            entry = entries[number]
+            entry_digest = hashlib.sha256(json.dumps(
+                entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest()
+            connection.execute(
+                """INSERT INTO import_frozen_crop_reviews
+                   (import_job_id,question_no,crop_generation_id,crop_sha256,
+                    manifest_entry_sha256,source_manifest_sha256,
+                    source_manifest_signature,review_evidence_sha256,
+                    review_evidence_signature,evidence_relative_path,reviewer,frozen_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(import_job_id,question_no,crop_generation_id) DO NOTHING""",
+                (job_id, number, manifest["generation_id"], entry["sha256"],
+                 entry_digest, manifest_snapshot.sha256, manifest["signature"],
+                 evidence_snapshot.sha256, review["signature"],
+                 f"frozen_crop_reviews/{archive_name}", review["reviewer_run_id"], now),
+            )
+        connection.commit()
+
+
 def _atomic_json(path, value):
     content = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -1099,7 +1797,10 @@ def _mark_failed(database_path, job_id):
         pass
 
 
-def split_import_job(database_path, private_root, job_id, runner, *, replace_invalid=False):
+def split_import_job(
+    database_path, private_root, job_id, runner, *, replace_invalid=False,
+    review_feedback=(), frozen_regions=(), artifact_lock=None,
+):
     job_dir = Path(private_root) / "processing" / f"import_job_{job_id}"
     pages = _load_render(database_path, private_root, job_id)
     layout = None
@@ -1126,32 +1827,52 @@ def split_import_job(database_path, private_root, job_id, runner, *, replace_inv
                 os.fsync(stream.fileno())
             image_paths.append(path)
         response = runner.run(
-            image_paths=image_paths, prompt=_prompt(job_id, pages, layout)
+            image_paths=image_paths,
+            prompt=_prompt(
+                job_id, pages, layout, review_feedback, frozen_regions,
+            ),
         )
     if not isinstance(response, CodexRunResult):
         raise QuestionSplitError(SAFE_SPLIT_ERROR)
     plan = parse_codex_question_plan(
         response.final_message, job_id, {item[0]: item[2] for item in pages}
     )
-    backup = _snapshot_outputs(job_dir)
+    plan = _merge_frozen_regions(plan, review_feedback, frozen_regions)
+    recrop_numbers = tuple(
+        item["question_no"] for item in review_feedback
+    )
+    if replace_invalid and recrop_numbers:
+        _freeze_passed_crop_reviews(
+            database_path, artifact_lock, job_id, set(recrop_numbers),
+        )
+    backup = _snapshot_outputs(job_dir, database_path, job_id)
+    database_committed = False
+    commit_uncertain = False
     try:
-        if replace_invalid:
-            for name in ("question_crops", "question_crops.json", "review"):
+        if replace_invalid and not recrop_numbers:
+            for name in (
+                "question_crops", "question_crops.json", "crop_ai_review.json", "review",
+            ):
                 _remove_formal_output(job_dir, name)
         plan_content = _atomic_json(job_dir / "question_regions.json", plan)
         crop_questions = [{
             "question_no": item["question_no"],
             "regions": [{"page_number": region["page_number"], "bbox": region["bbox"]}
                         for region in item["regions"]],
+            "mask_regions_normalized": item["mask_regions_normalized"],
+            "mask_regions": item["mask_regions"],
             "warnings": item.get("warnings", []),
         } for item in plan["questions"]]
         report = generate_question_crops_report(
             job_dir=job_dir, questions=crop_questions,
             expected_question_nos=list(range(1, plan["question_count"] + 1)),
             source_page_bytes={number: content for number, content, _ in pages},
+            job_lock=artifact_lock,
+            force_recrop_question_nos=recrop_numbers,
         )
         generate_crop_review_sheets(
-            job_dir=job_dir, recropped_question_nos=report.recropped_question_nos
+            job_dir=job_dir, recropped_question_nos=report.recropped_question_nos,
+            job_lock=artifact_lock,
         )
         crop_manifest_content = _read_job_regular(
             private_root, job_id, "question_crops.json", max_bytes=16 * 1024 * 1024
@@ -1160,6 +1881,10 @@ def split_import_job(database_path, private_root, job_id, runner, *, replace_inv
             raise QuestionSplitError(SAFE_SPLIT_ERROR)
         digest = hashlib.sha256(plan_content).hexdigest()
         crop_digest = hashlib.sha256(crop_manifest_content).hexdigest()
+        _record_new_split_anchors(job_dir, (
+            plan["question_count"], digest, crop_digest,
+            report.generation_id, report.manifest["signature"],
+        ))
         now = _now()
         with closing(sqlite3.connect(database_path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1185,16 +1910,44 @@ def split_import_job(database_path, private_root, job_id, runner, *, replace_inv
                     report.generation_id, report.manifest["signature"], now, now, job_id,
                 ),
             )
-            connection.commit()
+            try:
+                connection.commit()
+                database_committed = True
+            except Exception:
+                journal = _read_split_journal(job_dir)
+                new_anchors = tuple(journal["new_anchors"] or ())
+                old_anchors = tuple(journal["old_anchors"])
+                state = _authoritative_split_commit_state(
+                    database_path, private_root, job_id, old_anchors, new_anchors,
+                )
+                if state == "committed":
+                    database_committed = True
+                elif state == "unknown":
+                    commit_uncertain = True
+                    raise SplitCommitUncertain(SAFE_SPLIT_ERROR)
+                else:
+                    raise
+        try:
+            shutil.rmtree(backup)
+        except FileNotFoundError:
+            pass
         try:
             (job_dir / _SPLIT_JOURNAL_NAME).unlink()
         except FileNotFoundError:
             pass
-        shutil.rmtree(backup, ignore_errors=True)
         return plan
     except Exception:
-        _restore_outputs(job_dir, backup)
-        raise
+        if not database_committed and not commit_uncertain:
+            _restore_outputs(job_dir, backup)
+            raise
+        if commit_uncertain:
+            raise
+        LOGGER.warning(
+            "deferred cleanup for committed question split job %s",
+            job_id,
+            exc_info=True,
+        )
+        return plan
 
 
 def run_claimed_split(claim):
@@ -1205,7 +1958,16 @@ def run_claimed_split(claim):
             return split_import_job(
                 claim.database_path, claim.private_root, claim.job_id, claim.runner,
                 replace_invalid=claim.replace_invalid,
+                review_feedback=claim.review_feedback,
+                frozen_regions=claim.frozen_regions,
+                artifact_lock=claim.artifact_lock,
             )
+        except SplitCommitUncertain:
+            LOGGER.exception(
+                "question split commit outcome is uncertain for import job %s",
+                claim.job_id,
+            )
+            return None
         except Exception:
             LOGGER.exception("question split failed for import job %s", claim.job_id)
             _mark_failed(claim.database_path, claim.job_id)

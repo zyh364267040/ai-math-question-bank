@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% block title %}本地知识点分类 · AI 数学题库{% endblock %}
+{% block title %}Codex 知识点分类 · AI 数学题库{% endblock %}
 {% block head_extra %}{% if page.status == 'processing' %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
 {% block content %}
 <section class="page-heading">
   <p class="eyebrow">LOCAL KNOWLEDGE CLASSIFICATION</p>
   <h1>{{ paper_name }}</h1>
-  <p>本机 Ollama 双重分类；只复核冲突或低置信度题。</p>
+  <p>Codex 独立双重分类；仅对未达成初始共识的题增加独立第三票。</p>
 </section>
 
 {% if applied_notice %}<div class="save-feedback" role="status">整批分类证据已登记</div>{% endif %}
@@ -14,31 +14,47 @@
     <p><span class="status completed">分类已完成</span></p>
     <p>append-only 分类证据已经登记；本页不再允许修改或重新运行。</p>
   {% elif page.status == 'processing' %}
-    <p><span class="status processing">本地 Ollama 分类中</span></p>
-    <p>当前阶段：{{ {'waiting':'等待本机模型锁','level2':'二级知识模块初判','proposal':'三级知识点初审','verifier':'独立三级复核','publishing':'安全发布分类草稿'}.get(page.stage, '处理中') }}。同一任务不会重复启动。</p>
+    <p><span class="status processing">Codex 分类中</span></p>
+    <p>{% if page.replacement_active %}这是“重跑尚未应用结果”；旧结果会保留到新结果完整发布。{% endif %}当前阶段：{{ {'waiting':'等待本机模型锁','level2':'二级知识模块初判','proposal':'三级知识点初审','verifier':'独立三级复核','adjudicator':'独立第三票仲裁','publishing':'安全发布分类草稿'}.get(page.stage, '处理中') }}。同一任务不会重复启动。</p>
   {% elif page.status == 'failed' %}
     <p><span class="status failed">分类失败</span></p>
     <p class="form-error">{{ page.error_message }}</p>
     <form method="post" action="/imports/{{ job_id }}/classification/start">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="button" type="submit">重试本地知识点分类</button>
+      <button class="button" type="submit">重试 Codex 知识点分类</button>
     </form>
   {% elif not page.exists %}
-    <p><strong>只有显式点击才会调用本机 qwen2.5:14b；GET 浏览不会启动模型或创建状态。</strong></p>
+    <p><strong>只有显式点击才会启动三个基础 Codex 临时会话；存在未决题时才启动第四个独立仲裁会话。GET 浏览不会启动分类或创建状态。</strong></p>
     <form method="post" action="/imports/{{ job_id }}/classification/start">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="button" type="submit">开始本地知识点分类</button>
+      <button class="button" type="submit">开始 Codex 知识点分类</button>
     </form>
   {% else %}
     <p><span class="status completed">分类草稿复核就绪</span></p>
+    {% if page.replacement_result == 'completed' %}
+      <p>当前草稿来自一次安全的未应用结果 replacement run。</p>
+    {% elif page.replacement_result == 'failed' %}
+      <p>最近一次 replacement run 未发布；当前仍为此前已完成结果，可再次显式重跑。</p>
+    {% endif %}
   {% endif %}
   <p><strong>分类不检查答案是否正确，也不会自动正式入库。</strong></p>
 </section>
 
 {% if page.exists and page.status == 'completed' %}
+{% if page.can_replace %}
+<section class="paper-card processing-card">
+  <p>此操作只替换尚未登记、尚未正式入库且锚点未变化的分类草稿；失败时保留当前结果。</p>
+  <form method="post" action="/imports/{{ job_id }}/classification/replace">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="replace_unapplied" value="true">
+    <button class="button" type="submit">重新运行未应用分类</button>
+  </form>
+</section>
+{% endif %}
 <section class="audit-summary">
-  <div><strong>{{ page.auto_approved }}</strong><span>双重一致自动通过</span></div>
-  <div><strong>{{ page.pending }}</strong><span>待教师复核</span></div>
+  <div><strong>{{ page.double_approved }}</strong><span>Codex双重一致</span></div>
+  <div><strong>{{ page.adjudicated_approved }}</strong><span>Codex第三票仲裁</span></div>
+  <div><strong>{{ page.pending }}</strong><span>剩余人工复核</span></div>
   <div><strong>{{ page.approved }}</strong><span>已批准</span></div>
 </section>
 
@@ -54,8 +70,9 @@
     <div class="classification-comparison">
       <section><h3>Proposal</h3><p>主知识点：{{ draft.proposal_primary_code }} {{ draft.proposal_name }}</p><p>关联：{{ draft.proposal_related_codes|join('、') or '无' }}</p><p>置信度：{{ draft.proposal_confidence }}；理由：{{ draft.proposal_reason }}</p></section>
       <section><h3>Verifier</h3><p>主知识点：{{ draft.verifier_primary_code }} {{ draft.verifier_name }}</p><p>关联：{{ draft.verifier_related_codes|join('、') or '无' }}</p><p>置信度：{{ draft.verifier_confidence }}；理由：{{ draft.verifier_reason }}</p></section>
+      {% if draft.adjudicator_primary_code %}<section><h3>Adjudicator</h3><p>主知识点：{{ draft.adjudicator_primary_code }} {{ draft.adjudicator_name }}</p><p>关联：{{ draft.adjudicator_related_codes|join('、') or '无' }}</p><p>置信度：{{ draft.adjudicator_confidence }}；理由：{{ draft.adjudicator_reason }}</p></section>{% endif %}
     </div>
-    <p>批准来源：{{ '本地双重一致' if draft.approval_source == 'local_double_pass' else ('教师复核' if draft.approval_source == 'human' else '尚未批准') }}</p>
+    <p>批准来源：{{ 'Codex 双重一致' if draft.approval_source in ('codex_double_pass', 'local_double_pass') else ('Codex 第三票仲裁' if draft.approval_source == 'codex_adjudicated' else ('教师复核' if draft.approval_source == 'human' else '尚未批准')) }}</p>
     {% if not page.applied %}
     <form method="post" action="/imports/{{ job_id }}/classification/questions/{{ draft.source_question_no }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

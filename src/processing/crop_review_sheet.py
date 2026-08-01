@@ -11,8 +11,8 @@ import secrets
 import shutil
 import stat
 import re
-from contextlib import ExitStack
-from pathlib import PurePosixPath
+from contextlib import ExitStack, nullcontext
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from PIL import Image, ImageDraw, UnidentifiedImageError
@@ -366,7 +366,7 @@ def generate_crop_review_sheets(*, job_dir, recropped_question_nos,
                                 max_input_bytes=MAX_INPUT_BYTES,
                                 max_total_output_bytes=MAX_TOTAL_OUTPUT_BYTES,
                                 min_free_disk_bytes=MIN_FREE_DISK_BYTES,
-                                jpeg_quality=88):
+                                jpeg_quality=88, job_lock=None):
     """Rebuild only affected four-question sheets under one recoverable journal."""
     if not isinstance(recropped_question_nos, list):
         raise CropReviewSheetError("变化题号必须是列表")
@@ -384,7 +384,10 @@ def generate_crop_review_sheets(*, job_dir, recropped_question_nos,
             or max_canvas_height > MAX_CANVAS_DIMENSION or jpeg_quality > 95):
         raise CropReviewSheetError("联系表尺寸或JPEG质量参数超出安全范围")
     try:
-        with locked_job(job_dir) as lock:
+        lock_context = locked_job(job_dir) if job_lock is None else nullcontext(job_lock)
+        with lock_context as lock:
+            if lock.path != Path(job_dir).resolve():
+                raise CropReviewSheetError("共享裁图锁与任务目录不匹配")
             key = load_hmac_key(lock.path)
             manifest = _read_manifest(lock.descriptor, key)
             forced_names = _recover_journal(lock.descriptor, key, manifest)

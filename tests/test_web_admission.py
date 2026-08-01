@@ -25,15 +25,18 @@ from src.importing.web_admission import (
     WebAdmissionError,
     apply_web_admission,
     load_admission_page,
+    prepare_web_admission,
 )
 from src.importing.admit_questions import backup_database
 from src.importing.admit_questions import admit_questions
 from src.reviewing.knowledge_classification import adopt_knowledge_classifications
 from src.reviewing.finalize import finalize_review
+from src.pipeline.import_pipeline import inspect_pipeline
 from src.web.app import create_app
 from src.web.app import MAX_ADMISSION_FORM_BYTES
 from tests.fixture_factory import (
     anchor_synthetic_candidate_audit,
+    anchor_synthetic_figure_reviews,
     create_import_job_fixture,
 )
 
@@ -60,6 +63,7 @@ class WebAdmissionTests(unittest.TestCase):
                 (source,),
             )
         anchor_synthetic_candidate_audit(self.db, self.job_dir)
+        anchor_synthetic_figure_reviews(self.db, self.private)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -115,6 +119,364 @@ class WebAdmissionTests(unittest.TestCase):
             self.db, 1, json.dumps(evidence, ensure_ascii=False),
             "strict-external-classification-run",
         )
+
+    def _set_job_status(self, status):
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "UPDATE import_jobs SET status=? WHERE id=1", (status,)
+            )
+
+    @staticmethod
+    def _drop_completed_guards(connection):
+        names = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND (name LIKE 'web_admission_completed_%' "
+            "OR name LIKE 'web_admission_protect_%')"
+        ).fetchall()
+        for (name,) in names:
+            connection.execute(f'DROP TRIGGER "{name}"')
+
+    def _assert_completed_conflict_is_read_only(self, database, *, client=None):
+        backup_root = database.parent / "backups"
+        backups_before = tuple(sorted(backup_root.iterdir())) if backup_root.exists() else ()
+        client = client or TestClient(create_app(database, self.private))
+        before = database.read_bytes()
+        with closing(sqlite3.connect(database)) as connection:
+            counts_before = connection.execute(
+                """SELECT
+                   (SELECT COUNT(*) FROM import_web_admission_runs WHERE import_job_id=1),
+                   (SELECT COUNT(*) FROM question_sources WHERE import_job_id=1),
+                   (SELECT COUNT(*) FROM questions)"""
+            ).fetchone()
+        response = client.get("/imports/1/admission")
+        self.assertEqual(409, response.status_code)
+        self.assertEqual(before, database.read_bytes())
+
+        with self.assertRaisesRegex(WebAdmissionError, f"^{SAFE_COMPLETED_DRIFT}$"):
+            load_admission_page(database, self.private, 1)
+        self.assertEqual(before, database.read_bytes())
+        inspected = inspect_pipeline(database, self.private, 1)
+        self.assertEqual(("blocked", "manual_review"), (
+            inspected.stage, inspected.next_action,
+        ))
+        self.assertNotIn("完成", inspected.message)
+        self.assertEqual(before, database.read_bytes())
+        backup = mock.Mock(side_effect=AssertionError("backup must not run"))
+        with self.assertRaisesRegex(WebAdmissionError, f"^{SAFE_COMPLETED_DRIFT}$") as error:
+            apply_web_admission(
+                database, self.private, 1, backup_fn=backup,
+            )
+        self.assertEqual(409, error.exception.status_code)
+        backup.assert_not_called()
+
+        self.assertEqual(before, database.read_bytes())
+        backups_after = tuple(sorted(backup_root.iterdir())) if backup_root.exists() else ()
+        self.assertEqual(backups_before, backups_after)
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(counts_before, connection.execute(
+                """SELECT
+                   (SELECT COUNT(*) FROM import_web_admission_runs WHERE import_job_id=1),
+                   (SELECT COUNT(*) FROM question_sources WHERE import_job_id=1),
+                   (SELECT COUNT(*) FROM questions)"""
+            ).fetchone())
+
+    def test_prepare_pending_all_green_enables_existing_apply(self):
+        self._approve_and_classify_all()
+        self._set_job_status("pending")
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                """INSERT INTO import_page_render_runs
+                   (import_job_id,status,total_pages,rendered_pages)
+                   VALUES(1,'completed',4,4)"""
+            )
+
+        self.assertFalse(load_admission_page(self.db, self.private, 1).can_apply)
+        self.assertEqual(
+            "prepare_strict_admission",
+            inspect_pipeline(self.db, self.private, 1).next_action,
+        )
+        self.assertEqual(
+            "prepared", prepare_web_admission(self.db, self.private, 1)
+        )
+
+        page = load_admission_page(self.db, self.private, 1)
+        self.assertEqual("needs_review", page.job_status)
+        self.assertTrue(page.can_apply)
+        self.assertEqual(
+            "run_strict_admission",
+            inspect_pipeline(self.db, self.private, 1).next_action,
+        )
+        self.assertEqual("completed", apply_web_admission(self.db, self.private, 1))
+
+    def test_prepare_rejects_missing_evidence_or_unapproved_draft(self):
+        self._approve_and_classify_all()
+        self._set_job_status("pending")
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "UPDATE candidate_review_drafts SET status='needs_fix' "
+                "WHERE import_job_id=1 AND source_question_no='23'"
+            )
+        with self.assertRaises(WebAdmissionError):
+            prepare_web_admission(self.db, self.private, 1)
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            self.assertEqual("pending", connection.execute(
+                "SELECT status FROM import_jobs WHERE id=1"
+            ).fetchone()[0])
+
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "UPDATE candidate_review_drafts SET status='approved' "
+                "WHERE import_job_id=1 AND source_question_no='23'"
+            )
+            connection.execute(
+                "DROP TRIGGER candidate_knowledge_classifications_delete_immutable"
+            )
+            connection.execute(
+                "DELETE FROM candidate_knowledge_classifications "
+                "WHERE import_job_id=1 AND source_question_no='23'"
+            )
+        with self.assertRaises(WebAdmissionError):
+            prepare_web_admission(self.db, self.private, 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual("pending", connection.execute(
+                "SELECT status FROM import_jobs WHERE id=1"
+            ).fetchone()[0])
+
+    def test_prepare_rejects_ineligible_and_formal_source_without_state_change(self):
+        self._approve_and_classify_all()
+        self._set_job_status("pending")
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "UPDATE candidate_review_drafts SET edited_json='{}' "
+                "WHERE import_job_id=1 AND source_question_no='23'"
+            )
+        with self.assertRaises(WebAdmissionError):
+            prepare_web_admission(self.db, self.private, 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual("pending", connection.execute(
+                "SELECT status FROM import_jobs WHERE id=1"
+            ).fetchone()[0])
+
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "UPDATE candidate_review_drafts SET edited_json=source_snapshot_json "
+                "WHERE import_job_id=1 AND source_question_no='23'"
+            )
+        admit_questions(
+            self.db, self.private, 1, require_complete_batch=True
+        )
+        with self.assertRaises(WebAdmissionError):
+            prepare_web_admission(self.db, self.private, 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual("pending", connection.execute(
+                "SELECT status FROM import_jobs WHERE id=1"
+            ).fetchone()[0])
+
+    def test_prepare_needs_review_is_read_only_idempotent(self):
+        self._approve_and_classify_all()
+        with closing(sqlite3.connect(self.db)) as connection:
+            before = connection.execute(
+                "SELECT updated_at FROM import_jobs WHERE id=1"
+            ).fetchone()[0]
+        self.assertEqual(
+            "already_prepared", prepare_web_admission(self.db, self.private, 1)
+        )
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(before, connection.execute(
+                "SELECT updated_at FROM import_jobs WHERE id=1"
+            ).fetchone()[0])
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM import_web_admission_runs"
+            ).fetchone()[0])
+        self.assertFalse((self.db.parent / "backups").exists())
+
+    def test_prepare_rejects_processing_failed_and_completed(self):
+        self._approve_and_classify_all()
+        for status in ("processing", "failed", "completed"):
+            with self.subTest(status=status):
+                self._set_job_status(status)
+                with self.assertRaises(WebAdmissionError):
+                    prepare_web_admission(self.db, self.private, 1)
+                with closing(sqlite3.connect(self.db)) as connection:
+                    self.assertEqual(status, connection.execute(
+                        "SELECT status FROM import_jobs WHERE id=1"
+                    ).fetchone()[0])
+
+    def test_prepare_rejects_existing_web_admission_run(self):
+        self._approve_and_classify_all()
+        self._set_job_status("pending")
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                """INSERT INTO import_web_admission_runs
+                   (import_job_id,status,stage,claim_token,expected_count,claimed_at,
+                    heartbeat_at,lease_expires_at,created_at,updated_at)
+                   VALUES(1,'processing','preparing_backup',?,23,?,?,?,?,?)""",
+                (
+                    "f" * 64,
+                    "2026-08-01T00:00:00+00:00",
+                    "2026-08-01T00:00:00+00:00",
+                    "2026-08-01T00:05:00+00:00",
+                    "2026-08-01T00:00:00+00:00",
+                    "2026-08-01T00:00:00+00:00",
+                ),
+            )
+        with self.assertRaises(WebAdmissionError):
+            prepare_web_admission(self.db, self.private, 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual("pending", connection.execute(
+                "SELECT status FROM import_jobs WHERE id=1"
+            ).fetchone()[0])
+
+    def test_prepare_concurrent_calls_have_one_transition_and_one_idempotent_result(self):
+        self._approve_and_classify_all()
+        self._set_job_status("pending")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(
+                lambda _: prepare_web_admission(self.db, self.private, 1), range(2)
+            ))
+        self.assertCountEqual(["prepared", "already_prepared"], results)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual("needs_review", connection.execute(
+                "SELECT status FROM import_jobs WHERE id=1"
+            ).fetchone()[0])
+
+    def test_prepare_rejects_job_and_draft_drift_inside_assessment_transaction(self):
+        self._approve_and_classify_all()
+        self._set_job_status("pending")
+        original = web_admission_module._prepare_transition
+
+        def drift_job(connection, job_id, context, report):
+            connection.execute(
+                "UPDATE import_jobs SET status='processing' WHERE id=?", (job_id,)
+            )
+            return original(connection, job_id, context, report)
+
+        with mock.patch.object(
+            web_admission_module, "_prepare_transition", side_effect=drift_job,
+        ):
+            with self.assertRaises(WebAdmissionError):
+                prepare_web_admission(self.db, self.private, 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual("pending", connection.execute(
+                "SELECT status FROM import_jobs WHERE id=1"
+            ).fetchone()[0])
+
+        def drift_draft(connection, job_id, context, report):
+            connection.execute(
+                "UPDATE candidate_review_drafts SET version=version+1 "
+                "WHERE import_job_id=? AND source_question_no='23'", (job_id,)
+            )
+            return original(connection, job_id, context, report)
+
+        with mock.patch.object(
+            web_admission_module, "_prepare_transition", side_effect=drift_draft,
+        ):
+            with self.assertRaises(WebAdmissionError):
+                prepare_web_admission(self.db, self.private, 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(("pending", 1), connection.execute(
+                """SELECT j.status,d.version FROM import_jobs j
+                   JOIN candidate_review_drafts d ON d.import_job_id=j.id
+                   WHERE j.id=1 AND d.source_question_no='23'"""
+            ).fetchone())
+
+        def drift_evidence(connection, job_id, context, report):
+            connection.execute(
+                """INSERT INTO candidate_knowledge_classifications
+                   (import_job_id,source_question_no,approved_draft_version,
+                    edited_sha256,primary_knowledge_point_code,
+                    related_knowledge_point_codes_json,classifier,reviewer,
+                    approval_source,classifier_run_id,evidence_sha256,reason,created_at)
+                   SELECT import_job_id,'999',approved_draft_version,edited_sha256,
+                          primary_knowledge_point_code,related_knowledge_point_codes_json,
+                          classifier,reviewer,approval_source,classifier_run_id || '-drift',
+                          evidence_sha256,reason,created_at
+                   FROM candidate_knowledge_classifications
+                   WHERE import_job_id=? LIMIT 1""",
+                (job_id,),
+            )
+            return original(connection, job_id, context, report)
+
+        with mock.patch.object(
+            web_admission_module, "_prepare_transition", side_effect=drift_evidence,
+        ):
+            with self.assertRaises(WebAdmissionError):
+                prepare_web_admission(self.db, self.private, 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(("pending", 23), (
+                connection.execute(
+                    "SELECT status FROM import_jobs WHERE id=1"
+                ).fetchone()[0],
+                connection.execute(
+                    "SELECT COUNT(*) FROM candidate_knowledge_classifications "
+                    "WHERE import_job_id=1"
+                ).fetchone()[0],
+            ))
+
+    def test_prepare_rejects_artifact_drift_after_assessment_and_rolls_back_cas(self):
+        self._approve_and_classify_all()
+        self._set_job_status("pending")
+        original = web_admission_module._prepare_transition
+
+        def drift_artifact(connection, job_id, context, report):
+            candidate = self.job_dir / "candidate_questions.json"
+            candidate.write_bytes(candidate.read_bytes() + b" ")
+            return original(connection, job_id, context, report)
+
+        with mock.patch.object(
+            web_admission_module, "_prepare_transition", side_effect=drift_artifact,
+        ):
+            with self.assertRaises(WebAdmissionError):
+                prepare_web_admission(self.db, self.private, 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual("pending", connection.execute(
+                "SELECT status FROM import_jobs WHERE id=1"
+            ).fetchone()[0])
+
+    def test_pending_web_prepare_is_explicit_post_only_and_never_admits(self):
+        self._approve_and_classify_all()
+        self._set_job_status("pending")
+        client = TestClient(create_app(self.db, self.private))
+
+        before = self.db.read_bytes()
+        page = client.get("/imports/1/admission")
+        self.assertEqual(200, page.status_code)
+        self.assertIn("准备严格入库</button>", page.text)
+        self.assertNotIn("正式入库并完成任务</button>", page.text)
+        self.assertEqual(before, self.db.read_bytes())
+        self.assertEqual(405, client.get(
+            "/imports/1/admission/prepare"
+        ).status_code)
+
+        csrf = client.cookies.get("basket_csrf")
+        self.assertEqual(403, client.post(
+            "/imports/1/admission/prepare", data={}
+        ).status_code)
+        self.assertEqual(400, client.post(
+            "/imports/1/admission/prepare",
+            data={"csrf_token": csrf, "unknown": "x"},
+        ).status_code)
+        duplicate = f"csrf_token={csrf}&csrf_token={csrf}".encode()
+        self.assertEqual(400, client.post(
+            "/imports/1/admission/prepare", content=duplicate,
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        ).status_code)
+
+        response = client.post(
+            "/imports/1/admission/prepare", data={"csrf_token": csrf},
+            follow_redirects=False,
+        )
+        self.assertEqual(303, response.status_code)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(("needs_review", 0), (
+                connection.execute(
+                    "SELECT status FROM import_jobs WHERE id=1"
+                ).fetchone()[0],
+                connection.execute("SELECT COUNT(*) FROM questions").fetchone()[0],
+            ))
+        ready = client.get("/imports/1/admission")
+        self.assertIn("正式入库并完成任务</button>", ready.text)
+        self.assertNotIn("准备严格入库</button>", ready.text)
 
     def test_get_blocked_is_byte_for_byte_read_only_and_has_no_apply_button(self):
         app = create_app(self.db, self.private)
@@ -334,6 +696,184 @@ class WebAdmissionTests(unittest.TestCase):
                 ).fetchone()[0],
             ))
 
+    def test_admission_anchor_callback_failure_rolls_back_batch_and_retries(self):
+        self._approve_and_classify_all()
+        callback_observed = []
+
+        def reject_transactional_anchor(*args, **kwargs):
+            original = kwargs["completion_callback"]
+
+            def reject(connection, result):
+                callback_observed.append((
+                    result.inserted,
+                    connection.execute(
+                        "SELECT COUNT(*) FROM question_sources WHERE import_job_id=1"
+                    ).fetchone()[0],
+                ))
+                original(connection, result)
+                raise RuntimeError("injected transactional anchor failure")
+
+            kwargs["completion_callback"] = reject
+            return admit_questions(*args, **kwargs)
+
+        with self.assertRaisesRegex(WebAdmissionError, f"^{SAFE_APPLY_FAILED}$"):
+            apply_web_admission(
+                self.db, self.private, 1, admit_fn=reject_transactional_anchor,
+            )
+
+        self.assertEqual([(23, 23)], callback_observed)
+        with closing(sqlite3.connect(self.db)) as connection:
+            for table, where in (
+                ("questions", ""),
+                ("question_sources", " WHERE import_job_id=1"),
+                ("question_assets", " WHERE import_job_id=1"),
+                (
+                    "question_related_knowledge_points",
+                    " WHERE question_id IN (SELECT question_id FROM question_sources WHERE import_job_id=1)",
+                ),
+            ):
+                self.assertEqual(
+                    0,
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table}{where}"
+                    ).fetchone()[0],
+                    table,
+                )
+            self.assertEqual(
+                ("needs_review", "failed", "processing", None),
+                connection.execute(
+                    """SELECT j.status,r.status,r.stage,r.formal_batch_digest
+                       FROM import_jobs j JOIN import_web_admission_runs r
+                         ON r.import_job_id=j.id WHERE j.id=1"""
+                ).fetchone(),
+            )
+
+        self.assertEqual(
+            "completed", apply_web_admission(self.db, self.private, 1)
+        )
+
+    def test_commit_then_api_error_is_recovered_from_transactional_anchor(self):
+        self._approve_and_classify_all()
+
+        def commit_then_raise(*args, **kwargs):
+            admit_questions(*args, **kwargs)
+            raise RuntimeError("injected post-commit API failure")
+
+        with self.assertRaisesRegex(WebAdmissionError, f"^{SAFE_FINALIZE_FAILED}$"):
+            apply_web_admission(
+                self.db, self.private, 1, admit_fn=commit_then_raise,
+            )
+
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(
+                (23, "needs_review", "failed", "admitted_pending_finalize"),
+                connection.execute(
+                    """SELECT COUNT(s.question_id),j.status,r.status,r.stage
+                       FROM import_jobs j
+                       JOIN import_web_admission_runs r ON r.import_job_id=j.id
+                       LEFT JOIN question_sources s ON s.import_job_id=j.id
+                       WHERE j.id=1"""
+                ).fetchone(),
+            )
+            digest = connection.execute(
+                "SELECT formal_batch_digest FROM import_web_admission_runs WHERE import_job_id=1"
+            ).fetchone()[0]
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        page = load_admission_page(self.db, self.private, 1)
+        self.assertEqual("admitted_pending_finalize", page.stage)
+        self.assertTrue(page.can_apply)
+
+        self.assertEqual("completed", apply_web_admission(self.db, self.private, 1))
+        self.assertEqual("completed", apply_web_admission(self.db, self.private, 1))
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(23, connection.execute(
+                "SELECT COUNT(*) FROM questions"
+            ).fetchone()[0])
+
+    def test_pipeline_needs_review_requires_real_strict_green_and_is_read_only(self):
+        before_database = self.db.read_bytes()
+        before_files = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*") if path.is_file()
+        }
+
+        blocked = inspect_pipeline(self.db, self.private, 1)
+
+        self.assertEqual(
+            ("needs_review", "manual_review"),
+            (blocked.stage, blocked.next_action),
+        )
+        self.assertNotEqual("run_strict_admission", blocked.next_action)
+        self.assertEqual(before_database, self.db.read_bytes())
+        self.assertEqual(before_files, {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*") if path.is_file()
+        })
+
+        self._approve_and_classify_all()
+        green_database = self.db.read_bytes()
+        green_files = {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*") if path.is_file()
+        }
+        ready = inspect_pipeline(self.db, self.private, 1)
+        self.assertEqual(
+            ("ready", "run_strict_admission"),
+            (ready.stage, ready.next_action),
+        )
+        self.assertEqual(green_database, self.db.read_bytes())
+        self.assertEqual(green_files, {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*") if path.is_file()
+        })
+
+    def test_pipeline_needs_review_blocks_partial_formal_sources(self):
+        self._approve_and_classify_all()
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            knowledge_id = connection.execute(
+                "SELECT id FROM knowledge_points ORDER BY id LIMIT 1"
+            ).fetchone()[0]
+            question_id = connection.execute(
+                """INSERT INTO questions
+                   (question_code,stem_markdown,region_code,exam_type_code,
+                    question_type_code,primary_knowledge_point_id,content_hash,
+                    answer_status)
+                   VALUES('Q-PARTIAL-WEB-001','部分正式题','TJ','YK','solution',?,?,
+                          'missing')""",
+                (knowledge_id, "7" * 64),
+            ).lastrowid
+            connection.execute(
+                """INSERT INTO question_sources
+                   (question_id,source_paper_id,import_job_id,source_question_no,
+                    source_pages_json)
+                   SELECT ?,source_paper_id,1,'1','[1]' FROM import_jobs WHERE id=1""",
+                (question_id,),
+            )
+
+        result = inspect_pipeline(self.db, self.private, 1)
+        self.assertEqual(
+            ("needs_review", "manual_review"),
+            (result.stage, result.next_action),
+        )
+
+    def test_pipeline_needs_review_blocks_conflicting_active_run(self):
+        self._approve_and_classify_all()
+        now = "2026-08-01T00:00:00+00:00"
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                """INSERT INTO import_web_admission_runs
+                   (import_job_id,status,stage,claim_token,expected_count,
+                    claimed_at,heartbeat_at,lease_expires_at,created_at,updated_at)
+                   VALUES(1,'processing','preparing_backup',?,23,?,?,?,?,?)""",
+                ("f" * 64, now, now, "2999-01-01T00:00:00+00:00", now, now),
+            )
+
+        result = inspect_pipeline(self.db, self.private, 1)
+        self.assertEqual(
+            ("needs_review", "manual_review"),
+            (result.stage, result.next_action),
+        )
+
     def test_retry_rejects_old_backup_when_unrelated_business_data_drifted(self):
         self._approve_and_classify_all()
 
@@ -363,13 +903,206 @@ class WebAdmissionTests(unittest.TestCase):
     def test_inexact_historical_completed_job_does_not_create_retroactive_run(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.execute("UPDATE import_jobs SET status='completed' WHERE id=1")
-        page = load_admission_page(self.db, self.private, 1)
-        self.assertEqual("pending", page.stage)
-        self.assertFalse(page.can_apply)
+        before = self.db.read_bytes()
+        backup = mock.Mock(side_effect=AssertionError("backup must not run"))
+
+        with self.assertRaisesRegex(WebAdmissionError, f"^{SAFE_COMPLETED_DRIFT}$") as page_error:
+            load_admission_page(self.db, self.private, 1)
+        self.assertEqual(409, page_error.exception.status_code)
+
+        inspected = inspect_pipeline(self.db, self.private, 1)
+        self.assertEqual(("blocked", "manual_review"), (
+            inspected.stage, inspected.next_action,
+        ))
+        self.assertNotIn("完成", inspected.message)
+
+        with self.assertRaisesRegex(WebAdmissionError, f"^{SAFE_COMPLETED_DRIFT}$") as apply_error:
+            apply_web_admission(
+                self.db, self.private, 1, backup_fn=backup,
+            )
+        self.assertEqual(409, apply_error.exception.status_code)
+        backup.assert_not_called()
+        self.assertEqual(before, self.db.read_bytes())
         with closing(sqlite3.connect(self.db)) as connection, connection:
             self.assertEqual(0, connection.execute(
                 "SELECT COUNT(*) FROM import_web_admission_runs"
             ).fetchone()[0])
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM question_sources WHERE import_job_id=1"
+            ).fetchone()[0])
+
+    def test_completed_shortcuts_require_one_exact_coordinated_batch(self):
+        self._approve_and_classify_all()
+        self.assertEqual("completed", apply_web_admission(self.db, self.private, 1))
+
+        scenarios = (
+            "run_only",
+            "zero_sources",
+            "partial_sources",
+            "extra_source",
+            "digest_drift",
+            "expected_count_drift",
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                database = self.root / f"{scenario}.db"
+                with closing(sqlite3.connect(self.db)) as source, closing(
+                    sqlite3.connect(database)
+                ) as target:
+                    source.backup(target)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    self._drop_completed_guards(connection)
+                    if scenario == "run_only":
+                        connection.execute(
+                            "UPDATE import_jobs SET status='needs_review' WHERE id=1"
+                        )
+                    elif scenario == "zero_sources":
+                        connection.execute(
+                            "DELETE FROM question_sources WHERE import_job_id=1"
+                        )
+                    elif scenario == "partial_sources":
+                        connection.execute(
+                            "DELETE FROM question_sources WHERE import_job_id=1 "
+                            "AND source_question_no='23'"
+                        )
+                    elif scenario == "extra_source":
+                        question_id = connection.execute(
+                            """INSERT INTO questions
+                               (question_code,stem_markdown,region_code,exam_type_code,
+                                question_type_code,primary_knowledge_point_id,
+                                content_hash,answer_status)
+                               SELECT 'Q-aaaaaaaaaaaaaaaa-024','extra','TJ','YK',
+                                      'single_choice',id,?,'missing'
+                               FROM knowledge_points ORDER BY id LIMIT 1""",
+                            ("f" * 64,),
+                        ).lastrowid
+                        source_id = connection.execute(
+                            "SELECT source_paper_id FROM import_jobs WHERE id=1"
+                        ).fetchone()[0]
+                        connection.execute(
+                            """INSERT INTO question_sources
+                               (question_id,source_paper_id,import_job_id,
+                                source_question_no,source_pages_json)
+                               VALUES(?,?,1,'24','[1]')""",
+                            (question_id, source_id),
+                        )
+                    elif scenario == "digest_drift":
+                        connection.execute(
+                            "UPDATE import_web_admission_runs "
+                            "SET formal_batch_digest=? WHERE import_job_id=1",
+                            ("b" * 64,),
+                        )
+                    elif scenario == "expected_count_drift":
+                        connection.execute(
+                            "UPDATE import_web_admission_runs "
+                            "SET expected_count=22,eligible_count=22 WHERE import_job_id=1"
+                        )
+                self._assert_completed_conflict_is_read_only(database)
+
+        legal_before = self.db.read_bytes()
+        legal_backups = tuple(sorted((self.db.parent / "backups").iterdir()))
+        page = load_admission_page(self.db, self.private, 1)
+        self.assertEqual(("completed", False), (page.stage, page.can_apply))
+        inspected = inspect_pipeline(self.db, self.private, 1)
+        self.assertEqual(("completed", "none"), (
+            inspected.stage, inspected.next_action,
+        ))
+        self.assertEqual("completed", apply_web_admission(
+            self.db, self.private, 1,
+            backup_fn=mock.Mock(side_effect=AssertionError("backup must not run")),
+        ))
+        self.assertEqual(legal_before, self.db.read_bytes())
+        self.assertEqual(
+            legal_backups, tuple(sorted((self.db.parent / "backups").iterdir())),
+        )
+
+    def test_completed_batch_rejects_self_consistent_cross_and_mixed_papers(self):
+        self._approve_and_classify_all()
+        self.assertEqual("completed", apply_web_admission(self.db, self.private, 1))
+
+        for scenario in (
+            "all_sources_on_paper_2",
+            "mixed_source_papers",
+            "job_paper_sha_is_null",
+        ):
+            with self.subTest(scenario=scenario):
+                database = self.root / f"{scenario}.db"
+                with closing(sqlite3.connect(self.db)) as source, closing(
+                    sqlite3.connect(database)
+                ) as target:
+                    source.backup(target)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    self._drop_completed_guards(connection)
+                    paper_2 = connection.execute(
+                        """INSERT INTO source_papers
+                           (sha256,file_size,original_filename,stored_path,
+                            region_code,exam_year,exam_type_code,paper_name)
+                           VALUES(?,1,'synthetic-2.pdf',
+                                  'raw_papers/TJ/2026/synthetic-2.pdf',
+                                  'TJ',2026,'YK','另一份合成测试卷')""",
+                        ("b" * 64,),
+                    ).lastrowid
+                    if scenario == "all_sources_on_paper_2":
+                        connection.execute(
+                            "UPDATE question_sources SET source_paper_id=? "
+                            "WHERE import_job_id=1",
+                            (paper_2,),
+                        )
+                    elif scenario == "mixed_source_papers":
+                        connection.execute(
+                            "UPDATE question_sources SET source_paper_id=? "
+                            "WHERE import_job_id=1 AND source_question_no='23'",
+                            (paper_2,),
+                        )
+                    else:
+                        source_sql = connection.execute(
+                            "SELECT sql FROM sqlite_master "
+                            "WHERE type='table' AND name='source_papers'"
+                        ).fetchone()[0]
+                        nullable_sql = source_sql.replace(
+                            "sha256 TEXT NOT NULL UNIQUE", "sha256 TEXT UNIQUE", 1,
+                        )
+                        self.assertNotEqual(source_sql, nullable_sql)
+                        connection.execute("PRAGMA writable_schema=ON")
+                        connection.execute(
+                            "UPDATE sqlite_master SET sql=? "
+                            "WHERE type='table' AND name='source_papers'",
+                            (nullable_sql,),
+                        )
+                        connection.execute("PRAGMA writable_schema=OFF")
+                        schema_version = connection.execute(
+                            "PRAGMA schema_version"
+                        ).fetchone()[0]
+                        connection.execute(
+                            f"PRAGMA schema_version={schema_version + 1}"
+                        )
+                        connection.execute(
+                            "UPDATE source_papers SET sha256=NULL "
+                            "WHERE id=(SELECT source_paper_id FROM import_jobs WHERE id=1)"
+                        )
+                    digest = web_admission_module._formal_batch_digest(connection, 1)
+                    connection.execute(
+                        "UPDATE import_web_admission_runs "
+                        "SET formal_batch_digest=? WHERE import_job_id=1",
+                        (digest,),
+                    )
+
+                self._assert_completed_conflict_is_read_only(database)
+
+        missing_paper = self.root / "job_points_to_missing_paper.db"
+        with closing(sqlite3.connect(self.db)) as source, closing(
+            sqlite3.connect(missing_paper)
+        ) as target:
+            source.backup(target)
+        client = TestClient(create_app(missing_paper, self.private))
+        with closing(sqlite3.connect(missing_paper)) as connection, connection:
+            self._drop_completed_guards(connection)
+            connection.execute(
+                "UPDATE import_jobs SET source_paper_id=999999 WHERE id=1"
+            )
+        self._assert_completed_conflict_is_read_only(
+            missing_paper, client=client,
+        )
 
     def test_completed_job_with_stale_failed_run_is_authoritative_and_read_only(self):
         self._approve_and_classify_all()
@@ -424,7 +1157,7 @@ class WebAdmissionTests(unittest.TestCase):
         self.assertNotIn("正式入库并完成任务</button>", response.text)
         self.assertEqual(before, self.db.read_bytes())
 
-    def test_historical_completed_job_without_web_run_needs_no_artifacts(self):
+    def test_completed_job_without_web_run_fails_closed_without_artifacts(self):
         self._approve_and_classify_all()
         self.assertEqual("completed", apply_web_admission(self.db, self.private, 1))
         with closing(sqlite3.connect(self.db)) as connection, connection:
@@ -441,15 +1174,15 @@ class WebAdmissionTests(unittest.TestCase):
             "/imports/1/admission"
         )
 
-        self.assertEqual(200, response.status_code)
-        self.assertIn("completed", response.text)
+        self.assertEqual(409, response.status_code)
+        self.assertIn(SAFE_COMPLETED_DRIFT, response.text)
         self.assertEqual(before, self.db.read_bytes())
         with closing(sqlite3.connect(self.db)) as connection:
             self.assertEqual(0, connection.execute(
                 "SELECT COUNT(*) FROM import_web_admission_runs"
             ).fetchone()[0])
 
-    def test_historical_completed_job_five_without_web_run_is_read_only(self):
+    def test_historical_completed_job_five_without_web_run_fails_closed(self):
         source_sha = "b" * 64
         with closing(sqlite3.connect(self.db)) as connection, connection:
             source_id = connection.execute(
@@ -488,10 +1221,8 @@ class WebAdmissionTests(unittest.TestCase):
         before = self.db.read_bytes()
         response = TestClient(app).get("/imports/5/admission")
 
-        self.assertEqual(200, response.status_code)
-        self.assertIn("整批入库与任务收口已完成。本页仅供查看。", response.text)
-        self.assertIn("原卷答案缺失时始终保持 missing", response.text)
-        self.assertNotIn("不满足整批严格门禁", response.text)
+        self.assertEqual(409, response.status_code)
+        self.assertIn(SAFE_COMPLETED_DRIFT, response.text)
         self.assertNotIn("正式入库并完成任务</button>", response.text)
         self.assertEqual(before, self.db.read_bytes())
         with closing(sqlite3.connect(self.db)) as connection:
@@ -855,30 +1586,48 @@ class WebAdmissionTests(unittest.TestCase):
                 "SELECT status FROM import_web_admission_runs WHERE import_job_id=1"
             ).fetchone()[0])
 
-    def test_keeper_renews_short_lease_while_admit_is_paused(self):
+    def test_admission_transaction_does_not_use_locked_heartbeat_connection(self):
         self._approve_and_classify_all()
         entered = threading.Event()
         release = threading.Event()
+        transaction_open = threading.Event()
+        heartbeat_during_transaction = []
+        original_renew = web_admission_module._renew
 
         def paused_admit(*args, **kwargs):
-            entered.set()
-            self.assertTrue(release.wait(5))
+            original_completion = kwargs["completion_callback"]
+
+            def pause_after_anchor(connection, result):
+                original_completion(connection, result)
+                transaction_open.set()
+                entered.set()
+                try:
+                    self.assertTrue(release.wait(5))
+                finally:
+                    transaction_open.clear()
+
+            kwargs["completion_callback"] = pause_after_anchor
             return admit_questions(*args, **kwargs)
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            first = pool.submit(
-                apply_web_admission, self.db, self.private, 1,
-                admit_fn=paused_admit, lease_seconds=0.15, keeper_interval=0.02,
-            )
-            self.assertTrue(entered.wait(5))
-            time.sleep(0.25)
-            with self.assertRaisesRegex(WebAdmissionError, SAFE_BUSY):
-                apply_web_admission(
-                    self.db, self.private, 1,
-                    lease_seconds=0.15, keeper_interval=0.02,
+        def observed_renew(*args, **kwargs):
+            if transaction_open.is_set():
+                heartbeat_during_transaction.append(threading.current_thread().name)
+            return original_renew(*args, **kwargs)
+
+        with mock.patch.object(
+            web_admission_module, "_renew", side_effect=observed_renew,
+        ):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                first = pool.submit(
+                    apply_web_admission, self.db, self.private, 1,
+                    admit_fn=paused_admit, lease_seconds=0.15,
+                    keeper_interval=0.02,
                 )
-            release.set()
-            self.assertEqual("completed", first.result(timeout=10))
+                self.assertTrue(entered.wait(5))
+                time.sleep(0.25)
+                self.assertEqual([], heartbeat_during_transaction)
+                release.set()
+                self.assertEqual("completed", first.result(timeout=10))
 
     def test_old_worker_stops_after_claim_token_is_replaced(self):
         self._approve_and_classify_all()

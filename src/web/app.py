@@ -62,6 +62,13 @@ from src.processing.question_splitter import (
     read_completed_split_image,
     run_claimed_split,
 )
+from src.processing.crop_review import CropReviewError, load_current_crop_review
+from src.processing.mask_review import (
+    MaskReviewError,
+    apply_approved_masks,
+    record_mask_review,
+)
+from src.processing.figure_review import FigureReviewError, record_figure_review
 from src.processing.candidate_extractor import (
     SAFE_EXISTING_ERROR as SAFE_CANDIDATE_EXISTING_ERROR,
     SAFE_EXTRACTION_ERROR,
@@ -73,7 +80,9 @@ from src.processing.candidate_extractor import (
     run_claimed_candidate_extraction,
 )
 from src.processing.secure_crop_artifacts import (
+    MAX_MANIFEST_BYTES,
     SecureCropArtifactError,
+    read_file_at,
     validate_signed_manifest,
 )
 from src.reviewing.candidate_auditor import (
@@ -253,11 +262,12 @@ class PreviewUploadBodyLimitMiddleware:
         if path == "/imports/preview":
             request_limit = self.max_body_bytes
         elif re.fullmatch(
-            r"/imports/[^/]+/classification(?:/start|/apply|/questions/[^/]+)?",
+            r"/imports/[^/]+/classification"
+            r"(?:/start|/replace|/apply|/questions/[^/]+)?",
             path,
         ):
             request_limit = min(self.max_body_bytes, MAX_CLASSIFICATION_FORM_BYTES)
-        elif re.fullmatch(r"/imports/[^/]+/admission/apply", path):
+        elif re.fullmatch(r"/imports/[^/]+/admission/(?:prepare|apply)", path):
             request_limit = min(self.max_body_bytes, MAX_ADMISSION_FORM_BYTES)
         elif re.fullmatch(
             r"/imports/[^/]+/(?:render|layout|split|candidates|audit(?:/adopt)?)",
@@ -952,7 +962,16 @@ def _verified_asset_path(private_root, asset):
     if not isinstance(entries, list):
         raise ValueError("图片清单验证失败")
     manifest = next((x for x in entries if isinstance(x, dict) and x.get("output_relative_path") == asset["relative_path"]), None)
-    if (manifest is None or manifest.get("review_status") != "ai_review_passed"
+    source_status_valid = (
+        manifest is not None
+        and (
+            manifest.get("review_status") == "ai_review_passed"
+            if asset["asset_kind"] == "complete_question"
+            else manifest.get("review_status") == "pending_ai_review"
+            and asset.get("review_status") == "ai_review_passed"
+        )
+    )
+    if (not source_status_valid
             or any(manifest.get(key) != asset[key] for key in ("width", "height", "byte_size", "sha256"))):
         raise ValueError("图片清单验证失败")
     relative = str(asset["relative_path"])
@@ -1109,6 +1128,7 @@ def create_app(
     corrected_audit_runner=None,
     classification_runner=None,
     web_admission_service=None,
+    web_admission_prepare_service=None,
     _initialize_schema=True,
 ):
     database_path = Path(database_path)
@@ -1128,6 +1148,7 @@ def create_app(
     application.state.corrected_audit_runner = corrected_audit_runner or audit_runner
     application.state.classification_runner = classification_runner
     application.state.web_admission_service = web_admission_service
+    application.state.web_admission_prepare_service = web_admission_prepare_service
 
     def enqueue_automatic_import(job_id):
         application.state.auto_submit(partial(
@@ -1467,7 +1488,11 @@ def create_app(
             return _error(request, templates, "自动切题任务暂时无法启动", 500)
         if claim is not None:
             background_tasks.add_task(run_claimed_split, claim)
-        return RedirectResponse(f"/imports/{job_id}/split", status_code=303)
+            return RedirectResponse(f"/imports/{job_id}/split", status_code=303)
+        return _error(
+            request, templates,
+            "当前没有通过安全校验且可启动的自动切题动作", 409,
+        )
 
     @application.get("/imports/{job_id}/split", response_class=HTMLResponse)
     def question_split_status(request: Request, job_id: int):
@@ -1555,11 +1580,129 @@ def create_app(
         run["crop_review_pending"] = sum(
             crop.get("review_status") == "pending_ai_review" for crop in crops
         )
+        run["crop_review_evidence_valid"] = False
+        run["crop_review_evidence_status"] = None
+        if (
+            retained_valid and run["status"] in {"completed", "failed"}
+            and run["crop_review_needs_recrop"]
+        ):
+            try:
+                evidence = load_current_crop_review(
+                    database_path, private_root, job_id,
+                )
+                run["crop_review_evidence_valid"] = any(
+                    item["status"] == "needs_recrop"
+                    for item in evidence["questions"]
+                )
+            except CropReviewError:
+                run["crop_review_evidence_status"] = (
+                    "审核证据校验失败，当前裁图状态不能作为可信审核意见。"
+                )
         return templates.TemplateResponse(
             request=request, name="import_split.html",
             context={"run": run, "crops": crops},
             headers={"Cache-Control": "no-store"},
         )
+
+    @application.get("/imports/{job_id}/mask-review")
+    def mask_review_status(request: Request, job_id: int):
+        """Read-only proposal discovery; evidence creation is POST-only."""
+        try:
+            job_dir = Path(private_root) / "processing" / f"import_job_{job_id}"
+            flags = (
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            job_fd = os.open(job_dir, flags)
+            try:
+                pinned = read_file_at(
+                    job_fd, "question_crops.json", max_bytes=MAX_MANIFEST_BYTES,
+                )
+            finally:
+                os.close(job_fd)
+            manifest = json.loads(pinned.data.decode("utf-8"))
+            proposals = [
+                {
+                    "generation_id": manifest["generation_id"],
+                    "question_no": item["question_no"],
+                    "masks": item.get("mask_regions", []),
+                }
+                for item in manifest["questions"] if item.get("mask_regions")
+            ]
+            return JSONResponse({
+                "ok": True, "proposals": proposals,
+                "csrf_token": request.state.csrf_token,
+            }, headers={"Cache-Control": "no-store"})
+        except (
+            OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError,
+            SecureCropArtifactError,
+        ):
+            return JSONResponse(
+                {"ok": False, "error": "遮罩审核任务不可读取"}, status_code=409,
+                headers={"Cache-Control": "no-store"},
+            )
+
+    @application.post("/imports/{job_id}/mask-review")
+    async def submit_mask_review(request: Request, job_id: int):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        required = {
+            "csrf_token", "generation_id", "question_no", "page_number",
+            "bbox", "reason", "decision",
+        }
+        if set(form.keys()) != required or any(len(form.getlist(name)) != 1 for name in required):
+            return _error(request, templates, "遮罩审核请求参数无效", 400)
+        try:
+            bbox = json.loads(form["bbox"])
+            record_mask_review(database_path, private_root, {
+                "version": 1, "import_job_id": job_id,
+                "input_generation_id": form["generation_id"],
+                "question_no": int(form["question_no"]),
+                "page_number": int(form["page_number"]), "bbox": bbox,
+                "reason": form["reason"], "decision": form["decision"],
+                "reviewer": "independent-mask-review-service",
+            })
+        except (ValueError, MaskReviewError):
+            return _error(request, templates, "遮罩独立审核未通过安全校验", 409)
+        return RedirectResponse(f"/imports/{job_id}/mask-review", status_code=303)
+
+    @application.post("/imports/{job_id}/mask-review/apply")
+    async def apply_mask_review(request: Request, job_id: int):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "遮罩应用请求参数无效", 400)
+        try:
+            apply_approved_masks(database_path, private_root, job_id)
+        except MaskReviewError:
+            return _error(request, templates, "遮罩证据不完整或已漂移", 409)
+        return RedirectResponse(f"/imports/{job_id}/split", status_code=303)
+
+    @application.post("/imports/{job_id}/figure-review")
+    async def submit_figure_review(request: Request, job_id: int):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        required = {
+            "csrf_token", "generation_id", "question_no",
+            "output_relative_path", "decision",
+        }
+        if set(form.keys()) != required or any(len(form.getlist(name)) != 1 for name in required):
+            return _error(request, templates, "配图审核请求参数无效", 400)
+        try:
+            record_figure_review(database_path, private_root, {
+                "version": 1, "import_job_id": job_id,
+                "input_generation_id": form["generation_id"],
+                "question_no": int(form["question_no"]),
+                "output_relative_path": form["output_relative_path"],
+                "reviewer": "independent-figure-review-service",
+                "decision": form["decision"],
+            })
+        except (ValueError, FigureReviewError):
+            return _error(request, templates, "配图独立审核未通过安全校验", 409)
+        return RedirectResponse(f"/imports/{job_id}/review", status_code=303)
 
     @application.get("/imports/{job_id}/split-images/{question_no}.png")
     def question_split_image(job_id: int, question_no: int):
@@ -1777,12 +1920,12 @@ def create_app(
     async def start_knowledge_classification(
         request: Request, job_id: int, background_tasks: BackgroundTasks
     ):
-        """A protected click claims local classification; GET never launches it."""
+        """A protected click claims Codex classification; GET never launches it."""
         form = await require_csrf(request)
         if form is None:
             return _error(request, templates, "CSRF 校验失败", 403)
         if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
-            return _error(request, templates, "本地知识点分类请求参数无效", 400)
+            return _error(request, templates, "Codex 知识点分类请求参数无效", 400)
         try:
             claim = claim_knowledge_classification(
                 database_path, private_root, job_id,
@@ -1794,6 +1937,37 @@ def create_app(
         if claim is not None:
             background_tasks.add_task(run_claimed_knowledge_classification, claim)
         return RedirectResponse(f"/imports/{job_id}/classification", status_code=303)
+
+    @application.post("/imports/{job_id}/classification/replace")
+    async def replace_unapplied_knowledge_classification(
+        request: Request, job_id: int, background_tasks: BackgroundTasks
+    ):
+        """Explicitly replace only a still-unapplied, fully anchored result."""
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if (
+            set(form.keys()) != {"csrf_token", "replace_unapplied"}
+            or len(list(form.multi_items())) != 2
+            or form.get("replace_unapplied") != "true"
+        ):
+            return _error(
+                request, templates, "Codex 分类重跑请求参数无效", 400
+            )
+        try:
+            claim = claim_knowledge_classification(
+                database_path, private_root, job_id,
+                runner=application.state.classification_runner,
+                replace_unapplied=True,
+            )
+        except KnowledgeClassificationRunError as error:
+            status = 404 if str(error) == "未找到导入任务" else 409
+            return _error(request, templates, str(error), status)
+        if claim is not None:
+            background_tasks.add_task(run_claimed_knowledge_classification, claim)
+        return RedirectResponse(
+            f"/imports/{job_id}/classification", status_code=303
+        )
 
     @application.post("/imports/{job_id}/classification/questions/{question_no}")
     async def save_knowledge_classification(
@@ -1875,6 +2049,29 @@ def create_app(
             request=request, name="import_classification.html", context=context,
             headers={"Cache-Control": "no-store"},
         )
+
+    @application.post("/imports/{job_id}/admission/prepare")
+    async def prepare_strict_web_admission(request: Request, job_id: int):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "严格准入准备请求参数无效", 400)
+        from src.importing.web_admission import (
+            WebAdmissionError,
+            prepare_web_admission,
+        )
+        service = (
+            application.state.web_admission_prepare_service
+            or prepare_web_admission
+        )
+        try:
+            service(database_path, private_root, job_id)
+        except WebAdmissionError as error:
+            return _error(request, templates, str(error), error.status_code)
+        except Exception:
+            return _error(request, templates, "严格准入准备暂时无法完成", 500)
+        return RedirectResponse(f"/imports/{job_id}/admission", status_code=303)
 
     @application.post("/imports/{job_id}/admission/apply")
     async def apply_strict_web_admission(request: Request, job_id: int):

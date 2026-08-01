@@ -209,14 +209,23 @@ def create_import_job_fixture(
         figure_entries.append({
             "question_no": str(number), "kind": "question_figure",
             "source_page": page_number,
+            "source_relative_path": f"pages/page_{page_number:03d}.png",
             "source_page_sha256": page_metadata[page_number]["sha256"],
             "crop_box_pixels": [2, 2, 42, 26],
             "crop_box_normalized": [0.03125, 0.025, 0.65625, 0.325],
-            "output_relative_path": relative, **metadata, "processing": "synthetic",
-            "review_status": "ai_review_passed",
-            "review_notes": ["程序生成的合成必要配图。"],
+            "output_relative_path": relative, **metadata,
+            "processing": {"variant": "original", "scale": 1,
+                           "contrast": 1.0, "sharpen": False},
+            "review_status": "pending_ai_review",
         })
-    _write_json(job_dir / "figure_assets.json", {"version": 1, "assets": figure_entries})
+    figure_manifest = {
+        "version": 2, "import_job_id": job_id,
+        "generation_id": f"{job_id + 1000:032x}", "assets": figure_entries,
+    }
+    _write_json(
+        job_dir / "figure_assets.json",
+        sign_manifest(load_hmac_key(job_dir), figure_manifest),
+    )
 
     _write_json(job_dir / "render_manifest.json", {
         "import_job_id": job_id, "source_paper_id": source_paper_id,
@@ -224,6 +233,25 @@ def create_import_job_fixture(
         "dpi": 72, "page_count": 4, "pages": page_entries,
     })
     return job_dir
+
+
+def anchor_synthetic_figure_reviews(database_path: Path, private_root: Path, job_id=1):
+    """Create the independent evidence/DB half for synthetic figure fixtures."""
+    from src.processing.figure_review import record_figure_review
+
+    job_dir = Path(private_root) / "processing" / f"import_job_{job_id}"
+    manifest = json.loads((job_dir / "figure_assets.json").read_text())
+    for asset in manifest["assets"]:
+        if asset["kind"] != "question_figure":
+            continue
+        record_figure_review(database_path, private_root, {
+            "version": 1, "import_job_id": job_id,
+            "input_generation_id": manifest["generation_id"],
+            "question_no": int(asset["question_no"]),
+            "output_relative_path": asset["output_relative_path"],
+            "reviewer": "synthetic-independent-figure-review",
+            "decision": "approved",
+        })
 
 
 def anchor_synthetic_candidate_audit(database_path: Path, job_dir: Path) -> None:

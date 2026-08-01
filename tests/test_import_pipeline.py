@@ -7,10 +7,17 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from src.database.initialize import initialize_database
 from src.pipeline.import_pipeline import PipelineResult, inspect_pipeline, main, run_pipeline
+from src.processing.secure_crop_artifacts import load_hmac_key, sign_manifest
+from tests.fixture_factory import (
+    QUESTION_COUNT,
+    create_import_job_fixture,
+    write_synthetic_crop_review_evidence,
+)
 
 
 class ImportPipelineTests(unittest.TestCase):
@@ -124,10 +131,103 @@ class ImportPipelineTests(unittest.TestCase):
 
         self.write_json(job_dir, "ai_audit.json", self.audit())
         state = inspect_pipeline(self.database, self.private_root, 1)
-        self.assertEqual(("ready", "run_strict_admission"), (
+        self.assertEqual(("needs_review", "manual_review"), (
             state.stage, state.next_action
         ))
         self.assertFalse((job_dir / "pipeline_state.json").exists())
+
+        with mock.patch(
+            "src.importing.web_admission.load_admission_page",
+            return_value=SimpleNamespace(
+                can_prepare=True, eligible_count=1, ineligible_count=0,
+            ),
+        ):
+            state = inspect_pipeline(self.database, self.private_root, 1)
+        self.assertEqual(("ready", "prepare_strict_admission"), (
+            state.stage, state.next_action
+        ))
+
+    def test_needs_review_job_points_to_existing_strict_admission(self):
+        self.create_job(status="needs_review")
+        state = inspect_pipeline(self.database, self.private_root, 1)
+        self.assertEqual(("needs_review", "manual_review"), (
+            state.stage, state.next_action
+        ))
+
+    def test_needs_review_admission_evaluation_failure_is_fail_closed(self):
+        self.create_job(status="needs_review")
+        before = self.database.read_bytes()
+        with mock.patch(
+            "src.importing.web_admission.load_admission_page",
+            side_effect=RuntimeError("private strict-evaluation detail"),
+        ):
+            state = inspect_pipeline(self.database, self.private_root, 1)
+        self.assertEqual(("needs_review", "manual_review"), (
+            state.stage, state.next_action
+        ))
+        self.assertNotIn("private strict-evaluation detail", state.message)
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_unanchored_recrop_json_never_claims_confirmed_feedback(self):
+        job_dir = self.create_job()
+        self.mark_rendered(job_dir)
+        self.write_json(job_dir, "question_crops.json", self.crops("needs_recrop"))
+
+        recrop = inspect_pipeline(self.database, self.private_root, 1)
+        self.assertEqual(
+            ("needs_candidates", "provide_candidate_questions"),
+            (recrop.stage, recrop.next_action),
+        )
+        self.assertNotIn("已确认", recrop.message)
+
+        self.write_json(job_dir, "candidate_questions.json", self.candidate())
+        review = inspect_pipeline(self.database, self.private_root, 1)
+        self.assertEqual(
+            ("needs_crop_review", "review_crops"),
+            (review.stage, review.next_action),
+        )
+
+    def test_db_anchored_signed_review_can_request_recrop(self):
+        self.create_job().rmdir()
+        job_dir = create_import_job_fixture(
+            self.private_root, job_id=1, source_paper_id=self.source_id,
+        )
+        self.mark_rendered(job_dir)
+        manifest_path = job_dir / "question_crops.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["questions"][0]["review_status"] = "needs_recrop"
+        manifest["questions"][0]["warnings"] = ["第一题下边界需重切"]
+        manifest = sign_manifest(load_hmac_key(job_dir), manifest)
+        self.write_json(job_dir, "question_crops.json", manifest)
+        write_synthetic_crop_review_evidence(job_dir)
+        manifest_bytes = manifest_path.read_bytes()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """INSERT INTO import_question_split_runs
+                   (import_job_id,status,question_count,processed_pages,
+                    codex_run_id,result_manifest_sha256,render_manifest_sha256,
+                    source_pdf_sha256,crop_manifest_sha256,crop_generation_id,
+                    crop_manifest_signature,completed_at)
+                   VALUES(1,'completed',?,4,'pipeline-test',?,?,?,?,?,?,
+                          '2026-07-30T00:00:00+00:00')""",
+                (
+                    QUESTION_COUNT,
+                    "1" * 64,
+                    "2" * 64,
+                    "3" * 64,
+                    hashlib.sha256(manifest_bytes).hexdigest(),
+                    manifest["generation_id"],
+                    manifest["signature"],
+                ),
+            )
+
+        result = inspect_pipeline(self.database, self.private_root, 1)
+
+        self.assertEqual(
+            ("needs_crop_review", "recrop_questions"),
+            (result.stage, result.next_action),
+        )
+        self.assertIn("验签确认", result.message)
 
     def test_non_pending_job_statuses_never_offer_page_render(self):
         for status, expected in (
@@ -146,14 +246,19 @@ class ImportPipelineTests(unittest.TestCase):
                 job_dir = self.private_root / "processing" / "import_job_1"
                 job_dir.rmdir()
 
-    def test_database_completed_status_is_authoritative(self):
+    def test_database_completed_status_without_coordinator_is_blocked(self):
         self.create_job(status="completed")
+        before = self.database.read_bytes()
         state = inspect_pipeline(self.database, self.private_root, 1)
-        self.assertEqual(("completed", "none"), (state.stage, state.next_action))
+        self.assertEqual(("blocked", "manual_review"), (
+            state.stage, state.next_action,
+        ))
+        self.assertNotIn("完成", state.message)
         applied = run_pipeline(
             self.database, self.private_root, 1, apply=True
         )
-        self.assertEqual(("completed", False), (applied.stage, applied.changed))
+        self.assertEqual(("blocked", False), (applied.stage, applied.changed))
+        self.assertEqual(before, self.database.read_bytes())
 
     def test_mutable_candidate_cannot_repair_stale_pending_status(self):
         job_dir = self.create_job()

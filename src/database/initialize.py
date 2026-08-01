@@ -194,6 +194,178 @@ def _rebuild_web_admission_runs(connection):
     connection.row_factory = None
 
 
+def _quote_catalog_identifier(identifier):
+    """Quote an identifier obtained from the SQLite catalog."""
+    if not isinstance(identifier, str) or not identifier or "\x00" in identifier:
+        raise sqlite3.OperationalError("invalid SQLite catalog identifier")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _schema_statements(schema):
+    pending = ""
+    for line in schema.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            pending = ""
+            if statement:
+                yield statement
+    if pending.strip():
+        raise sqlite3.OperationalError("incomplete schema statement")
+
+
+def _normalize_schema_sql(sql):
+    """Normalize formatting/quoting while preserving SQL literal contents."""
+    text = (sql or "").strip().rstrip(";")
+    lowered = text.lower()
+    create_at = lowered.find("create ")
+    if create_at >= 0:
+        text = text[create_at:]
+    normalized = []
+    in_literal = False
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == "'":
+            normalized.append(character)
+            if in_literal and index + 1 < len(text) and text[index + 1] == "'":
+                normalized.append("'")
+                index += 2
+                continue
+            in_literal = not in_literal
+        elif not in_literal and character == '"':
+            pass
+        elif not in_literal and character.isspace():
+            if normalized and normalized[-1] != " ":
+                normalized.append(" ")
+        elif in_literal:
+            normalized.append(character)
+        else:
+            normalized.append(character.lower())
+        index += 1
+    result = "".join(normalized).strip()
+    return result.replace(" if not exists ", " ", 1)
+
+
+def _classification_schema_targets(schema):
+    tables = {}
+    triggers = {}
+    target_tables = {
+        "import_knowledge_classification_runs",
+        "candidate_knowledge_classification_drafts",
+    }
+    for statement in _schema_statements(schema):
+        normalized = _normalize_schema_sql(statement)
+        words = normalized.split()
+        if len(words) < 3:
+            continue
+        if words[:2] == ["create", "table"]:
+            name = words[2].split("(", 1)[0]
+            if name in target_tables:
+                tables[name] = statement[statement.lower().find("create "):]
+        elif words[:2] == ["create", "trigger"]:
+            name = words[2]
+            if (
+                name.startswith("knowledge_classification_")
+                or name.startswith("candidate_knowledge_classifications_")
+            ):
+                triggers[name] = statement[statement.lower().find("create "):]
+    if set(tables) != target_tables or not triggers:
+        raise sqlite3.OperationalError("classification schema targets are incomplete")
+    return tables, triggers
+
+
+def _restore_autoincrement_sequence(connection, table, prior_sequence):
+    if prior_sequence is None:
+        return
+    quoted = _quote_catalog_identifier(table)
+    maximum = connection.execute(
+        f"SELECT COALESCE(MAX(id), 0) FROM {quoted}"
+    ).fetchone()[0]
+    high_water = max(prior_sequence, maximum)
+    connection.execute("DELETE FROM sqlite_sequence WHERE name=?", (table,))
+    connection.execute(
+        "INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)", (table, high_water)
+    )
+
+
+def _rebuild_table_from_definition(connection, table, create_sql):
+    quoted = _quote_catalog_identifier(table)
+    legacy = f"{table}__migration_old"
+    quoted_legacy = _quote_catalog_identifier(legacy)
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE name=?", (legacy,)
+    ).fetchone():
+        raise sqlite3.OperationalError("classification migration name collision")
+    old_columns = [row[1] for row in connection.execute(f"PRAGMA table_info({quoted})")]
+    sequence_row = connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name=?", (table,)
+    ).fetchone()
+    prior_sequence = sequence_row[0] if sequence_row is not None else None
+    connection.execute(f"ALTER TABLE {quoted} RENAME TO {quoted_legacy}")
+    connection.execute(create_sql)
+    new_columns = {
+        row[1] for row in connection.execute(f"PRAGMA table_info({quoted})")
+    }
+    copied = [column for column in old_columns if column in new_columns]
+    if copied:
+        column_sql = ",".join(_quote_catalog_identifier(column) for column in copied)
+        connection.execute(
+            f"INSERT INTO {quoted} ({column_sql}) "
+            f"SELECT {column_sql} FROM {quoted_legacy}"
+        )
+    connection.execute(f"DROP TABLE {quoted_legacy}")
+    _restore_autoincrement_sequence(connection, table, prior_sequence)
+
+
+def _refresh_knowledge_classification_schema(connection, schema):
+    """Deterministically install the canonical classification tables/triggers."""
+    target_tables, target_triggers = _classification_schema_targets(schema)
+    actual_tables = {
+        row[0]: row[1]
+        for row in connection.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN (?,?)",
+            tuple(target_tables),
+        )
+    }
+    mismatched_tables = {
+        name for name, definition in target_tables.items()
+        if name not in actual_tables
+        or _normalize_schema_sql(actual_tables[name])
+        != _normalize_schema_sql(definition)
+    }
+    actual_triggers = {
+        row[0]: row[1]
+        for row in connection.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND "
+            "(name LIKE 'knowledge_classification_%' OR "
+            "name LIKE 'candidate_knowledge_classifications_%')"
+        )
+    }
+    triggers_match = (
+        set(actual_triggers) == set(target_triggers)
+        and all(
+            _normalize_schema_sql(actual_triggers[name])
+            == _normalize_schema_sql(definition)
+            for name, definition in target_triggers.items()
+        )
+    )
+    if not mismatched_tables and triggers_match:
+        return
+    for name in actual_triggers:
+        connection.execute(
+            f"DROP TRIGGER {_quote_catalog_identifier(name)}"
+        )
+    for name in target_tables:
+        if name in mismatched_tables:
+            _rebuild_table_from_definition(connection, name, target_tables[name])
+    for definition in target_triggers.values():
+        connection.execute(definition)
+    # Rebuilding renames and drops the old indexes.  Re-running the canonical
+    # schema recreates only missing indexes and is still inside the transaction.
+    _execute_script_transactionally(connection, schema)
+
+
 def _refresh_web_admission_protection_triggers(connection, schema):
     """Replace every versioned formal-data guard with the current definition."""
     start = schema.index(
@@ -370,27 +542,20 @@ def _ensure_schema_migrations(connection):
             "ALTER TABLE candidate_review_drafts ADD COLUMN approval_evidence_json TEXT "
             "CHECK (approval_evidence_json IS NULL OR json_valid(approval_evidence_json))"
         )
-    classification_run_columns = {
+    classification_evidence_columns = {
         row[1] for row in connection.execute(
-            "PRAGMA table_info(import_knowledge_classification_runs)"
+            "PRAGMA table_info(candidate_knowledge_classifications)"
         )
     }
-    if classification_run_columns and "stage" not in classification_run_columns:
+    if classification_evidence_columns and "approval_source" not in classification_evidence_columns:
         connection.execute(
-            "ALTER TABLE import_knowledge_classification_runs ADD COLUMN stage TEXT "
-            "NOT NULL DEFAULT 'waiting' CHECK (stage IN "
-            "('waiting','level2','proposal','verifier','publishing','review_ready'))"
+            "ALTER TABLE candidate_knowledge_classifications ADD COLUMN "
+            "approval_source TEXT CHECK (approval_source IN "
+            "('codex_double_pass','codex_adjudicated','local_double_pass','human') "
+            "OR approval_source IS NULL)"
         )
-    classification_draft_columns = {
-        row[1] for row in connection.execute(
-            "PRAGMA table_info(candidate_knowledge_classification_drafts)"
-        )
-    }
-    if classification_draft_columns and "human_review_note" not in classification_draft_columns:
-        connection.execute(
-            "ALTER TABLE candidate_knowledge_classification_drafts ADD COLUMN "
-            "human_review_note TEXT NOT NULL DEFAULT '' CHECK (length(human_review_note) <= 200)"
-        )
+    schema = SCHEMA_PATH.read_text(encoding="utf-8")
+    _refresh_knowledge_classification_schema(connection, schema)
     web_admission_sql = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' "
         "AND name='import_web_admission_runs'"

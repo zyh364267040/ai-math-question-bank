@@ -203,6 +203,45 @@ CREATE TABLE IF NOT EXISTS import_question_split_runs (
     )
 );
 
+CREATE TABLE IF NOT EXISTS import_crop_security_reviews (
+    import_job_id INTEGER NOT NULL REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    evidence_kind TEXT NOT NULL CHECK (evidence_kind IN ('mask', 'figure')),
+    question_no INTEGER NOT NULL CHECK (question_no > 0),
+    generation_id TEXT NOT NULL CHECK (length(generation_id) = 32),
+    subject_digest TEXT NOT NULL CHECK (length(subject_digest) = 64),
+    source_sha256 TEXT NOT NULL CHECK (length(source_sha256) = 64),
+    artifact_sha256 TEXT NOT NULL CHECK (length(artifact_sha256) = 64),
+    preview_sha256 TEXT NOT NULL CHECK (length(preview_sha256) = 64),
+    evidence_sha256 TEXT NOT NULL CHECK (length(evidence_sha256) = 64),
+    evidence_signature TEXT NOT NULL CHECK (length(evidence_signature) = 64),
+    reviewer TEXT NOT NULL CHECK (length(trim(reviewer)) BETWEEN 1 AND 100),
+    decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+    reason TEXT CHECK (reason IS NULL OR reason IN ('qr_code', 'promotion_overlay')),
+    bbox_json TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    PRIMARY KEY (import_job_id, evidence_kind, question_no, generation_id, subject_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_crop_security_reviews_job
+ON import_crop_security_reviews(import_job_id, evidence_kind, generation_id);
+
+CREATE TABLE IF NOT EXISTS import_frozen_crop_reviews (
+    import_job_id INTEGER NOT NULL REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    question_no INTEGER NOT NULL CHECK (question_no > 0),
+    crop_generation_id TEXT NOT NULL CHECK (length(crop_generation_id) = 32),
+    crop_sha256 TEXT NOT NULL CHECK (length(crop_sha256) = 64),
+    manifest_entry_sha256 TEXT NOT NULL CHECK (length(manifest_entry_sha256) = 64),
+    source_manifest_sha256 TEXT NOT NULL CHECK (length(source_manifest_sha256) = 64),
+    source_manifest_signature TEXT NOT NULL CHECK (length(source_manifest_signature) = 64),
+    review_evidence_sha256 TEXT NOT NULL CHECK (length(review_evidence_sha256) = 64),
+    review_evidence_signature TEXT NOT NULL CHECK (length(review_evidence_signature) = 64),
+    evidence_relative_path TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    frozen_at TEXT NOT NULL,
+    PRIMARY KEY (import_job_id, question_no, crop_generation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_frozen_crop_reviews_job
+ON import_frozen_crop_reviews(import_job_id, question_no);
+
 CREATE TABLE IF NOT EXISTS import_candidate_extraction_runs (
     import_job_id INTEGER PRIMARY KEY REFERENCES import_jobs(id) ON DELETE RESTRICT,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (
@@ -607,6 +646,11 @@ CREATE TABLE IF NOT EXISTS candidate_knowledge_classifications (
     related_knowledge_point_codes_json TEXT NOT NULL,
     classifier TEXT NOT NULL CHECK (length(trim(classifier)) BETWEEN 1 AND 100),
     reviewer TEXT NOT NULL CHECK (length(trim(reviewer)) BETWEEN 1 AND 100),
+    approval_source TEXT CHECK (
+        approval_source IN (
+            'codex_double_pass','codex_adjudicated','local_double_pass','human'
+        ) OR approval_source IS NULL
+    ),
     classifier_run_id TEXT NOT NULL CHECK (length(trim(classifier_run_id)) BETWEEN 1 AND 200),
     evidence_sha256 TEXT NOT NULL CHECK (length(evidence_sha256) = 64 AND evidence_sha256 NOT GLOB '*[^0-9a-f]*'),
     reason TEXT NOT NULL DEFAULT '' CHECK (length(reason) <= 200),
@@ -635,11 +679,14 @@ CREATE TABLE IF NOT EXISTS import_knowledge_classification_runs (
         status IN ('pending','processing','completed','failed')
     ),
     stage TEXT NOT NULL DEFAULT 'waiting' CHECK (
-        stage IN ('waiting','level2','proposal','verifier','publishing','review_ready')
+        stage IN (
+            'waiting','level2','proposal','verifier','adjudicator',
+            'publishing','review_ready'
+        )
     ),
     question_count INTEGER CHECK (question_count IS NULL OR question_count > 0),
     processed_questions INTEGER NOT NULL DEFAULT 0 CHECK (processed_questions >= 0),
-    model TEXT NOT NULL DEFAULT 'qwen2.5:14b' CHECK (length(trim(model)) BETWEEN 1 AND 100),
+    model TEXT NOT NULL DEFAULT 'codex-cli' CHECK (model='codex-cli'),
     input_digest TEXT CHECK (input_digest IS NULL OR (
         length(input_digest)=64 AND input_digest NOT GLOB '*[^0-9a-f]*'
     )),
@@ -656,6 +703,15 @@ CREATE TABLE IF NOT EXISTS import_knowledge_classification_runs (
     completed_at TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     applied_at TEXT,
+    replacement_active INTEGER NOT NULL DEFAULT 0 CHECK (
+        replacement_active IN (0, 1)
+    ),
+    replacement_attempted_at TEXT,
+    replacement_completed_at TEXT,
+    replacement_result TEXT CHECK (
+        replacement_result IN ('processing','completed','failed')
+        OR replacement_result IS NULL
+    ),
     CHECK (question_count IS NULL OR processed_questions <= question_count),
     CHECK (status != 'completed' OR (
         question_count IS NOT NULL AND processed_questions=question_count
@@ -681,10 +737,25 @@ CREATE TABLE IF NOT EXISTS candidate_knowledge_classification_drafts (
     verifier_related_codes_json TEXT NOT NULL CHECK (json_valid(verifier_related_codes_json)),
     verifier_confidence TEXT NOT NULL CHECK (verifier_confidence IN ('low','medium','high')),
     verifier_reason TEXT NOT NULL CHECK (length(verifier_reason) BETWEEN 1 AND 200),
+    adjudicator_primary_code TEXT REFERENCES knowledge_points(code) ON DELETE RESTRICT,
+    adjudicator_related_codes_json TEXT CHECK (
+        adjudicator_related_codes_json IS NULL OR json_valid(adjudicator_related_codes_json)
+    ),
+    adjudicator_confidence TEXT CHECK (
+        adjudicator_confidence IN ('low','medium','high') OR adjudicator_confidence IS NULL
+    ),
+    adjudicator_reason TEXT CHECK (
+        adjudicator_reason IS NULL OR length(adjudicator_reason) BETWEEN 1 AND 200
+    ),
     final_primary_code TEXT NOT NULL REFERENCES knowledge_points(code) ON DELETE RESTRICT,
     final_related_codes_json TEXT NOT NULL CHECK (json_valid(final_related_codes_json)),
+    final_reason TEXT CHECK (final_reason IS NULL OR length(final_reason) BETWEEN 1 AND 200),
     status TEXT NOT NULL CHECK (status IN ('pending','approved')),
-    approval_source TEXT CHECK (approval_source IN ('local_double_pass','human') OR approval_source IS NULL),
+    approval_source TEXT CHECK (
+        approval_source IN (
+            'codex_double_pass','codex_adjudicated','local_double_pass','human'
+        ) OR approval_source IS NULL
+    ),
     human_review_note TEXT NOT NULL DEFAULT '' CHECK (length(human_review_note) <= 200),
     version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
     reviewed_at TEXT,
@@ -696,6 +767,26 @@ CREATE TABLE IF NOT EXISTS candidate_knowledge_classification_drafts (
 );
 CREATE INDEX IF NOT EXISTS idx_knowledge_classification_draft_review
 ON candidate_knowledge_classification_drafts(import_job_id, status, source_question_no);
+
+CREATE TABLE IF NOT EXISTS knowledge_classification_replacement_snapshots (
+    import_job_id INTEGER PRIMARY KEY
+        REFERENCES import_knowledge_classification_runs(import_job_id) ON DELETE RESTRICT,
+    claim_token TEXT NOT NULL UNIQUE CHECK (
+        length(claim_token)=64 AND claim_token NOT GLOB '*[^0-9a-f]*'
+    ),
+    run_snapshot_json TEXT NOT NULL CHECK (json_valid(run_snapshot_json)),
+    drafts_snapshot_json TEXT NOT NULL CHECK (json_valid(drafts_snapshot_json)),
+    output_sha256 TEXT NOT NULL CHECK (
+        length(output_sha256)=64 AND output_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    output_byte_size INTEGER NOT NULL CHECK (output_byte_size > 0),
+    backup_name TEXT NOT NULL CHECK (
+        length(backup_name) BETWEEN 1 AND 120
+        AND backup_name NOT LIKE '%/%' AND backup_name NOT LIKE '%\%'
+        AND backup_name NOT LIKE '%..%'
+    ),
+    created_at TEXT NOT NULL
+);
 
 CREATE TRIGGER IF NOT EXISTS knowledge_classification_applied_run_immutable
 BEFORE UPDATE ON import_knowledge_classification_runs
@@ -720,6 +811,17 @@ WHEN OLD.status='completed' AND (
     OR NEW.output_sha256 != OLD.output_sha256
     OR NEW.output_byte_size != OLD.output_byte_size
     OR NEW.completed_at != OLD.completed_at
+) AND NOT (
+    OLD.applied_at IS NULL
+    AND NEW.status='processing'
+    AND NEW.replacement_active=1
+    AND NEW.question_count IS OLD.question_count
+    AND NEW.model IS OLD.model
+    AND NEW.input_digest IS OLD.input_digest
+    AND NEW.taxonomy_digest IS OLD.taxonomy_digest
+    AND NEW.output_sha256 IS OLD.output_sha256
+    AND NEW.output_byte_size IS OLD.output_byte_size
+    AND NEW.completed_at IS OLD.completed_at
 )
 BEGIN
     SELECT RAISE(ABORT, 'completed knowledge classification output is immutable');
@@ -743,6 +845,22 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'applied knowledge classification draft is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS knowledge_classification_replacement_snapshot_immutable
+BEFORE UPDATE ON knowledge_classification_replacement_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'knowledge classification replacement snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS knowledge_classification_active_replacement_snapshot_delete_immutable
+BEFORE DELETE ON knowledge_classification_replacement_snapshots
+WHEN EXISTS (
+    SELECT 1 FROM import_knowledge_classification_runs r
+    WHERE r.import_job_id=OLD.import_job_id AND r.replacement_active=1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'active knowledge classification replacement snapshot is immutable');
 END;
 
 CREATE TABLE IF NOT EXISTS import_web_admission_runs (

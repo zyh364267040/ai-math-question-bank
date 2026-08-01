@@ -109,6 +109,180 @@ class QuestionCropTests(unittest.TestCase):
         on_disk = json.loads((self.job_dir / "question_crops.json").read_text())
         self.assertEqual(manifest, on_disk)
 
+    def test_single_page_multiple_masks_remain_unapplied_pending_proposals(self):
+        specs = [
+            {
+                "question_no": 1,
+                "regions": [{"page_number": 1, "bbox": [5, 8, 105, 58]}],
+                "mask_regions_normalized": [
+                    {"bbox_normalized": [0.10, 0.15, 0.20, 0.25], "reason": "二维码"},
+                    {"bbox_normalized": [0.50, 0.30, 0.70, 0.40], "reason": "群组宣传"},
+                ],
+                "mask_regions": [
+                    {"page_number": 1, "bbox": [12, 15, 24, 25], "reason": "二维码"},
+                    {"page_number": 1, "bbox": [60, 30, 84, 40], "reason": "群组宣传"},
+                ],
+            },
+            {"question_no": 2, "regions": [
+                {"page_number": 2, "bbox": [10, 20, 110, 90]},
+            ]},
+        ]
+        unmasked = self.generate_report()
+        unmasked_hash = unmasked.manifest["questions"][0]["sha256"]
+
+        masked = self.generate_report(specs)
+
+        entry = masked.manifest["questions"][0]
+        self.assertEqual(unmasked_hash, entry["sha256"])
+        self.assertEqual(specs[0]["mask_regions_normalized"],
+                         entry["mask_regions_normalized"])
+        self.assertEqual(specs[0]["mask_regions"], entry["mask_regions"])
+        self.assertEqual("pending_ai_review", entry["review_status"])
+        with Image.open(self.job_dir / entry["output_relative_path"]) as image:
+            self.assertEqual((240, 20, 20), image.getpixel((8, 8)))
+            self.assertEqual((240, 20, 20), image.getpixel((60, 27)))
+            self.assertEqual((240, 20, 20), image.getpixel((1, 1)))
+
+    def test_unapproved_central_mask_is_pending_only_and_cannot_erase_body(self):
+        specs = [
+            {
+                "question_no": 1,
+                "regions": [{"page_number": 1, "bbox": [5, 8, 105, 58]}],
+                "mask_regions_normalized": [{
+                    "bbox_normalized": [0.10, 0.15, 0.80, 0.50],
+                    "reason": "模型声称可删除",
+                }],
+                "mask_regions": [{
+                    "page_number": 1, "bbox": [12, 15, 96, 50],
+                    "reason": "模型声称可删除",
+                }],
+            },
+            {"question_no": 2, "regions": [
+                {"page_number": 2, "bbox": [10, 20, 110, 90]},
+            ]},
+        ]
+
+        report = self.generate_report(specs)
+
+        entry = report.manifest["questions"][0]
+        self.assertEqual("pending_ai_review", entry["review_status"])
+        with Image.open(self.job_dir / entry["output_relative_path"]) as image:
+            self.assertEqual((240, 20, 20), image.getpixel((50, 25)))
+
+    def test_absent_and_explicit_empty_masks_keep_identical_png_and_generation(self):
+        first = self.generate_report()
+        explicit = [
+            {
+                "question_no": 1,
+                "regions": [{"page_number": 1, "bbox": [5, 8, 105, 58]}],
+                "mask_regions_normalized": [],
+                "mask_regions": [],
+            },
+            {
+                "question_no": 2,
+                "regions": [{"page_number": 2, "bbox": [10, 20, 110, 90]}],
+                "mask_regions_normalized": [],
+                "mask_regions": [],
+            },
+        ]
+
+        second = self.generate_report(explicit)
+
+        self.assertEqual(first.generation_id, second.generation_id)
+        self.assertEqual(
+            [item["sha256"] for item in first.manifest["questions"]],
+            [item["sha256"] for item in second.manifest["questions"]],
+        )
+        self.assertEqual([], second.recropped_question_nos)
+        self.assertEqual([1, 2], second.reused_question_nos)
+
+    def test_mask_fields_are_hmac_protected_and_schema_validated(self):
+        specs = [
+            {
+                "question_no": 1,
+                "regions": [{"page_number": 1, "bbox": [5, 8, 105, 58]}],
+                "mask_regions_normalized": [{
+                    "bbox_normalized": [0.10, 0.15, 0.20, 0.25],
+                    "reason": "二维码",
+                }],
+                "mask_regions": [{
+                    "page_number": 1, "bbox": [12, 15, 24, 25],
+                    "reason": "二维码",
+                }],
+            },
+            {"question_no": 2, "regions": [
+                {"page_number": 2, "bbox": [10, 20, 110, 90]},
+            ]},
+        ]
+        self.generate_report(specs)
+        path = self.job_dir / "question_crops.json"
+        original = path.read_bytes()
+        tampered = json.loads(original)
+        tampered["questions"][0]["mask_regions"][0]["reason"] = "伪造原因"
+        path.write_text(json.dumps(tampered), encoding="utf-8")
+        with self.assertRaisesRegex(QuestionCropError, "签名|完整性|拒绝"):
+            self.generate_report(specs)
+
+        path.write_bytes(original)
+        invalid = json.loads(original)
+        invalid.pop("signature")
+        invalid["questions"][0]["mask_regions"][0]["bbox"] = [0, 0, 12, 15]
+        invalid = sign_manifest(load_hmac_key(self.job_dir), invalid)
+        path.write_text(json.dumps(invalid), encoding="utf-8")
+        with self.assertRaisesRegex(QuestionCropError, "签名|schema|拒绝"):
+            self.generate_report(specs)
+
+    def test_cross_page_mask_proposal_does_not_modify_vertical_composition(self):
+        specs = [
+            {
+                "question_no": 1,
+                "regions": [
+                    {"page_number": 1, "bbox": [5, 8, 105, 58]},
+                    {"page_number": 2, "bbox": [10, 20, 110, 70]},
+                ],
+                "mask_regions_normalized": [{
+                    "bbox_normalized": [0.50, 0.30, 0.70, 0.40],
+                    "reason": "第二页宣传层",
+                }],
+                "mask_regions": [{
+                    "page_number": 2, "bbox": [60, 30, 84, 40],
+                    "reason": "第二页宣传层",
+                }],
+            },
+            {"question_no": 2, "regions": [
+                {"page_number": 2, "bbox": [10, 70, 110, 95]},
+            ]},
+        ]
+
+        report = self.generate_report(specs)
+
+        entry = report.manifest["questions"][0]
+        with Image.open(self.job_dir / entry["output_relative_path"]) as image:
+            self.assertEqual((20, 20, 240), image.getpixel((55, 69)))
+            self.assertEqual((20, 20, 240), image.getpixel((1, 58)))
+
+    def test_crop_rejects_mask_outside_or_inconsistent_with_region(self):
+        base = {
+            "question_no": 1,
+            "regions": [{"page_number": 1, "bbox": [5, 8, 105, 58]}],
+            "mask_regions_normalized": [{
+                "bbox_normalized": [0.10, 0.15, 0.20, 0.25], "reason": "二维码",
+            }],
+        }
+        invalid_masks = (
+            [{"page_number": 1, "bbox": [0, 0, 10, 10], "reason": "二维码"}],
+            [{"page_number": 2, "bbox": [12, 15, 24, 25], "reason": "二维码"}],
+            [{"page_number": 1, "bbox": [12, 15, 24, 25], "reason": "不同原因"}],
+        )
+        for masks in invalid_masks:
+            with self.subTest(masks=masks), self.assertRaises(QuestionCropError):
+                self.generate_report([
+                    {**base, "mask_regions": masks},
+                    {"question_no": 2, "regions": [
+                        {"page_number": 2, "bbox": [10, 20, 110, 90]},
+                    ]},
+                ])
+
     def test_report_marks_first_batch_as_recropped(self):
         report = self.generate_report()
         self.assertEqual([1, 2], report.recropped_question_nos)

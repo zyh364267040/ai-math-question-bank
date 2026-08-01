@@ -42,7 +42,13 @@
 
 <section class="paper-card">
   <p><strong>原卷答案缺失时始终保持 missing，AI 不会猜测或补写答案。</strong></p>
-  {% if page.stage != 'completed' and page.can_apply %}
+  {% if page.stage != 'completed' and page.can_prepare %}
+  <p>候选题与严格证据已齐全。先显式准备准入状态；此操作不会创建正式题。</p>
+  <form method="post" action="/imports/{{ page.job_id }}/admission/prepare">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="button urgent" type="submit">准备严格入库</button>
+  </form>
+  {% elif page.stage != 'completed' and page.can_apply %}
   <form method="post" action="/imports/{{ page.job_id }}/admission/apply">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button class="button urgent" type="submit">正式入库并完成任务</button>

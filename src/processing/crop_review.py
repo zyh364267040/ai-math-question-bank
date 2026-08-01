@@ -27,6 +27,7 @@ from src.processing.secure_crop_artifacts import (
     validate_signed_manifest,
     write_file_at,
 )
+from src.processing.mask_review import MaskReviewError, validate_applied_masks
 
 
 MANIFEST_NAME = "question_crops.json"
@@ -200,6 +201,63 @@ def validate_current_crop_review(
         expected_output_sha256=manifest_sha256,
         expected_output_signature=manifest["signature"],
         expected_questions=expected_questions,
+    )
+
+
+def load_current_crop_review(
+    database_path: Any, private_root: Any, job_id: int, *, recover: bool = False,
+) -> dict[str, Any]:
+    """Load only recovery-clean, signed evidence for the DB-anchored crop generation."""
+    if not _strict_int(job_id):
+        raise CropReviewError("题图审核任务参数无效")
+    database_path = Path(database_path)
+    job_dir = Path(private_root) / "processing" / f"import_job_{job_id}"
+    try:
+        with locked_job(job_dir) as lock:
+            return _load_current_crop_review_locked(
+                database_path, lock, job_id, recover=recover,
+            )
+    except CropReviewError:
+        raise
+    except (OSError, SecureCropArtifactError) as error:
+        raise CropReviewError("当前题图审核证据不可验证") from error
+
+
+def _load_current_crop_review_locked(
+    database_path: Path, lock: Any, job_id: int, *, recover: bool,
+) -> dict[str, Any]:
+    """Validate review evidence while the caller retains the artifact lock."""
+    key = load_hmac_key(lock.path)
+    if recover:
+        _recover_if_needed(database_path, lock.descriptor, key, job_id)
+    else:
+        if _read_journal(lock.descriptor, key) is not None:
+            raise CropReviewError("题图审核事务尚未恢复，当前证据不可确认")
+        _recover_if_needed(database_path, lock.descriptor, key, job_id)
+    row = _database_row(database_path, job_id)
+    if (
+        row is None or row[0] != "pending"
+        or row[1] not in {"completed", "failed", "processing"}
+        or not _strict_int(row[2], maximum=MAX_QUESTIONS)
+        or any(value is None for value in row[3:6])
+    ):
+        raise CropReviewError("仅可读取数据库绑定的当前题图审核")
+    manifest_snapshot = read_file_at(
+        lock.descriptor, MANIFEST_NAME, max_bytes=MAX_MANIFEST_BYTES,
+    )
+    manifest = validate_signed_manifest(
+        _parse_json(manifest_snapshot.data, "question_crops manifest"), key,
+        expected_job_id=job_id,
+        expected_question_nos=list(range(1, row[2] + 1)),
+    )
+    if (
+        manifest_snapshot.sha256,
+        manifest["generation_id"],
+        manifest["signature"],
+    ) != tuple(row[3:6]):
+        raise CropReviewError("当前切题manifest与数据库锚点不一致")
+    return validate_current_crop_review(
+        lock.descriptor, key, manifest, manifest_snapshot.sha256,
     )
 
 
@@ -411,6 +469,19 @@ def record_crop_ai_review(database_path: Any, private_root: Any, payload: Any) -
             expected_numbers = [question["question_no"] for question in manifest["questions"]]
             if [question["question_no"] for question in payload["questions"]] != expected_numbers:
                 raise CropReviewError("审核必须按manifest顺序完整覆盖全部题号")
+            if any(
+                question.get("mask_regions") and decision["status"] == "ai_review_passed"
+                for question, decision in zip(
+                    manifest["questions"], payload["questions"], strict=True,
+                )
+            ):
+                try:
+                    with closing(sqlite3.connect(database_path)) as evidence_connection:
+                        validate_applied_masks(
+                            evidence_connection, lock.descriptor, lock.path, manifest,
+                        )
+                except MaskReviewError as error:
+                    raise CropReviewError("遮罩必须先完成独立审核并安全应用") from error
             normalized_payload = json.loads(json.dumps(payload))
             for crop, decision in zip(
                 manifest["questions"], normalized_payload["questions"], strict=True

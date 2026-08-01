@@ -147,6 +147,9 @@ class QuestionSplitWebTests(unittest.TestCase):
             )
         failed = self.client.get(f"/imports/{job_id}/split")
         self.assertIn("Q001", failed.text)
+        self.assertIn("当前可信审核意见", failed.text)
+        self.assertIn("根据审核意见重新切题", failed.text)
+        self.assertNotIn("重试调用 Codex 自动切题", failed.text)
         self.assertEqual(200, self.client.get(
             f"/imports/{job_id}/split-images/1.png"
         ).status_code)
@@ -160,6 +163,114 @@ class QuestionSplitWebTests(unittest.TestCase):
             self.assertEqual(0, connection.execute(
                 "SELECT COUNT(*) FROM candidate_review_drafts"
             ).fetchone()[0])
+
+    def test_recrop_button_is_mutually_exclusive_with_all_passed_review(self):
+        job_id = self.upload_confirm_render()
+        self.client.post(
+            f"/imports/{job_id}/split", data={"csrf_token": self.csrf},
+            follow_redirects=False,
+        )
+        job_dir = self.private / "processing" / f"import_job_{job_id}"
+
+        def review(second_status, warnings):
+            manifest_bytes = (job_dir / "question_crops.json").read_bytes()
+            manifest = json.loads(manifest_bytes)
+            record_crop_ai_review(self.db, self.private, {
+                "version": 1,
+                "import_job_id": job_id,
+                "input_generation_id": manifest["generation_id"],
+                "input_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                "reviewer_run_id": f"web-button-{second_status}",
+                "questions": [
+                    {"question_no": 1, "status": "ai_review_passed", "warnings": []},
+                    {"question_no": 2, "status": second_status, "warnings": warnings},
+                ],
+            })
+
+        review("ai_review_passed", [])
+        all_passed = self.client.get(f"/imports/{job_id}/split")
+        self.assertNotIn("根据审核意见重新切题", all_passed.text)
+
+        review("needs_recrop", ["第二题下边界错误"])
+        needs_recrop = self.client.get(f"/imports/{job_id}/split")
+        self.assertIn("根据审核意见重新切题", needs_recrop.text)
+        self.assertIn(
+            f'action="/imports/{job_id}/split"', needs_recrop.text
+        )
+        self.assertIn('name="csrf_token"', needs_recrop.text)
+
+        restarted = self.client.post(
+            f"/imports/{job_id}/split", data={"csrf_token": self.csrf},
+            follow_redirects=False,
+        )
+        self.assertEqual(303, restarted.status_code)
+        self.assertEqual(2, len(self.runner.calls))
+        self.assertIn('"question_no":2', self.runner.calls[-1][1])
+        pending = self.client.get(f"/imports/{job_id}/split")
+        self.assertNotIn("根据审核意见重新切题", pending.text)
+        self.assertIn("通过 1 题，需重切 0 题，待审核 1 题", pending.text)
+
+    def test_invalid_review_evidence_hides_recrop_action_and_post_is_not_success(self):
+        job_id = self.upload_confirm_render()
+        self.client.post(
+            f"/imports/{job_id}/split", data={"csrf_token": self.csrf},
+            follow_redirects=False,
+        )
+        job_dir = self.private / "processing" / f"import_job_{job_id}"
+        manifest_bytes = (job_dir / "question_crops.json").read_bytes()
+        manifest = json.loads(manifest_bytes)
+        record_crop_ai_review(self.db, self.private, {
+            "version": 1,
+            "import_job_id": job_id,
+            "input_generation_id": manifest["generation_id"],
+            "input_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "reviewer_run_id": "web-invalid-evidence",
+            "questions": [
+                {"question_no": 1, "status": "ai_review_passed", "warnings": []},
+                {"question_no": 2, "status": "needs_recrop", "warnings": ["边界错误"]},
+            ],
+        })
+        (job_dir / "crop_ai_review.json").write_bytes(b"{broken")
+
+        page = self.client.get(f"/imports/{job_id}/split")
+        self.assertNotIn("当前可信审核意见", page.text)
+        self.assertNotIn("根据审核意见重新切题", page.text)
+        self.assertIn("审核证据校验失败", page.text)
+
+        post = self.client.post(
+            f"/imports/{job_id}/split", data={"csrf_token": self.csrf},
+            follow_redirects=False,
+        )
+        self.assertEqual(409, post.status_code)
+        self.assertEqual(1, len(self.runner.calls))
+
+    def test_mask_review_get_is_read_only_and_posts_require_strict_csrf_and_fields(self):
+        job_id = self.upload_confirm_render()
+        self.client.post(
+            f"/imports/{job_id}/split", data={"csrf_token": self.csrf},
+            follow_redirects=False,
+        )
+        before = {
+            path.relative_to(self.private).as_posix(): path.read_bytes()
+            for path in self.private.rglob("*") if path.is_file()
+        }
+
+        response = self.client.get(f"/imports/{job_id}/mask-review")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual([], response.json()["proposals"])
+        after = {
+            path.relative_to(self.private).as_posix(): path.read_bytes()
+            for path in self.private.rglob("*") if path.is_file()
+        }
+        self.assertEqual(before, after)
+        self.assertEqual(403, self.client.post(
+            f"/imports/{job_id}/mask-review", data={"csrf_token": "wrong"},
+        ).status_code)
+        self.assertEqual(400, self.client.post(
+            f"/imports/{job_id}/mask-review",
+            data={"csrf_token": self.csrf, "review_status": "ai_review_passed"},
+        ).status_code)
 
     def test_get_csrf_body_limit_duplicate_post_and_safe_image_route(self):
         job_id = self.upload_confirm_render()
@@ -192,7 +303,7 @@ class QuestionSplitWebTests(unittest.TestCase):
         first = self.client.post(f"/imports/{job_id}/split", data={"csrf_token": self.csrf})
         second = self.client.post(f"/imports/{job_id}/split", data={"csrf_token": self.csrf})
         self.assertEqual(200, first.status_code)
-        self.assertEqual(200, second.status_code)
+        self.assertEqual(409, second.status_code)
         self.assertEqual(1, len(self.runner.calls))
         self.assertEqual(404, self.client.get(
             f"/imports/{job_id}/split-images/999.png"

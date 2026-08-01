@@ -28,6 +28,12 @@ from src.processing.secure_crop_artifacts import (
     read_file_at,
     validate_signed_manifest,
 )
+from src.processing.mask_review import MaskReviewError, validate_applied_masks
+from src.processing.figure_review import (
+    FigureReviewError,
+    validate_figure_evidence,
+    validate_figure_manifest,
+)
 from src.web.app import (
     AuditDataError,
     CHOICE_TYPES,
@@ -373,6 +379,10 @@ def _load_context(connection, private_root: Path, job_id: int, artifact_lock=Non
         crops[number] = entry
     if set(crops) != set(numbers):
         raise AdmissionError("完整题图清单不完整")
+    try:
+        validate_applied_masks(connection, job_fd, job_dir, crops_data)
+    except MaskReviewError as exc:
+        raise AdmissionError("遮罩独立审核证据无效") from exc
 
     figures_data, _figures_snapshot = _read_artifact_json(
         job_fd, "figure_assets.json", "配图清单", snapshots
@@ -385,12 +395,23 @@ def _load_context(connection, private_root: Path, job_id: int, artifact_lock=Non
         if not isinstance(entry, dict) or entry.get("kind") != "question_figure":
             continue
         number = entry.get("question_no")
-        if number in figures or number not in numbers or entry.get("review_status") != "ai_review_passed":
+        if number in figures or number not in numbers or entry.get("review_status") != "pending_ai_review":
             raise AdmissionError("必要配图未通过审核")
         _safe_png(
             job_dir, job_fd, entry.get("output_relative_path"), entry, snapshots
         )
         figures[number] = entry
+    if figures:
+        try:
+            validate_figure_manifest(
+                figures_data, load_hmac_key(job_dir), job_id,
+            )
+            validate_figure_evidence(
+                connection, job_fd, job_dir, job_id, figures_data,
+                candidate_snapshot.sha256,
+            )
+        except FigureReviewError as exc:
+            raise AdmissionError("配图独立审核证据无效") from exc
     anchor = connection.execute(
         """SELECT status,input_candidate_sha256,input_manifest_sha256,output_sha256,
                   completed_at FROM import_candidate_audit_runs WHERE import_job_id=?""",
@@ -647,7 +668,10 @@ def _effective_questions(connection, context):
     }
 
 
-def assess_job(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1):
+def assess_job(
+    database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1, *,
+    _transaction_callback=None,
+):
     database_path = Path(database_path)
     private_root = Path(private_root or database_path.parent)
     job_dir = private_root / "processing" / f"import_job_{job_id}"
@@ -655,12 +679,24 @@ def assess_job(database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1)
         with closing(sqlite3.connect(database_path)) as connection:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
-            context = _load_context(
-                connection, private_root, job_id, artifact_lock=artifact_lock
-            )
-            report = _assess(connection, context)
-            _verify_artifact_snapshots(artifact_lock.descriptor, context[9])
-            return report
+            try:
+                if _transaction_callback is not None:
+                    connection.execute("PRAGMA busy_timeout=10000")
+                    connection.execute("BEGIN IMMEDIATE")
+                context = _load_context(
+                    connection, private_root, job_id, artifact_lock=artifact_lock
+                )
+                report = _assess(connection, context)
+                _verify_artifact_snapshots(artifact_lock.descriptor, context[9])
+                if _transaction_callback is not None:
+                    _transaction_callback(connection, context, report)
+                    _verify_artifact_snapshots(artifact_lock.descriptor, context[9])
+                    connection.commit()
+                return report
+            except Exception:
+                if _transaction_callback is not None:
+                    connection.rollback()
+                raise
 
 
 def _code(source_sha: str, number: str) -> str:
@@ -917,6 +953,7 @@ def _validate_existing_question(
 def admit_questions(
     database_path=DEFAULT_DATABASE_PATH, private_root=None, job_id=1, *,
     require_complete_batch=False, pre_apply_callback=None,
+    completion_callback=None,
 ):
     database_path = Path(database_path)
     private_root = Path(private_root or database_path.parent)
@@ -989,6 +1026,8 @@ def admit_questions(
                 inserted, present, len(assessment.eligible), len(assessment.ineligible),
                 tuple(codes),
             )
+            if completion_callback is not None:
+                completion_callback(connection, result)
             connection.commit()
             return result
         except Exception:

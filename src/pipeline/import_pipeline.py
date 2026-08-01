@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from src.database.initialize import DEFAULT_DATABASE_PATH
+from src.processing.crop_review import CropReviewError, load_current_crop_review
 from src.processing.pdf_page_renderer import (
     _open_child_directory,
     _open_safe_directory,
@@ -167,6 +168,10 @@ def _database_snapshot(database_path, job_id):
             "SELECT status FROM import_page_render_runs WHERE import_job_id=?",
             (job_id,),
         ).fetchone()
+        admission_run = connection.execute(
+            "SELECT status,stage FROM import_web_admission_runs WHERE import_job_id=?",
+            (job_id,),
+        ).fetchone()
         admitted = {
             row[0]
             for row in connection.execute(
@@ -174,7 +179,7 @@ def _database_snapshot(database_path, job_id):
                 (job_id,),
             )
         }
-    return job, render, admitted
+    return job, render, admission_run, admitted
 
 
 def inspect_pipeline(database_path, private_root, job_id):
@@ -186,11 +191,61 @@ def inspect_pipeline(database_path, private_root, job_id):
         return _result(job_id, "unavailable", "check_database", "题库数据库不可读取")
     if snapshot is None:
         return _result(job_id, "not_found", "check_job_id", "导入任务不存在")
-    job, render, admitted = snapshot
-    if job[0] == "completed":
-        return _result(job_id, "completed", "none", "任务已经完成")
+    job, render, admission_run, admitted = snapshot
+    completion_claimed = bool(
+        job[0] == "completed"
+        or admission_run is not None
+        and (admission_run[0] == "completed" or admission_run[1] == "completed")
+    )
+    if completion_claimed:
+        try:
+            from src.importing.web_admission import load_admission_page
+
+            admission = load_admission_page(database_path, private_root, job_id)
+        except Exception:
+            return _result(
+                job_id,
+                "blocked",
+                "manual_review",
+                "任务状态与权威批次锚点不一致，请人工复核",
+            )
+        if admission.stage == "completed":
+            return _result(job_id, "completed", "none", "任务已经完成")
+        return _result(
+            job_id,
+            "blocked",
+            "manual_review",
+            "任务状态与权威批次锚点不一致，请人工复核",
+        )
     if job[0] == "needs_review":
-        return _result(job_id, "needs_review", "manual_review", "任务保持人工复核")
+        try:
+            from src.importing.web_admission import load_admission_page
+
+            admission = load_admission_page(database_path, private_root, job_id)
+        except Exception:
+            return _result(
+                job_id,
+                "needs_review",
+                "manual_review",
+                "严格准入评估未通过或暂时不可用，请人工复核",
+            )
+        if not admission.can_apply:
+            return _result(
+                job_id,
+                "needs_review",
+                "manual_review",
+                "严格准入证据不完整、存在冲突或批次尚不可安全入库",
+                eligible=admission.eligible_count,
+                ineligible=admission.ineligible_count,
+            )
+        return _result(
+            job_id,
+            "ready",
+            "run_strict_admission",
+            "严格准入评估已全部通过，可调用现有严格入库服务",
+            eligible=admission.eligible_count,
+            ineligible=admission.ineligible_count,
+        )
     if job[0] == "processing":
         return _result(
             job_id,
@@ -224,6 +279,49 @@ def inspect_pipeline(database_path, private_root, job_id):
             ):
                 return _result(job_id, "needs_render", "render_pages", "需要生成页面 PNG")
 
+            crops = _object_at(job_fd, "question_crops.json")
+            crop_entries = crops.get("questions") if crops else None
+            crop_numbers = [
+                item.get("question_no") if isinstance(item, dict) else None
+                for item in crop_entries or []
+            ]
+            recognizable_crops = bool(
+                crops
+                and crops.get("import_job_id") == job_id
+                and isinstance(crop_entries, list)
+                and crop_entries
+                and crops.get("question_count") == len(crop_entries)
+                and all(
+                    isinstance(number, int) and not isinstance(number, bool)
+                    for number in crop_numbers
+                )
+                and len(set(crop_numbers)) == len(crop_numbers)
+                and all(
+                    item.get("crop_status") == "generated"
+                    for item in crop_entries
+                )
+            )
+            if recognizable_crops and any(
+                item.get("review_status") == "needs_recrop"
+                for item in crop_entries
+            ):
+                try:
+                    review = load_current_crop_review(
+                        database_path, private_root, job_id,
+                    )
+                except CropReviewError:
+                    review = None
+                if review is not None and any(
+                    item["status"] == "needs_recrop"
+                    for item in review["questions"]
+                ):
+                    return _result(
+                        job_id,
+                        "needs_crop_review",
+                        "recrop_questions",
+                        "题目裁图存在验签确认的边界问题，需要根据审核意见重新切题",
+                    )
+
             candidate = _object_at(job_fd, "candidate_questions.json")
             numbers = _candidate_numbers(candidate, job_id, job[1])
             if numbers is None:
@@ -233,7 +331,6 @@ def inspect_pipeline(database_path, private_root, job_id):
                     "provide_candidate_questions",
                     "需要在任务页显式生成候选题",
                 )
-            crops = _object_at(job_fd, "question_crops.json")
             if not _matching_batch(crops, job_id, numbers):
                 return _result(
                     job_id,
@@ -241,9 +338,7 @@ def inspect_pipeline(database_path, private_root, job_id):
                     "provide_crop_plan",
                     "区域计划和裁图由外部视觉流程处理",
                 )
-            crop_entries = (
-                crops.get("questions") if isinstance(crops, dict) else []
-            ) or []
+            crop_entries = crops.get("questions") or []
             if any(
                 item.get("crop_status") != "generated"
                 or item.get("review_status") != "ai_review_passed"
@@ -283,11 +378,38 @@ def inspect_pipeline(database_path, private_root, job_id):
                     "provide_ai_audit",
                     "需要由外部流程提供 AI 审核清单",
                 )
+            try:
+                from src.importing.web_admission import (
+                    WebAdmissionError,
+                    load_admission_page,
+                )
+
+                admission = load_admission_page(
+                    database_path, private_root, job_id,
+                )
+            except (WebAdmissionError, sqlite3.Error, OSError):
+                return _result(
+                    job_id,
+                    "needs_review",
+                    "manual_review",
+                    "严格准入证据尚未完整通过",
+                )
+            if not admission.can_prepare:
+                return _result(
+                    job_id,
+                    "needs_review",
+                    "manual_review",
+                    "严格准入证据尚未完整通过",
+                    eligible=admission.eligible_count,
+                    ineligible=admission.ineligible_count,
+                )
             return _result(
                 job_id,
                 "ready",
-                "run_strict_admission",
-                "视觉工件齐备，请调用现有严格入库服务",
+                "prepare_strict_admission",
+                "视觉工件齐备，请显式执行严格准入准备",
+                eligible=admission.eligible_count,
+                ineligible=admission.ineligible_count,
             )
     except _ArtifactError:
         return _result(

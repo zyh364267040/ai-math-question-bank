@@ -12,11 +12,13 @@ import threading
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from urllib.parse import quote
 
 from src.importing.admit_questions import (
     AdmissionError,
+    AdmissionResult,
     admit_questions,
     assess_job,
     backup_database,
@@ -31,6 +33,8 @@ SAFE_FINALIZE_FAILED = "正式题已安全入库，任务收口未完成，可�
 SAFE_COMPLETED_DRIFT = "正式题内容与完成时锚点不一致"
 SAFE_BUSY = "任务正由另一个请求处理，请稍后刷新"
 SAFE_NOT_READY = "当前任务不满足严格整批入库条件"
+SAFE_PREPARE_NOT_READY = "当前任务不满足严格准入准备条件"
+SAFE_PREPARE_CHANGED = "准入准备期间任务或证据已变化"
 LEASE_SECONDS = 300
 
 REASON_NAMES = {
@@ -82,6 +86,21 @@ class AdmissionPage:
     stage: str
     safe_error: str | None
     can_apply: bool
+    can_prepare: bool = False
+
+
+class _ClaimDisposition(Enum):
+    ALREADY_COMPLETED = "already_completed"
+    CLAIMED = "claimed"
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True)
+class _ClaimResult:
+    disposition: _ClaimDisposition
+    token: str | None = None
+    stage: str | None = None
+    source_digest: str | None = None
 
 
 def _now() -> datetime:
@@ -323,8 +342,10 @@ def _cleanup_new_backup(database_path: Path, candidate, before: set[Path]) -> No
 
 def _job_row(connection, job_id: int):
     return connection.execute(
-        """SELECT j.id,j.status,s.paper_name,s.sha256 AS source_sha256 FROM import_jobs j
-           JOIN source_papers s ON s.id=j.source_paper_id WHERE j.id=?""",
+        """SELECT j.id,j.status,j.source_paper_id,s.paper_name,
+                  s.sha256 AS source_sha256
+           FROM import_jobs j LEFT JOIN source_papers s ON s.id=j.source_paper_id
+           WHERE j.id=?""",
         (job_id,),
     ).fetchone()
 
@@ -355,25 +376,160 @@ def _bound_evidence_numbers(connection, job_id: int) -> set[str]:
     return numbers
 
 
-def _is_exact_completed_batch(connection, job, expected_numbers: set[str]) -> bool:
+def _is_exact_completed_batch(connection, job, run) -> bool:
+    """Validate every durable completion anchor against the current formal batch."""
+    if (
+        job is None or run is None or job["status"] != "completed"
+        or run["status"] != "completed" or run["stage"] != "completed"
+    ):
+        return False
+    expected_count = run["expected_count"]
+    if not isinstance(expected_count, int) or expected_count <= 0:
+        return False
     rows = connection.execute(
-        """SELECT q.question_code,s.source_question_no
+        """SELECT q.id AS authoritative_question_id,q.question_code,
+                  s.question_id,s.source_paper_id,s.import_job_id,
+                  s.source_question_no
            FROM question_sources s JOIN questions q ON q.id=s.question_id
            WHERE s.import_job_id=?""",
         (job["id"],),
     ).fetchall()
     actual_numbers = {row["source_question_no"] for row in rows}
-    return bool(
-        expected_numbers and len(rows) == len(expected_numbers)
-        and actual_numbers == expected_numbers
-        and all(
-            row["question_code"] == (
+    try:
+        codes = tuple(row["question_code"] for row in rows)
+        codes_match = all(
+            row["source_question_no"].isdigit()
+            and row["question_code"] == (
                 f"Q-{job['source_sha256'][:16]}-{int(row['source_question_no']):03d}"
             )
             for row in rows
         )
-        and not connection.execute("PRAGMA foreign_key_check").fetchall()
+        source_bindings_match = all(
+            row["import_job_id"] == job["id"]
+            and row["source_paper_id"] == job["source_paper_id"]
+            and row["question_id"] == row["authoritative_question_id"]
+            for row in rows
+        )
+        expected_digest = run["formal_batch_digest"]
+        digest_matches = bool(
+            isinstance(expected_digest, str)
+            and secrets.compare_digest(
+                expected_digest, _formal_batch_digest(connection, job["id"]),
+            )
+        )
+        run_anchors_match = bool(
+            _digest(codes) == run["question_code_digest"]
+            and run["eligible_count"] == expected_count
+            and run["inserted_count"] + run["already_present_count"]
+            == expected_count
+        )
+        foreign_keys_match = not connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+    except (AttributeError, KeyError, TypeError, ValueError, sqlite3.Error):
+        return False
+    return bool(
+        len(rows) == expected_count
+        and len(actual_numbers) == expected_count
+        and codes_match and source_bindings_match
+        and digest_matches and run_anchors_match
+        and foreign_keys_match
     )
+
+
+def _prepare_transition(connection, job_id: int, context, report) -> str:
+    """Validate the strict report's database bindings and perform one CAS."""
+    job = connection.execute(
+        "SELECT status FROM import_jobs WHERE id=?", (job_id,)
+    ).fetchone()
+    if job is None:
+        raise WebAdmissionError("未找到导入任务", status_code=404)
+    if job["status"] == "needs_review":
+        return "already_prepared"
+    if job["status"] != "pending":
+        raise WebAdmissionError(SAFE_PREPARE_NOT_READY, status_code=409)
+    if connection.execute(
+        "SELECT 1 FROM question_sources WHERE import_job_id=? LIMIT 1", (job_id,)
+    ).fetchone() is not None:
+        raise WebAdmissionError(SAFE_PREPARE_NOT_READY, status_code=409)
+    if connection.execute(
+        "SELECT 1 FROM import_web_admission_runs WHERE import_job_id=? LIMIT 1",
+        (job_id,),
+    ).fetchone() is not None:
+        raise WebAdmissionError(SAFE_PREPARE_NOT_READY, status_code=409)
+
+    numbers = {question["source_question_no"] for question in context[2]}
+    eligible = {item.question_no for item in report.eligible}
+    assessed = eligible | {item.question_no for item in report.ineligible}
+    if (
+        not numbers or report.ineligible or eligible != numbers
+        or assessed != numbers or len(report.eligible) != len(numbers)
+    ):
+        raise WebAdmissionError(SAFE_PREPARE_NOT_READY, status_code=409)
+
+    drafts = connection.execute(
+        """SELECT source_question_no,status,deleted_at FROM candidate_review_drafts
+           WHERE import_job_id=?""",
+        (job_id,),
+    ).fetchall()
+    approved_numbers = {
+        row["source_question_no"] for row in drafts
+        if row["status"] == "approved" and row["deleted_at"] is None
+    }
+    if len(drafts) != len(numbers) or approved_numbers != numbers:
+        raise WebAdmissionError(SAFE_PREPARE_NOT_READY, status_code=409)
+    if (
+        _evidence_numbers(connection, job_id) != numbers
+        or _bound_evidence_numbers(connection, job_id) != numbers
+    ):
+        raise WebAdmissionError(SAFE_PREPARE_NOT_READY, status_code=409)
+
+    cursor = connection.execute(
+        """UPDATE import_jobs SET status='needs_review',updated_at=?
+           WHERE id=? AND status='pending'""",
+        (_iso(_now()), job_id),
+    )
+    if cursor.rowcount != 1:
+        current = connection.execute(
+            "SELECT status FROM import_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        if current is not None and current["status"] == "needs_review":
+            return "already_prepared"
+        raise WebAdmissionError(SAFE_PREPARE_CHANGED, status_code=409)
+    return "prepared"
+
+
+def prepare_web_admission(database_path, private_root, job_id: int) -> str:
+    """Explicitly prepare a fully eligible pending job; never admit questions."""
+    database_path = Path(database_path)
+    private_root = Path(private_root)
+    with closing(_connect(database_path)) as connection:
+        job = _job_row(connection, job_id)
+        if job is None:
+            raise WebAdmissionError("未找到导入任务", status_code=404)
+        if job["status"] == "needs_review":
+            return "already_prepared"
+        if job["status"] != "pending":
+            raise WebAdmissionError(SAFE_PREPARE_NOT_READY, status_code=409)
+
+    outcome = None
+
+    def transition(connection, context, report):
+        nonlocal outcome
+        outcome = _prepare_transition(connection, job_id, context, report)
+
+    try:
+        assess_job(
+            database_path, private_root, job_id,
+            _transaction_callback=transition,
+        )
+    except WebAdmissionError:
+        raise
+    except (AdmissionError, sqlite3.Error, OSError) as exc:
+        raise WebAdmissionError(SAFE_PREPARE_NOT_READY, status_code=409) from exc
+    if outcome not in {"prepared", "already_prepared"}:
+        raise WebAdmissionError(SAFE_PREPARE_CHANGED, status_code=409)
+    return outcome
 
 
 def load_admission_page(database_path, private_root, job_id: int) -> AdmissionPage:
@@ -397,25 +553,14 @@ def load_admission_page(database_path, private_root, job_id: int) -> AdmissionPa
                 (job_id,),
             )
         }
-        if run is not None and run["status"] == "completed" and (
-            job["status"] != "completed" or run["stage"] != "completed"
-        ):
-            raise WebAdmissionError(SAFE_COMPLETED_DRIFT, status_code=409)
-        if job["status"] == "completed" and run is not None:
-            if (run["status"], run["stage"]) != ("completed", "completed"):
+        completion_claimed = bool(
+            job["status"] == "completed"
+            or run is not None
+            and (run["status"] == "completed" or run["stage"] == "completed")
+        )
+        if completion_claimed:
+            if not _is_exact_completed_batch(connection, job, run):
                 raise WebAdmissionError(SAFE_COMPLETED_DRIFT, status_code=409)
-            _verify_formal_batch(connection, run, job_id)
-            if not _is_exact_completed_batch(connection, job, formal_numbers):
-                raise WebAdmissionError(SAFE_COMPLETED_DRIFT, status_code=409)
-            return AdmissionPage(
-                job_id, job["paper_name"], job["status"], len(formal_numbers),
-                len(evidence), formal_count, formal_count, 0, (), "completed",
-                None, False,
-            )
-        if (
-            job["status"] == "completed" and run is None
-            and _is_exact_completed_batch(connection, job, formal_numbers)
-        ):
             return AdmissionPage(
                 job_id, job["paper_name"], job["status"], len(formal_numbers),
                 len(evidence), formal_count, formal_count, 0, (), "completed",
@@ -434,35 +579,55 @@ def load_admission_page(database_path, private_root, job_id: int) -> AdmissionPa
     with closing(_connect(database_path)) as connection:
         job = _job_row(connection, job_id)
         run = connection.execute(
-            "SELECT stage,status,safe_error FROM import_web_admission_runs WHERE import_job_id=?",
+            "SELECT * FROM import_web_admission_runs WHERE import_job_id=?",
             (job_id,),
         ).fetchone()
         evidence = _bound_evidence_numbers(connection, job_id)
         all_evidence = _evidence_numbers(connection, job_id)
+        formal_numbers = {
+            row[0] for row in connection.execute(
+                "SELECT source_question_no FROM question_sources WHERE import_job_id=?",
+                (job_id,),
+            )
+        }
         formal_count = connection.execute(
             "SELECT COUNT(*) FROM question_sources WHERE import_job_id=?", (job_id,)
         ).fetchone()[0]
-        authoritative_completed = bool(
+        completion_claimed = bool(
             job and job["status"] == "completed"
-            and _is_exact_completed_batch(connection, job, numbers)
+            or run is not None
+            and (run["status"] == "completed" or run["stage"] == "completed")
         )
+        authoritative_completed = _is_exact_completed_batch(connection, job, run)
+        if completion_claimed and not authoritative_completed:
+            raise WebAdmissionError(SAFE_COMPLETED_DRIFT, status_code=409)
     if authoritative_completed:
         return AdmissionPage(
             job_id, job["paper_name"], job["status"], len(numbers), len(evidence),
             formal_count, len(numbers), 0, (), "completed", None, False,
         )
     stage = run["stage"] if run else "pending"
-    can_apply = bool(
-        job and job["status"] == "needs_review" and not report.ineligible
+    strict_ready = bool(
+        job and not report.ineligible
         and {item.question_no for item in report.eligible} == numbers
-        and len(report.eligible) == len(numbers)
+        and numbers and len(report.eligible) == len(numbers)
         and all_evidence == numbers and evidence == numbers
+    )
+    formal_batch_shape_is_safe = not formal_numbers or formal_numbers == numbers
+    no_active_claim = not (run is not None and run["status"] == "processing")
+    can_apply = bool(
+        strict_ready and job["status"] == "needs_review"
+        and formal_batch_shape_is_safe and no_active_claim
         and stage in {"pending", "processing", "admitted_pending_finalize", "failed"}
+    )
+    can_prepare = bool(
+        strict_ready and job["status"] == "pending" and formal_count == 0
+        and run is None
     )
     return AdmissionPage(
         job_id, job["paper_name"], job["status"], len(numbers), len(evidence),
         formal_count, len(report.eligible), len(report.ineligible), blocked, stage,
-        _safe_page_error(run), can_apply,
+        _safe_page_error(run), can_apply, can_prepare,
     )
 
 
@@ -552,9 +717,14 @@ def _run_external(
 def _claim(
     database_path: Path, private_root: Path, job_id: int, *, backup_fn,
     lease_seconds: float, keeper_interval: float,
-) -> tuple[str | None, str, str | None]:
+) -> _ClaimResult:
     """Create a short coordination claim, then create and anchor the first backup."""
-    page = load_admission_page(database_path, private_root, job_id)
+    try:
+        page = load_admission_page(database_path, private_root, job_id)
+    except WebAdmissionError as exc:
+        if exc.status_code == 409 and str(exc) == SAFE_COMPLETED_DRIFT:
+            return _ClaimResult(_ClaimDisposition.CONFLICT)
+        raise
     now = _now()
     token = secrets.token_hex(32)
     connection = _connect(database_path)
@@ -569,16 +739,19 @@ def _claim(
         run = connection.execute(
             "SELECT * FROM import_web_admission_runs WHERE import_job_id=?", (job_id,)
         ).fetchone()
-        if run and run["status"] == "completed":
-            if job["status"] != "completed" or run["stage"] != "completed":
-                raise WebAdmissionError(SAFE_COMPLETED_DRIFT, status_code=409)
+        completion_claimed = bool(
+            job["status"] == "completed"
+            or run is not None
+            and (run["status"] == "completed" or run["stage"] == "completed")
+        )
+        if completion_claimed:
+            disposition = (
+                _ClaimDisposition.ALREADY_COMPLETED
+                if _is_exact_completed_batch(connection, job, run)
+                else _ClaimDisposition.CONFLICT
+            )
             connection.rollback()
-            return None, "completed", None
-        if job["status"] == "completed":
-            if run is not None:
-                raise WebAdmissionError(SAFE_COMPLETED_DRIFT, status_code=409)
-            connection.rollback()
-            return None, "completed", None
+            return _ClaimResult(disposition)
         if run and run["status"] == "processing" and run["lease_expires_at"] > _iso(now):
             raise WebAdmissionError(SAFE_BUSY, status_code=409)
         recoverable_ready = bool(
@@ -653,7 +826,9 @@ def _claim(
             _mark_failed(database_path, job_id, token, admitted=stage == "admitted_pending_finalize")
             raise WebAdmissionError(SAFE_APPLY_FAILED, status_code=500)
         _renew(database_path, job_id, token, lease_seconds=lease_seconds)
-        return token, stage, source_digest
+        return _ClaimResult(
+            _ClaimDisposition.CLAIMED, token, stage, source_digest,
+        )
 
     before = _backup_snapshot(database_path)
     created_backup = None
@@ -677,7 +852,9 @@ def _claim(
             (relative, digest, snapshot_digest, now_text,
              _iso(_now() + timedelta(seconds=lease_seconds)), now_text),
         )
-        return token, "processing", source_digest
+        return _ClaimResult(
+            _ClaimDisposition.CLAIMED, token, "processing", source_digest,
+        )
     except Exception:
         if created_backup is not None:
             _cleanup_new_backup(database_path, created_backup, before)
@@ -728,27 +905,76 @@ def _verify_completed(connection, job_id: int, expected_count: int, codes) -> No
         raise WebAdmissionError(SAFE_FINALIZE_FAILED, status_code=500)
 
 
-def _anchor_admitted(
-    database_path: Path, job_id: int, token: str, result, codes_digest: str,
+def _anchor_admitted_in_transaction(
+    connection: sqlite3.Connection, job_id: int, token: str, result,
     *, lease_seconds: float,
 ) -> None:
+    """Anchor the exact formal batch before its admission transaction commits."""
     now = _iso(_now())
+    digest = _formal_batch_digest(connection, job_id)
+    cursor = connection.execute(
+        """UPDATE import_web_admission_runs SET stage='admitted_pending_finalize',
+           inserted_count=?,already_present_count=?,eligible_count=?,
+           question_code_digest=?,formal_batch_digest=?,heartbeat_at=?,
+           lease_expires_at=?,updated_at=?
+           WHERE import_job_id=? AND claim_token=? AND status='processing'
+             AND expected_count=?""",
+        (
+            result.inserted,
+            result.already_present,
+            result.eligible,
+            _digest(result.question_codes),
+            digest,
+            now,
+            _iso(_now() + timedelta(seconds=lease_seconds)),
+            now,
+            job_id,
+            token,
+            result.eligible,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise WebAdmissionError(SAFE_BUSY, status_code=409)
+
+
+def _anchored_admission_result(
+    database_path: Path, job_id: int, token: str,
+) -> AdmissionResult | None:
+    """Return only a coordinator-authenticated batch; never adopt unknown rows."""
     with closing(_connect(database_path)) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        digest = _formal_batch_digest(connection, job_id)
-        cursor = connection.execute(
-            """UPDATE import_web_admission_runs SET stage='admitted_pending_finalize',
-               inserted_count=?,already_present_count=?,eligible_count=?,
-               question_code_digest=?,formal_batch_digest=?,heartbeat_at=?,
-               lease_expires_at=?,updated_at=?
-               WHERE import_job_id=? AND claim_token=? AND status='processing'""",
-            (result.inserted, result.already_present, result.eligible, codes_digest,
-             digest, now, _iso(_now() + timedelta(seconds=lease_seconds)), now,
-             job_id, token),
+        run = connection.execute(
+            "SELECT * FROM import_web_admission_runs WHERE import_job_id=?",
+            (job_id,),
+        ).fetchone()
+        if (
+            run is None
+            or run["stage"] != "admitted_pending_finalize"
+            or run["claim_token"] != token
+            or run["status"] != "processing"
+        ):
+            return None
+        _verify_formal_batch(connection, run, job_id)
+        codes = tuple(row[0] for row in connection.execute(
+            """SELECT q.question_code FROM questions q
+               JOIN question_sources s ON s.question_id=q.id
+               WHERE s.import_job_id=? ORDER BY q.question_code""",
+            (job_id,),
+        ))
+        if (
+            len(codes) != run["expected_count"]
+            or _digest(codes) != run["question_code_digest"]
+            or run["eligible_count"] != run["expected_count"]
+            or run["inserted_count"] + run["already_present_count"]
+            != run["expected_count"]
+        ):
+            raise WebAdmissionError(SAFE_COMPLETED_DRIFT, status_code=409)
+        return AdmissionResult(
+            run["inserted_count"],
+            run["already_present_count"],
+            run["eligible_count"],
+            0,
+            codes,
         )
-        if cursor.rowcount != 1:
-            raise WebAdmissionError(SAFE_BUSY, status_code=409)
-        connection.commit()
 
 
 def _complete_run(
@@ -804,7 +1030,7 @@ def apply_web_admission(
     if keeper_interval is None:
         keeper_interval = min(30.0, lease_seconds / 5)
     try:
-        token, stage, source_digest = _claim(
+        claim = _claim(
             database_path, private_root, job_id, backup_fn=backup_fn,
             lease_seconds=lease_seconds, keeper_interval=keeper_interval,
         )
@@ -812,34 +1038,46 @@ def apply_web_admission(
         raise
     except Exception as exc:
         raise WebAdmissionError(SAFE_APPLY_FAILED, status_code=500) from exc
-    if token is None:
+    if claim.disposition is _ClaimDisposition.ALREADY_COMPLETED:
         return "completed"
+    if claim.disposition is _ClaimDisposition.CONFLICT:
+        raise WebAdmissionError(SAFE_COMPLETED_DRIFT, status_code=409)
+    if claim.disposition is not _ClaimDisposition.CLAIMED or claim.token is None:
+        raise WebAdmissionError(SAFE_APPLY_FAILED, status_code=500)
+    token, stage, source_digest = claim.token, claim.stage, claim.source_digest
     if not source_digest:
         _mark_failed(database_path, job_id, token, admitted=False)
         raise WebAdmissionError(SAFE_APPLY_FAILED, status_code=500)
     admitted = stage == "admitted_pending_finalize"
     try:
-        result = _run_external(
-            database_path, job_id, token,
-            lambda: admit_fn(
+        if admitted:
+            result = _anchored_admission_result(database_path, job_id, token)
+            if result is None:
+                raise WebAdmissionError(SAFE_FINALIZE_FAILED, status_code=500)
+        else:
+            # BEGIN IMMEDIATE itself serializes this phase.  A second write
+            # connection is neither required nor reliable while it is open.
+            result = admit_fn(
                 database_path, private_root, job_id, require_complete_batch=True,
-                pre_apply_callback=(
-                    None if admitted else lambda connection: (
-                        _verify_source_snapshot_in_transaction(
-                            connection, source_digest,
-                        )
+                pre_apply_callback=lambda connection: (
+                    _verify_source_snapshot_in_transaction(
+                        connection, source_digest,
                     )
                 ),
-            ),
-            lease_seconds=lease_seconds, keeper_interval=keeper_interval,
-        )
-        codes_digest = _digest(result.question_codes)
-        now = _iso(_now())
-        if not admitted:
-            _anchor_admitted(
-                database_path, job_id, token, result, codes_digest,
-                lease_seconds=lease_seconds,
+                completion_callback=lambda connection, admitted_result: (
+                    _anchor_admitted_in_transaction(
+                        connection,
+                        job_id,
+                        token,
+                        admitted_result,
+                        lease_seconds=lease_seconds,
+                    )
+                ),
             )
+            anchored = _anchored_admission_result(database_path, job_id, token)
+            if anchored is None:
+                raise WebAdmissionError(SAFE_APPLY_FAILED, status_code=500)
+            result = anchored
             admitted = True
         with closing(_connect(database_path)) as connection:
             run = connection.execute(
@@ -923,9 +1161,17 @@ def apply_web_admission(
         )
         return "completed"
     except WebAdmissionError:
+        if not admitted:
+            admitted = _anchored_admission_result(
+                database_path, job_id, token
+            ) is not None
         _mark_failed(database_path, job_id, token, admitted=admitted)
         raise
     except Exception as exc:
+        if not admitted:
+            admitted = _anchored_admission_result(
+                database_path, job_id, token
+            ) is not None
         _mark_failed(database_path, job_id, token, admitted=admitted)
         message = SAFE_FINALIZE_FAILED if admitted else SAFE_APPLY_FAILED
         raise WebAdmissionError(message, status_code=500) from exc

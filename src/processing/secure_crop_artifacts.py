@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import stat
@@ -39,7 +40,12 @@ QUESTION_KEYS = {
     "question_no", "regions", "composition", "output_relative_path", "width", "height",
     "byte_size", "sha256", "crop_status", "review_status", "warnings",
 }
+MASK_QUESTION_KEYS = QUESTION_KEYS | {"mask_regions_normalized", "mask_regions"}
 REGION_KEYS = {"page_number", "bbox"}
+NORMALIZED_MASK_KEYS = {"bbox_normalized", "reason"}
+PIXEL_MASK_KEYS = {"page_number", "bbox", "reason"}
+MAX_MASK_REGIONS_PER_QUESTION = 10
+MAX_MASK_REASON_LENGTH = 200
 
 
 class SecureCropArtifactError(ValueError):
@@ -276,7 +282,10 @@ def validate_signed_manifest(data: Any, key: bytes, *, expected_job_id: int | No
         page_map = {item["page_number"]: item for item in data["source_pages"]}
         question_numbers: list[int] = []
         for question in data["questions"]:
-            if not isinstance(question, dict) or set(question) != QUESTION_KEYS:
+            if (
+                not isinstance(question, dict)
+                or set(question) not in {frozenset(QUESTION_KEYS), frozenset(MASK_QUESTION_KEYS)}
+            ):
                 raise TypeError
             number = question["question_no"]
             if not _strict_int(number) or number in question_numbers:
@@ -303,6 +312,79 @@ def validate_signed_manifest(data: Any, key: bytes, *, expected_job_id: int | No
                 page = page_map[region["page_number"]]
                 if (region["bbox"][2] > page["pixel_width"]
                         or region["bbox"][3] > page["pixel_height"]):
+                    raise TypeError
+            normalized_masks = question.get("mask_regions_normalized", [])
+            pixel_masks = question.get("mask_regions", [])
+            if (
+                not isinstance(normalized_masks, list)
+                or not isinstance(pixel_masks, list)
+                or len(normalized_masks) != len(pixel_masks)
+                or len(normalized_masks) > MAX_MASK_REGIONS_PER_QUESTION
+            ):
+                raise TypeError
+            seen_masks = set()
+            for normalized_mask, pixel_mask in zip(
+                normalized_masks, pixel_masks, strict=True,
+            ):
+                if (
+                    not isinstance(normalized_mask, dict)
+                    or set(normalized_mask) != NORMALIZED_MASK_KEYS
+                    or not isinstance(pixel_mask, dict)
+                    or set(pixel_mask) != PIXEL_MASK_KEYS
+                ):
+                    raise TypeError
+                normalized_box = normalized_mask["bbox_normalized"]
+                reason = normalized_mask["reason"]
+                if (
+                    not isinstance(normalized_box, list)
+                    or len(normalized_box) != 4
+                    or not all(
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(value)
+                        for value in normalized_box
+                    )
+                    or not (
+                        0 <= normalized_box[0] < normalized_box[2] <= 1
+                        and 0 <= normalized_box[1] < normalized_box[3] <= 1
+                    )
+                    or not isinstance(reason, str)
+                    or not reason.strip()
+                    or len(reason) > MAX_MASK_REASON_LENGTH
+                    or pixel_mask["reason"] != reason
+                ):
+                    raise TypeError
+                identity = tuple(normalized_box)
+                if identity in seen_masks:
+                    raise TypeError
+                seen_masks.add(identity)
+                mask_page_number = pixel_mask["page_number"]
+                if (
+                    not _strict_int(mask_page_number)
+                    or mask_page_number not in page_map
+                    or not _validate_bbox(pixel_mask["bbox"])
+                ):
+                    raise TypeError
+                mask_page = page_map[mask_page_number]
+                expected_pixel_box = [
+                    math.floor(normalized_box[0] * mask_page["pixel_width"]),
+                    math.floor(normalized_box[1] * mask_page["pixel_height"]),
+                    math.ceil(normalized_box[2] * mask_page["pixel_width"]),
+                    math.ceil(normalized_box[3] * mask_page["pixel_height"]),
+                ]
+                if pixel_mask["bbox"] != expected_pixel_box:
+                    raise TypeError
+                containing_regions = [
+                    region for region in question["regions"]
+                    if (
+                        region["page_number"] == mask_page_number
+                        and region["bbox"][0] <= pixel_mask["bbox"][0]
+                        and region["bbox"][1] <= pixel_mask["bbox"][1]
+                        and pixel_mask["bbox"][2] <= region["bbox"][2]
+                        and pixel_mask["bbox"][3] <= region["bbox"][3]
+                    )
+                ]
+                if len(containing_regions) != 1:
                     raise TypeError
             composition = question["composition"]
             if len(question["regions"]) == 1:

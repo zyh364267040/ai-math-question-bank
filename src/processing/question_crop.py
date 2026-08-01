@@ -5,13 +5,14 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import math
 import os
 import secrets
 import shutil
 import stat
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from PIL import Image, UnidentifiedImageError
@@ -47,6 +48,8 @@ MIN_FREE_DISK_BYTES = 64 * 1024 * 1024
 MAX_DIRECTORY_ENTRIES = 2_048
 MAX_DIRECTORY_TOTAL_ENTRIES = 8_192
 MAX_DIRECTORY_DEPTH = 32
+MAX_MASK_REGIONS_PER_QUESTION = 10
+MAX_MASK_REASON_LENGTH = 200
 FINAL_DIRECTORY = "question_crops"
 FINAL_MANIFEST = "question_crops.json"
 BACKUP_DIRECTORY = ".question_crops.previous"
@@ -437,6 +440,88 @@ def _validate_plans(questions: Any, expected_question_nos: Any,
             validated.append({"page_number": page_number, "bbox": bbox})
             widths.append(bbox[2] - bbox[0])
             heights.append(bbox[3] - bbox[1])
+        raw_normalized_masks = item.get("mask_regions_normalized", [])
+        raw_pixel_masks = item.get("mask_regions", [])
+        if (
+            ("mask_regions_normalized" in item) != ("mask_regions" in item)
+            or not isinstance(raw_normalized_masks, list)
+            or not isinstance(raw_pixel_masks, list)
+            or len(raw_normalized_masks) != len(raw_pixel_masks)
+            or len(raw_normalized_masks) > MAX_MASK_REGIONS_PER_QUESTION
+        ):
+            raise QuestionCropError("遮罩规范化坐标与像素坐标不完整")
+        normalized_masks = []
+        pixel_masks = []
+        seen_masks = set()
+        for normalized_mask, pixel_mask in zip(
+            raw_normalized_masks, raw_pixel_masks, strict=True,
+        ):
+            if (
+                not isinstance(normalized_mask, dict)
+                or set(normalized_mask) != {"bbox_normalized", "reason"}
+                or not isinstance(pixel_mask, dict)
+                or set(pixel_mask) != {"page_number", "bbox", "reason"}
+            ):
+                raise QuestionCropError("遮罩格式无效")
+            normalized_box = normalized_mask["bbox_normalized"]
+            reason = normalized_mask["reason"]
+            if (
+                not isinstance(normalized_box, list)
+                or len(normalized_box) != 4
+                or not all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    for value in normalized_box
+                )
+                or not (
+                    0 <= normalized_box[0] < normalized_box[2] <= 1
+                    and 0 <= normalized_box[1] < normalized_box[3] <= 1
+                )
+                or not isinstance(reason, str)
+                or not reason.strip()
+                or len(reason) > MAX_MASK_REASON_LENGTH
+                or pixel_mask["reason"] != reason
+            ):
+                raise QuestionCropError("遮罩坐标或原因无效")
+            identity = tuple(normalized_box)
+            if identity in seen_masks:
+                raise QuestionCropError("遮罩区域重复")
+            seen_masks.add(identity)
+            page_number = _positive_integer(pixel_mask.get("page_number"), "遮罩页码")
+            if page_number not in pages:
+                raise QuestionCropError("遮罩页码不在render_manifest白名单")
+            page = pages[page_number]
+            pixel_box = _validate_box(
+                pixel_mask.get("bbox"), page["pixel_width"], page["pixel_height"],
+            )
+            expected_pixel_box = [
+                math.floor(normalized_box[0] * page["pixel_width"]),
+                math.floor(normalized_box[1] * page["pixel_height"]),
+                math.ceil(normalized_box[2] * page["pixel_width"]),
+                math.ceil(normalized_box[3] * page["pixel_height"]),
+            ]
+            if pixel_box != expected_pixel_box:
+                raise QuestionCropError("遮罩规范化坐标与像素坐标不一致")
+            containing_indexes = [
+                index for index, region in enumerate(validated)
+                if (
+                    region["page_number"] == page_number
+                    and region["bbox"][0] <= pixel_box[0]
+                    and region["bbox"][1] <= pixel_box[1]
+                    and pixel_box[2] <= region["bbox"][2]
+                    and pixel_box[3] <= region["bbox"][3]
+                )
+            ]
+            if len(containing_indexes) != 1:
+                raise QuestionCropError("遮罩必须完全且唯一包含在本题一个region内")
+            normalized_masks.append({
+                "bbox_normalized": list(normalized_box), "reason": reason,
+            })
+            pixel_masks.append({
+                "page_number": page_number, "bbox": pixel_box,
+                "reason": reason, "region_index": containing_indexes[0],
+            })
         width = max(widths)
         height = sum(heights) + separator_height * (len(heights) - 1)
         pixels = width * height
@@ -446,6 +531,8 @@ def _validate_plans(questions: Any, expected_question_nos: Any,
         plans.append({
             "question_no": number,
             "regions": validated,
+            "mask_regions_normalized": normalized_masks,
+            "mask_regions": pixel_masks,
             "output_relative_path": _safe_output(number, item.get("output_relative_path")),
             "warnings": list(warnings),
             "expected_size": (width, height),
@@ -525,6 +612,12 @@ def _can_reuse(old: dict[str, Any], plan: dict[str, Any], old_sources: dict[int,
     width, height = plan["expected_size"]
     if (old.get("question_no") != plan["question_no"]
             or old.get("regions") != plan["regions"]
+            or old.get("mask_regions_normalized", [])
+            != plan["mask_regions_normalized"]
+            or old.get("mask_regions", []) != [
+                {key: value for key, value in mask.items() if key != "region_index"}
+                for mask in plan["mask_regions"]
+            ]
             or old.get("output_relative_path") != plan["output_relative_path"]
             or old.get("warnings") != plan["warnings"]
             or old.get("composition") != _composition(len(plan["regions"]), separator_height)
@@ -578,7 +671,8 @@ def generate_question_crops_report(*, job_dir, questions, expected_question_nos,
                                    max_total_crop_pixels=MAX_TOTAL_CROP_PIXELS,
                                    max_total_output_bytes=MAX_TOTAL_OUTPUT_BYTES,
                                    min_free_disk_bytes=MIN_FREE_DISK_BYTES,
-                                   source_page_bytes=None):
+                                   source_page_bytes=None, job_lock=None,
+                                   force_recrop_question_nos=()):
     """Generate a signed complete batch and report its published generation."""
     min_width = _positive_integer(min_width, "最小宽度")
     min_height = _positive_integer(min_height, "最小高度")
@@ -598,7 +692,10 @@ def generate_question_crops_report(*, job_dir, questions, expected_question_nos,
         "min_free_disk_bytes": _nonnegative_integer(min_free_disk_bytes, "最小磁盘裕量"),
     }
     try:
-        with locked_job(job_dir) as lock:
+        lock_context = locked_job(job_dir) if job_lock is None else nullcontext(job_lock)
+        with lock_context as lock:
+            if lock.path != Path(job_dir).resolve():
+                raise QuestionCropError("共享裁图锁与任务目录不匹配")
             key = load_hmac_key(lock.path)
             recovered = _recover_crop_publication(lock.descriptor, key)
             job_id, pages = _load_render_metadata(
@@ -615,6 +712,12 @@ def generate_question_crops_report(*, job_dir, questions, expected_question_nos,
                 max_total_crop_pixels=limits["max_total_crop_pixels"],
                 separator_height=separator_height,
             )
+            forced = set(force_recrop_question_nos)
+            if (
+                any(type(number) is not int for number in forced)
+                or not forced.issubset(expected)
+            ):
+                raise QuestionCropError("强制重裁题号无效")
             projected = sum(plan["expected_size"][0] * plan["expected_size"][1] * 4
                             for plan in plans)
             if shutil.disk_usage(lock.path).free - projected < limits["min_free_disk_bytes"]:
@@ -644,7 +747,7 @@ def generate_question_crops_report(*, job_dir, questions, expected_question_nos,
                 reusable: dict[int, PinnedBytes] = {}
                 for plan in plans:
                     number = plan["question_no"]
-                    if (old_pair and number in old_entries
+                    if (old_pair and number not in forced and number in old_entries
                             and _can_reuse(old_entries[number], plan, old_sources, sources,
                                            min_width, min_height, separator_height)):
                         reusable[number] = old_pair.files[number]
@@ -702,11 +805,22 @@ def generate_question_crops_report(*, job_dir, questions, expected_question_nos,
                             for piece in pieces:
                                 result.paste(piece, (0, y))
                                 y += piece.height + separator_height
+                        # Model-proposed masks are deliberately not applied here.  They stay
+                        # signed in the manifest as pending proposals until the independent
+                        # mask-review service anchors exact evidence and applies them.
                         data = _png_bytes(result)
                         digest = hashlib.sha256(data).hexdigest()
                         entry = {
                             "question_no": number,
                             "regions": plan["regions"],
+                            "mask_regions_normalized": plan["mask_regions_normalized"],
+                            "mask_regions": [
+                                {
+                                    key: value for key, value in mask.items()
+                                    if key != "region_index"
+                                }
+                                for mask in plan["mask_regions"]
+                            ],
                             "composition": _composition(len(plan["regions"]), separator_height),
                             "output_relative_path": plan["output_relative_path"],
                             "width": width,

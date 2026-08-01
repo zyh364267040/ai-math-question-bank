@@ -22,10 +22,16 @@
       </form>
     {% endif %}
   {% elif run.status in ('pending', 'failed') %}
-    {% if run.status == 'pending' %}<p>页面处理已完成，Codex 切题任务即将开始。</p>{% else %}<p>可手动重试 Codex 自动切题。</p>{% endif %}
+    {% if run.status == 'pending' %}
+      <p>页面处理已完成，Codex 切题任务即将开始。</p>
+    {% elif run.crop_review_evidence_valid %}
+      <p>上次重切失败，已保留当前可信审核意见，可继续根据审核意见重新切题。</p>
+    {% else %}
+      <p>可手动重试 Codex 自动切题。</p>
+    {% endif %}
     <form method="post" action="/imports/{{ run.id }}/split">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="button" type="submit">{% if run.status == 'failed' %}重试调用 Codex 自动切题{% else %}调用 Codex 自动切题{% endif %}</button>
+      <button class="button" type="submit">{% if run.crop_review_evidence_valid %}根据审核意见重新切题{% elif run.status == 'failed' %}重试调用 Codex 自动切题{% else %}调用 Codex 自动切题{% endif %}</button>
     </form>
   {% elif run.status == 'processing' %}
     <p>Codex 正在识别题号与边界；若服务曾重启，可显式继续。</p>
@@ -36,7 +42,17 @@
   {% elif run.status == 'completed' %}
     <h2>共切分 {{ run.question_count }} 题</h2>
     <p>独立视觉审核：通过 {{ run.crop_review_passed }} 题，需重切 {{ run.crop_review_needs_recrop }} 题，待审核 {{ run.crop_review_pending }} 题。</p>
+    {% if run.crop_review_evidence_valid and run.crop_review_needs_recrop %}
+      <p>已发现题图边界问题，可将当前可信审核意见交给 Codex 重新切题。</p>
+      <form method="post" action="/imports/{{ run.id }}/split">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="button" type="submit">根据审核意见重新切题</button>
+      </form>
+    {% endif %}
     {% if run.crop_review_pending %}<p>新裁图默认为 <code>pending_ai_review</code>，不会自动入库或标记审核通过。</p>{% endif %}
+  {% endif %}
+  {% if run.crop_review_evidence_status %}
+    <p class="form-error">{{ run.crop_review_evidence_status }}</p>
   {% endif %}
 </section>
 {% if crops %}
