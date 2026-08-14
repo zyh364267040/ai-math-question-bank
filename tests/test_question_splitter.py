@@ -14,7 +14,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from src.database.initialize import initialize_database
-from src.processing.crop_review import record_crop_ai_review
+from src.processing.crop_review import CropReviewError, record_crop_ai_review
 from src.processing.mask_review import (
     MaskReviewError,
     apply_approved_masks,
@@ -168,7 +168,8 @@ class QuestionSplitterTests(unittest.TestCase):
             ],
         }
 
-    def review_completed_split(self, *, recrop=()):
+    def review_completed_split(self, *, recrop=(), pass_warnings=None):
+        pass_warnings = pass_warnings or {}
         manifest_path = self.job_dir / "question_crops.json"
         manifest_bytes = manifest_path.read_bytes()
         manifest = json.loads(manifest_bytes)
@@ -187,10 +188,66 @@ class QuestionSplitterTests(unittest.TestCase):
                 ),
                 "warnings": (
                     ["下边界混入下一题，请在题间空白处重新切分"]
-                    if item["question_no"] in recrop else []
+                    if item["question_no"] in recrop
+                    else list(pass_warnings.get(item["question_no"], []))
                 ),
             } for item in manifest["questions"]],
         })
+
+    def three_question_plan(self):
+        payload = self.valid()
+        payload["question_count"] = 3
+        payload["questions"][1]["regions"] = [{
+            "page_number": 2,
+            "bbox_normalized": [0.05, 0.20, 0.95, 0.55],
+        }]
+        payload["questions"].append({
+            "question_no": 3,
+            "regions": [{
+                "page_number": 2,
+                "bbox_normalized": [0.05, 0.55, 0.95, 0.90],
+            }],
+            "warnings": [],
+            "confidence": 0.85,
+        })
+        return payload
+
+    def build_three_generation_warning_chain(self):
+        first_plan = self.three_question_plan()
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(first_plan),
+        ))
+        self.review_completed_split(recrop={2, 3})
+
+        second_plan = self.three_question_plan()
+        second_plan["questions"][1]["regions"][0]["bbox_normalized"] = [
+            0.05, 0.22, 0.95, 0.52,
+        ]
+        second_plan["questions"][2]["regions"][0]["bbox_normalized"] = [
+            0.05, 0.52, 0.95, 0.90,
+        ]
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(second_plan),
+        ))
+        self.review_completed_split(
+            recrop={3}, pass_warnings={2: ["来源页含宣传横幅，题干仍完整"]},
+        )
+        previous_evidence = (self.job_dir / "crop_ai_review.json").read_bytes()
+        previous_review = json.loads(previous_evidence)
+
+        third_plan = json.loads(json.dumps(second_plan))
+        third_plan["questions"][2]["regions"][0]["bbox_normalized"] = [
+            0.05, 0.54, 0.95, 0.94,
+        ]
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(third_plan),
+        ))
+        current = json.loads((self.job_dir / "question_crops.json").read_text())
+        self.assertEqual(
+            ["ai_review_passed", "pending_ai_review", "pending_ai_review"],
+            [item["review_status"] for item in current["questions"]],
+        )
+        return previous_review, previous_evidence
 
     def test_strict_parser_converts_normalized_boxes_deterministically(self):
         plan = parse_codex_question_plan(
@@ -201,7 +258,7 @@ class QuestionSplitterTests(unittest.TestCase):
         self.assertEqual([], plan["questions"][0]["mask_regions_normalized"])
         self.assertEqual([], plan["questions"][0]["mask_regions"])
 
-    def test_parser_converts_single_and_cross_page_masks_with_reasons(self):
+    def test_parser_converts_masks_and_canonicalizes_controlled_reason_annotations(self):
         payload = self.valid()
         payload["questions"][0]["regions"][0]["bbox_normalized"] = [
             0.05, 0.05, 0.95, 0.15,
@@ -212,11 +269,11 @@ class QuestionSplitterTests(unittest.TestCase):
         payload["questions"][0]["mask_regions_normalized"] = [
             {
                 "bbox_normalized": [0.10, 0.10, 0.20, 0.14],
-                "reason": "独立确认不覆盖正文的二维码",
+                "reason": "qr_code：独立确认不覆盖正文的二维码",
             },
             {
                 "bbox_normalized": [0.70, 0.16, 0.90, 0.18],
-                "reason": "群组宣传层",
+                "reason": "promotion_overlay: 群组宣传层",
             },
         ]
 
@@ -225,21 +282,13 @@ class QuestionSplitterTests(unittest.TestCase):
         )
 
         question = plan["questions"][0]
-        self.assertEqual(
-            payload["questions"][0]["mask_regions_normalized"],
-            question["mask_regions_normalized"],
-        )
         self.assertEqual([
-            {
-                "page_number": 1,
-                "bbox": [20, 30, 40, 43],
-                "reason": "独立确认不覆盖正文的二维码",
-            },
-            {
-                "page_number": 2,
-                "bbox": [140, 48, 180, 54],
-                "reason": "群组宣传层",
-            },
+            {"bbox_normalized": [0.10, 0.10, 0.20, 0.14], "reason": "qr_code"},
+            {"bbox_normalized": [0.70, 0.16, 0.90, 0.18], "reason": "promotion_overlay"},
+        ], question["mask_regions_normalized"])
+        self.assertEqual([
+            {"page_number": 1, "bbox": [20, 30, 40, 43], "reason": "qr_code"},
+            {"page_number": 2, "bbox": [140, 48, 180, 54], "reason": "promotion_overlay"},
         ], question["mask_regions"])
 
     def test_parser_rejects_every_invalid_mask_contract(self):
@@ -736,6 +785,220 @@ class QuestionSplitterTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(old_review_evidence).hexdigest(), frozen[1])
         archived = self.job_dir / frozen[3]
         self.assertEqual(old_review_evidence, archived.read_bytes())
+
+    def test_all_failed_recrop_accepts_complete_review_for_new_generation(self):
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
+        ))
+        self.review_completed_split(recrop={1, 2})
+        old_evidence = (self.job_dir / "crop_ai_review.json").read_bytes()
+        recrop_payload = self.valid()
+        recrop_payload["questions"][0]["regions"][0]["bbox_normalized"] = [
+            0.05, 0.06, 0.95, 0.46,
+        ]
+        recrop_payload["questions"][1]["regions"][0]["bbox_normalized"] = [
+            0.05, 0.22, 0.95, 0.82,
+        ]
+
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(recrop_payload),
+        ))
+        manifest = json.loads((self.job_dir / "question_crops.json").read_text())
+        self.assertEqual(
+            ["pending_ai_review", "pending_ai_review"],
+            [item["review_status"] for item in manifest["questions"]],
+        )
+
+        result = self.review_completed_split()
+
+        self.assertTrue(result.can_extract_candidates)
+        archived = list((self.job_dir / "frozen_crop_reviews").glob("evidence_*.json"))
+        self.assertEqual(1, len(archived))
+        self.assertEqual(old_evidence, archived[0].read_bytes())
+
+    def test_recrop_accepts_complete_review_for_new_generation_after_freezing_old_evidence(self):
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
+        ))
+        self.review_completed_split(recrop={2})
+        old_evidence = (self.job_dir / "crop_ai_review.json").read_bytes()
+        old_review = json.loads(old_evidence)
+        recrop_payload = self.valid()
+        recrop_payload["questions"][1]["regions"][0]["bbox_normalized"] = [
+            0.10, 0.35, 0.90, 0.95,
+        ]
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(recrop_payload),
+        ))
+        recropped = json.loads((self.job_dir / "question_crops.json").read_text())
+        self.assertNotEqual(old_review["input_generation_id"], recropped["generation_id"])
+        self.assertEqual(
+            ["ai_review_passed", "pending_ai_review"],
+            [item["review_status"] for item in recropped["questions"]],
+        )
+
+        result = self.review_completed_split()
+
+        self.assertTrue(result.can_extract_candidates)
+        self.assertEqual((2, 0), (result.passed_count, result.needs_recrop_count))
+        current_review = json.loads(
+            (self.job_dir / "crop_ai_review.json").read_text()
+        )
+        self.assertEqual(recropped["generation_id"], current_review["input_generation_id"])
+        with sqlite3.connect(self.db) as connection:
+            frozen = connection.execute(
+                """SELECT review_evidence_sha256,evidence_relative_path
+                   FROM import_frozen_crop_reviews
+                   WHERE import_job_id=? AND question_no=1
+                         AND crop_generation_id=?""",
+                (self.job_id, old_review["input_generation_id"]),
+            ).fetchone()
+        self.assertEqual(hashlib.sha256(old_evidence).hexdigest(), frozen[0])
+        self.assertEqual(old_evidence, (self.job_dir / frozen[1]).read_bytes())
+
+    def test_third_generation_can_review_passed_warning_crop_reset_to_pending(self):
+        previous_review, _ = self.build_three_generation_warning_chain()
+
+        result = self.review_completed_split()
+
+        self.assertTrue(result.can_extract_candidates)
+        self.assertEqual((3, 0), (result.passed_count, result.needs_recrop_count))
+        current_review = json.loads(
+            (self.job_dir / "crop_ai_review.json").read_text()
+        )
+        self.assertNotEqual(
+            previous_review["input_generation_id"],
+            current_review["input_generation_id"],
+        )
+
+    def test_third_generation_rejects_tampered_previous_review_archive(self):
+        previous_review, previous_evidence = (
+            self.build_three_generation_warning_chain()
+        )
+        with sqlite3.connect(self.db) as connection:
+            archive = connection.execute(
+                """SELECT evidence_relative_path
+                   FROM import_frozen_crop_reviews
+                   WHERE import_job_id=? AND question_no=2
+                         AND crop_generation_id=?""",
+                (self.job_id, previous_review["input_generation_id"]),
+            ).fetchone()[0]
+        (self.job_dir / archive).write_bytes(b"{\"tampered\":true}\n")
+
+        with self.assertRaisesRegex(
+            CropReviewError, "独立题图审核记录真实性校验失败"
+        ):
+            self.review_completed_split()
+
+        self.assertEqual(
+            previous_evidence, (self.job_dir / "crop_ai_review.json").read_bytes()
+        )
+
+    def test_third_generation_rejects_unanchored_pending_previous_pass(self):
+        previous_review, previous_evidence = (
+            self.build_three_generation_warning_chain()
+        )
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                """DELETE FROM import_frozen_crop_reviews
+                   WHERE import_job_id=? AND question_no=2
+                         AND crop_generation_id=?""",
+                (self.job_id, previous_review["input_generation_id"]),
+            )
+
+        with self.assertRaisesRegex(
+            CropReviewError, "独立题图审核记录真实性校验失败"
+        ):
+            self.review_completed_split()
+
+        self.assertEqual(
+            previous_evidence, (self.job_dir / "crop_ai_review.json").read_bytes()
+        )
+
+    def test_third_generation_rejects_changed_anchor_for_still_passed_crop(self):
+        previous_review, previous_evidence = (
+            self.build_three_generation_warning_chain()
+        )
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                """UPDATE import_frozen_crop_reviews SET crop_sha256=?
+                   WHERE import_job_id=? AND question_no=1
+                         AND crop_generation_id=?""",
+                ("f" * 64, self.job_id, previous_review["input_generation_id"]),
+            )
+
+        with self.assertRaisesRegex(
+            CropReviewError, "独立题图审核记录真实性校验失败"
+        ):
+            self.review_completed_split()
+
+        self.assertEqual(
+            previous_evidence, (self.job_dir / "crop_ai_review.json").read_bytes()
+        )
+
+    def test_previous_needs_recrop_cannot_become_passed_without_review(self):
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
+        ))
+        self.review_completed_split(recrop={2})
+        previous_evidence = (self.job_dir / "crop_ai_review.json").read_bytes()
+        recrop_plan = self.valid()
+        recrop_plan["questions"][1]["regions"][0]["bbox_normalized"] = [
+            0.10, 0.35, 0.90, 0.95,
+        ]
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(recrop_plan),
+        ))
+        manifest_path = self.job_dir / "question_crops.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["questions"][1]["review_status"] = "ai_review_passed"
+        manifest = sign_manifest(load_hmac_key(self.job_dir), manifest)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                """UPDATE import_question_split_runs
+                   SET crop_manifest_sha256=?,crop_manifest_signature=?
+                   WHERE import_job_id=?""",
+                (manifest_digest, manifest["signature"], self.job_id),
+            )
+
+        with self.assertRaisesRegex(
+            CropReviewError, "独立题图审核记录真实性校验失败"
+        ):
+            self.review_completed_split()
+
+        self.assertEqual(
+            previous_evidence, (self.job_dir / "crop_ai_review.json").read_bytes()
+        )
+
+    def test_recrop_rejects_stale_review_evidence_without_frozen_database_anchor(self):
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(self.valid()),
+        ))
+        self.review_completed_split(recrop={2})
+        recrop_payload = self.valid()
+        recrop_payload["questions"][1]["regions"][0]["bbox_normalized"] = [
+            0.10, 0.35, 0.90, 0.95,
+        ]
+        run_claimed_split(claim_split_job(
+            self.db, self.private, self.job_id, runner=FakeRunner(recrop_payload),
+        ))
+        stale_evidence = (self.job_dir / "crop_ai_review.json").read_bytes()
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                "DELETE FROM import_frozen_crop_reviews WHERE import_job_id=?",
+                (self.job_id,),
+            )
+
+        with self.assertRaisesRegex(
+            CropReviewError, "独立题图审核记录真实性校验失败"
+        ):
+            self.review_completed_split()
+
+        self.assertEqual(
+            stale_evidence, (self.job_dir / "crop_ai_review.json").read_bytes()
+        )
 
     def test_recrop_fails_closed_when_db_anchored_frozen_region_is_invalid(self):
         run_claimed_split(claim_split_job(
@@ -1335,7 +1598,8 @@ class QuestionSplitterTests(unittest.TestCase):
                 (self.job_id,),
             ).fetchone()[0]
         self.assertEqual((hashlib.sha256(
-            (self.job_dir / "mask_review" / f"evidence_{evidence['subject_digest']}.json").read_bytes()
+            (self.job_dir / "mask_review" /
+             f"evidence_{manifest['generation_id']}_{evidence['subject_digest']}.json").read_bytes()
         ).hexdigest(), evidence["signature"], "approved"), anchor)
         self.assertEqual(
             hashlib.sha256((self.job_dir / "question_crops.json").read_bytes()).hexdigest(),
@@ -1361,7 +1625,9 @@ class QuestionSplitterTests(unittest.TestCase):
             "reason": "qr_code", "reviewer": "independent-mask-review-2",
             "decision": "approved",
         })
-        preview = self.job_dir / "mask_review" / f"preview_{evidence['subject_digest']}.png"
+        preview = self.job_dir / "mask_review" / (
+            f"preview_{manifest['generation_id']}_{evidence['subject_digest']}.png"
+        )
         original = preview.read_bytes()
         preview.write_bytes(b"tampered-preview")
         with self.assertRaises(MaskReviewError):
@@ -1684,6 +1950,20 @@ class CodexCliRunnerTests(unittest.TestCase):
             "type": "string", "enum": ["low", "medium", "high"]
         }, confidence)
 
+    def test_output_schema_requires_every_declared_object_property(self):
+        def assert_required_covers_properties(schema, path="$"):
+            if schema.get("type") == "object":
+                properties = schema.get("properties", {})
+                self.assertEqual(
+                    sorted(properties), sorted(schema.get("required", [])), path
+                )
+                for name, child in properties.items():
+                    assert_required_covers_properties(child, f"{path}.{name}")
+            elif schema.get("type") == "array":
+                assert_required_covers_properties(schema["items"], f"{path}[]")
+
+        assert_required_covers_properties(_codex_output_schema())
+
     def test_prompt_requires_complete_nonoverlapping_questions_and_string_confidence(self):
         prompt = _prompt(5, [(1, b"page", (100, 200))], {"pages": []})
         for required in (
@@ -1692,12 +1972,14 @@ class CodexCliRunnerTests(unittest.TestCase):
             "试卷后的答案和解析页不作为新题",
             "low、medium或high",
             "版面提示仅作弱参考",
-            "mask_regions_normalized可省略，默认空列表",
+            "每题必须输出mask_regions_normalized数组",
+            "没有遮罩时输出[]",
             "独立确认不覆盖试题内容",
             "绝不能用于隐藏题干、选项、答案、解析",
             "不能用于掩盖相邻题边界错误",
         ):
             self.assertIn(required, prompt)
+        self.assertNotIn("mask_regions_normalized可省略", prompt)
         self.assertNotIn("confidence\":0到1", prompt)
 
     def script(self, body):

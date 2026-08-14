@@ -844,6 +844,36 @@ class LocalKnowledgeClassificationTests(unittest.TestCase):
             self.assertIn("字段名必须逐字使用", prompt)
             self.assertIn("题号必须字符串", prompt)
 
+    def test_level3_final_prompts_require_atomic_related_candidate_codes(self):
+        captured = []
+
+        def run(command, **kwargs):
+            captured.append(kwargs["input"])
+            Path(command[command.index("-o") + 1]).write_text(
+                '{"questions":[]}', encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        runner = CodexKnowledgeClassificationRunner(subprocess_run=run)
+        stages = ("level2", "proposal", "verifier", "adjudicator")
+        for stage in stages:
+            runner.run(stage, _prompt(stage, [], []))
+        prompts = dict(zip(stages, captured, strict=True))
+
+        constraints = (
+            "related_codes必须是JSON数组",
+            "每个元素必须逐字等于一个候选代码",
+            "禁止在单个元素中用`、`、`,`、`/`、空格等拼接多个代码",
+            "最多2个",
+            "无关联时[]",
+            "不得重复primary_code",
+        )
+        for stage in ("proposal", "verifier", "adjudicator"):
+            for constraint in constraints:
+                self.assertIn(constraint, prompts[stage])
+        for constraint in constraints:
+            self.assertNotIn(constraint, prompts["level2"])
+
     def test_codex_unknown_stage_rejected_before_subprocess(self):
         process = mock.Mock()
         runner = CodexKnowledgeClassificationRunner(subprocess_run=process)
@@ -947,7 +977,9 @@ class LocalKnowledgeClassificationTests(unittest.TestCase):
         level3_cases = []
         level3_cases.append({"questions": [dict(level3_valid[0])]})
         level3_cases.append({"questions": [dict(level3_valid[0]), dict(level3_valid[0])]})
-        for mutation in ("extra", "primary", "duplicate_related", "same", "too_many"):
+        for mutation in (
+            "extra", "primary", "duplicate_related", "same", "too_many", "joined_related",
+        ):
             rows = [dict(row) for row in level3_valid]
             rows[0]["related_codes"] = list(rows[0]["related_codes"])
             if mutation == "extra":
@@ -958,6 +990,8 @@ class LocalKnowledgeClassificationTests(unittest.TestCase):
                 rows[0]["related_codes"] = ["01.01.02", "01.01.02"]
             elif mutation == "same":
                 rows[0]["related_codes"] = ["01.01.01"]
+            elif mutation == "joined_related":
+                rows[0]["related_codes"] = ["01.01.02、01.01.03"]
             else:
                 rows[0]["related_codes"] = ["01.01.02", "01.01.03", "01.01.04"]
             level3_cases.append({"questions": rows})
@@ -1027,6 +1061,31 @@ class LocalKnowledgeClassificationTests(unittest.TestCase):
             self.db, self.private, 1, runner=FakeRunner(),
             replace_unapplied=True,
         ))
+
+    def test_explicit_replacement_accepts_fully_invalidated_old_classification_generation(self):
+        self._complete()
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            rows = connection.execute(
+                "SELECT id,edited_json FROM candidate_review_drafts ORDER BY id"
+            ).fetchall()
+            for row_id, raw in rows:
+                edited = json.loads(raw)
+                edited["answer_markdown"] = "$3$"
+                edited["analysis_markdown"] = "官方答案页转写"
+                connection.execute(
+                    "UPDATE candidate_review_drafts SET edited_json=?,version=version+1 WHERE id=?",
+                    (json.dumps(edited, ensure_ascii=False, separators=(",", ":")), row_id),
+                )
+            # Official-answer application leaves the completed run and its old
+            # per-question classification drafts as an auditable generation,
+            # while every newly approved draft has a new version/content hash.
+        claim = claim_knowledge_classification(
+            self.db, self.private, 1, runner=FakeRunner(),
+            replace_unapplied=True,
+        )
+        self.assertIsNotNone(claim)
+        self.assertTrue(claim.replace_unapplied)
+        self.assertNotEqual(claim.input_digest, self._completed_snapshot()[1]["input_digest"])
 
     def test_replacement_claim_rejects_every_untrusted_or_consumed_state(self):
         mutators = {

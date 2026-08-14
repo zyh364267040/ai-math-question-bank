@@ -276,6 +276,44 @@ def anchor_synthetic_candidate_audit(database_path: Path, job_dir: Path) -> None
              crop["generation_id"], hashlib.sha256(crop_raw).hexdigest(),
              crop["signature"], hashlib.sha256(audit_raw).hexdigest(), len(audit_raw)),
         )
+        candidate_sha = hashlib.sha256(candidate_raw).hexdigest()
+        draft_rows = dict(connection.execute(
+            "SELECT source_question_no,edited_json FROM candidate_review_drafts "
+            "WHERE import_job_id=?",
+            (candidate["import_job_id"],),
+        ))
+        draft_questions = [
+            json.loads(draft_rows[item["source_question_no"]])
+            if item["source_question_no"] in draft_rows else item
+            for item in candidate["questions"]
+        ]
+        draft_batch_sha = hashlib.sha256(json.dumps({
+            "version": 1,
+            "import_job_id": candidate["import_job_id"],
+            "questions": draft_questions,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )).hexdigest()
+        evidence_sha = hashlib.sha256(
+            f"synthetic-no-answer:{candidate_sha}:{count}".encode()
+        ).hexdigest()
+        connection.execute(
+            """INSERT INTO import_answer_sources
+               (import_job_id,source_answer_state,candidate_sha256,
+                expected_question_count,classification_evidence_sha256,
+                draft_batch_sha256,created_at,updated_at)
+               VALUES(?,'source_has_no_answer',?,?,?,?,
+                      '2026-07-16T00:00:00+00:00','2026-07-16T00:00:00+00:00')
+               ON CONFLICT(import_job_id) DO UPDATE SET
+                 source_answer_state=excluded.source_answer_state,
+                 candidate_sha256=excluded.candidate_sha256,
+                 expected_question_count=excluded.expected_question_count,
+                 classification_evidence_sha256=excluded.classification_evidence_sha256,
+                 draft_batch_sha256=excluded.draft_batch_sha256,
+                 updated_at=excluded.updated_at""",
+            (candidate["import_job_id"], candidate_sha, count, evidence_sha,
+             draft_batch_sha),
+        )
 
 
 def write_synthetic_crop_review_evidence(job_dir):

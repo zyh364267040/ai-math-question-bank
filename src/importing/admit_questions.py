@@ -18,7 +18,11 @@ from PIL import Image, UnidentifiedImageError
 
 from src.database.initialize import DEFAULT_DATABASE_PATH, initialize_database
 from src.reviewing.finalize import is_ai_second_pass_eligible
-from src.reviewing.candidate_review_ai import validate_ai_approval
+from src.reviewing.candidate_review_ai import (
+    CandidateAuditError,
+    validate_ai_approval,
+    validated_official_answer_overlay,
+)
 from src.reviewing.knowledge_classification import load_bound_knowledge_classification
 from src.processing.secure_crop_artifacts import (
     LOCK_FILENAME,
@@ -453,6 +457,19 @@ def _assess(connection, context, effective=None):
     eligible, ineligible = [], []
     if effective is None:
         effective = _effective_questions(connection, context)
+    answer_source = connection.execute(
+        "SELECT * FROM import_answer_sources WHERE import_job_id=?", (job["id"],)
+    ).fetchone()
+    official_reviews = {
+        row["source_question_no"]: row for row in connection.execute(
+            "SELECT * FROM candidate_official_answer_reviews WHERE import_job_id=?",
+            (job["id"],),
+        )
+    }
+    answer_extraction = connection.execute(
+        "SELECT * FROM import_answer_extraction_runs WHERE import_job_id=?",
+        (job["id"],),
+    ).fetchone()
     for source_question in questions:
         number = source_question["source_question_no"]
         question = effective[number][0]
@@ -479,11 +496,33 @@ def _assess(connection, context, effective=None):
             _has_markdown(source_question, "analysis_markdown")
             or _has_markdown(question, "analysis_markdown")
         )
-        if answer_relevant and audit.get("answer_status") != "passed":
+        official_linked = False
+        if answer_source is None:
+            reasons.append("answer_source_unclassified")
+        elif answer_source["candidate_sha256"] != context[6]:
+            reasons.append("answer_source_evidence_invalid")
+        elif answer_source["source_answer_state"] == "source_has_answer_unprocessed":
+            reasons.append("source_answer_unprocessed")
+        elif answer_source["source_answer_state"] == "source_answer_linked":
+            review = official_reviews.get(number)
+            official_linked = bool(
+                review is not None and review["decision"] == "passed"
+                and answer_extraction is not None
+                and answer_extraction["status"] == "completed"
+                and review["candidate_sha256"] == context[6]
+                and review["candidate_sha256"] == answer_source["candidate_sha256"]
+                and review["answer_pages_sha256"] == answer_extraction["answer_pages_sha256"]
+                and review["extraction_artifact_sha256"] == answer_extraction["output_sha256"]
+                and review["answer_analysis_sha256"] == _answer_analysis_sha256(question)
+            )
+            if not official_linked:
+                reasons.append("official_answer_evidence_invalid")
+        if answer_relevant and not official_linked and audit.get("answer_status") != "passed":
             reasons.append("answer_status_not_passed")
-        if analysis_relevant and audit.get("analysis_status") != "passed":
+        if analysis_relevant and not official_linked and audit.get("analysis_status") != "passed":
             reasons.append("analysis_status_not_passed")
         if ((answer_relevant or analysis_relevant)
+                and not official_linked
                 and audit.get("answer_analysis_sha256") != _answer_analysis_sha256(question)):
             reasons.append("answer_analysis_sha256_mismatch")
         item = AssessmentItem(number, tuple(reasons))
@@ -577,6 +616,13 @@ def _effective_questions(connection, context):
         if draft["status"] != "approved":
             selected[number] = (
                 question, None, ("human_approval_status_invalid",), False
+            )
+            continue
+        try:
+            validated_official_answer_overlay(connection, dict(draft))
+        except (CandidateAuditError, sqlite3.Error):
+            selected[number] = (
+                question, None, ("official_answer_overlay_invalid",), False
             )
             continue
         if draft["approval_source"] != "human":
@@ -736,6 +782,21 @@ def _approval_review_metadata(
     return reviewer, stable_auto_reviewed_at, f"AI二审通过（auto_pass）；{answer_note}"
 
 
+def _answer_source_note(connection, job_id: int, any_answer_provided: bool) -> str:
+    row = connection.execute(
+        "SELECT source_answer_state FROM import_answer_sources WHERE import_job_id=?",
+        (job_id,),
+    ).fetchone()
+    state = row[0] if row is not None else None
+    if state == "source_answer_linked":
+        return "原卷答案已审核"
+    if state == "source_has_no_answer":
+        return "AI候选答案已审核；原卷未提供答案" if any_answer_provided else "原卷未提供答案"
+    if state == "source_has_answer_unprocessed":
+        return "原卷答案待处理"
+    return "原卷答案来源状态未登记"
+
+
 def _insert_one(connection, context, question, code, human_approval=None):
     job, _, _, audits, crops, figures = context[:6]
     number = question["source_question_no"]
@@ -797,9 +858,7 @@ def _insert_one(connection, context, question, code, human_approval=None):
             (qid, kind, asset["output_relative_path"], asset["width"], asset["height"], asset["byte_size"], asset["sha256"], job["id"]),
         )
     any_answer_provided = _has_markdown(question, "answer_markdown")
-    answer_note = (
-        "原卷答案已通过审核" if any_answer_provided else "原卷未提供答案"
-    )
+    answer_note = _answer_source_note(connection, job["id"], any_answer_provided)
     reviewer, reviewed_at, review_note = _approval_review_metadata(
         human_approval, question, answer_note, audits, number, context[10]
     )
@@ -924,9 +983,7 @@ def _validate_existing_question(
            FROM question_assets WHERE question_id=? ORDER BY asset_kind""", (qid,)
     )]
     any_answer_provided = _has_markdown(question, "answer_markdown")
-    answer_note = (
-        "原卷答案已通过审核" if any_answer_provided else "原卷未提供答案"
-    )
+    answer_note = _answer_source_note(connection, job["id"], any_answer_provided)
     reviewer, reviewed_at, review_note = _approval_review_metadata(
         human_approval, question, answer_note, context[3], number, context[10]
     )

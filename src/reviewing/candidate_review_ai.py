@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import copy
 import json
 import os
 import re
@@ -37,6 +38,7 @@ RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
 ALLOWED_EDIT_FIELDS = {
     "stem_markdown", "question_type_code", "primary_knowledge_point_code",
     "related_knowledge_point_codes", "options", "subquestions",
+    "answer_markdown", "analysis_markdown",
 }
 
 
@@ -126,7 +128,8 @@ def _audit_database_row(connection, job_id: int):
 def _completed_bundle(database_path: Path, private_root: Path, job_id: int,
                       job_fd: int, temporary_root: Path):
     input_row, manifest_sha, manifest, images, candidate, candidate_file = _read_inputs(
-        database_path, private_root, job_id, job_fd, temporary_root
+        database_path, private_root, job_id, job_fd, temporary_root,
+        allowed_job_statuses=("pending", "needs_review"),
     )
     with closing(sqlite3.connect(database_path)) as connection:
         audit_row = _audit_database_row(connection, job_id)
@@ -165,6 +168,125 @@ def _release(job_fd, lock_fd, temporary) -> None:
         temporary.cleanup()
 
 
+def _replaceable_machine_draft(row: sqlite3.Row) -> bool:
+    """Prove a stale draft has never contained human-owned review state."""
+    try:
+        snapshot = _decode_object(row["source_snapshot_json"])
+        edited = _decode_object(row["edited_json"])
+        if (
+            snapshot != edited
+            or snapshot.get("source_question_no") != row["source_question_no"]
+            or row["review_notes"] != ""
+            or row["deleted_at"] is not None
+            or row["deletion_reason"] is not None
+            or row["deletion_note"] is not None
+        ):
+            return False
+        if row["status"] == "pending":
+            return bool(
+                row["version"] == 1
+                and row["reviewed_at"] is None
+                and row["approval_source"] is None
+                and row["approval_evidence_json"] is None
+            )
+        if (
+            row["status"] != "approved"
+            or row["version"] != 2
+            or row["approval_source"] != "ai_second_pass"
+            or not row["reviewed_at"]
+        ):
+            return False
+        evidence = _decode_object(row["approval_evidence_json"])
+        expected_keys = {
+            "method", "audit_output_sha256", "candidate_sha256",
+            "source_snapshot_sha256", "edited_sha256", "audit_run_id",
+            "audited_at", "reviewed_at", "approved_draft_version",
+        }
+        digest = _canonical_sha(snapshot)
+        return bool(
+            set(evidence) == expected_keys
+            and evidence["method"] == "batch_auto_pass"
+            and evidence["candidate_sha256"] == row["source_candidate_sha256"]
+            and evidence["source_snapshot_sha256"] == digest
+            and evidence["edited_sha256"] == digest
+            and evidence["approved_draft_version"] == row["version"]
+            and evidence["reviewed_at"] == row["reviewed_at"]
+            and isinstance(evidence["audit_output_sha256"], str)
+            and re.fullmatch(r"[0-9a-f]{64}", evidence["audit_output_sha256"])
+            and _bounded_run_id(evidence["audit_run_id"])
+            and isinstance(evidence["audited_at"], str)
+            and bool(evidence["audited_at"])
+        )
+    except (CandidateAuditError, TypeError, KeyError, json.JSONDecodeError):
+        return False
+
+
+def _prepare_current_draft_batch(connection, job_id: int, questions: list[dict],
+                                 candidate_sha256: str) -> None:
+    """Atomically replace an entirely machine-owned stale candidate batch."""
+    source_by_no = {item["source_question_no"]: item for item in questions}
+    rows = connection.execute(
+        "SELECT * FROM candidate_review_drafts WHERE import_job_id=? ORDER BY id",
+        (job_id,),
+    ).fetchall()
+    if not rows:
+        return
+    current_rows = True
+    for row in rows:
+        source = source_by_no.get(row["source_question_no"])
+        try:
+            snapshot = _decode_object(row["source_snapshot_json"])
+        except CandidateAuditError:
+            snapshot = None
+        if (
+            source is None
+            or row["source_candidate_sha256"] != candidate_sha256
+            or snapshot != source
+        ):
+            current_rows = False
+            break
+    if current_rows:
+        return
+    old_hashes = {row["source_candidate_sha256"] for row in rows}
+    has_formal_questions = connection.execute(
+        "SELECT 1 FROM question_sources WHERE import_job_id=? LIMIT 1", (job_id,)
+    ).fetchone() is not None
+    replaceable = all(_replaceable_machine_draft(row) for row in rows)
+    machine_batch_anchors = {
+        (
+            evidence["audit_output_sha256"], evidence["candidate_sha256"],
+            evidence["audit_run_id"], evidence["audited_at"],
+        )
+        for row in rows
+        if row["status"] == "approved" and replaceable
+        for evidence in (_decode_object(row["approval_evidence_json"]),)
+    }
+    if (
+        old_hashes == {candidate_sha256}
+        or len(old_hashes) != 1
+        or has_formal_questions
+        or not replaceable
+        or len(machine_batch_anchors) > 1
+    ):
+        raise CandidateAuditError(SAFE_REAUDIT_INPUT)
+    connection.execute(
+        "DELETE FROM candidate_review_drafts WHERE import_job_id=?", (job_id,)
+    )
+    connection.executemany(
+        """INSERT INTO candidate_review_drafts
+           (import_job_id,source_question_no,source_candidate_sha256,
+            source_snapshot_json,edited_json,status)
+           VALUES(?,?,?,?,?,'pending')""",
+        [
+            (
+                job_id, source["source_question_no"], candidate_sha256,
+                _canonical(source), _canonical(source),
+            )
+            for source in questions
+        ],
+    )
+
+
 def apply_batch_auto_pass(database_path, private_root, job_id) -> BatchApprovalResult:
     """Explicitly apply only pristine, DB-anchored batch auto-pass decisions."""
     database_path, private_root = Path(database_path), Path(private_root)
@@ -192,6 +314,9 @@ def apply_batch_auto_pass(database_path, private_root, job_id) -> BatchApprovalR
                 raise CandidateAuditError(SAFE_REAUDIT_INPUT)
             if tuple(_audit_database_row(connection, job_id)) != audit_row:
                 raise CandidateAuditError(SAFE_REAUDIT_INPUT)
+            _prepare_current_draft_batch(
+                connection, job_id, questions, candidate_file.sha256
+            )
             for source in questions:
                 number = source["source_question_no"]
                 strict = audit_by_no[number]["audit_status"] == "auto_pass"
@@ -264,9 +389,172 @@ def _decode_object(raw: object) -> dict[str, Any]:
     return value
 
 
+def _answer_independent_scope(question: dict[str, Any], scope: str) -> dict[str, Any]:
+    """Canonical conservative scope: remove only known answer/analysis leaves."""
+    if not isinstance(question, dict):
+        raise CandidateAuditError(SAFE_REAUDIT_INPUT)
+    scoped = copy.deepcopy(question)
+    scoped.pop("answer_markdown", None)
+    scoped.pop("analysis_markdown", None)
+    subquestions = scoped.get("subquestions")
+    if not isinstance(subquestions, list) or any(
+        not isinstance(item, dict) for item in subquestions
+    ):
+        raise CandidateAuditError(SAFE_REAUDIT_INPUT)
+    for item in subquestions:
+        item.pop("answer_markdown", None)
+        item.pop("analysis_markdown", None)
+    return {"version": 1, "scope": scope, "question": scoped}
+
+
+def visual_question_scope_sha256(question: dict[str, Any]) -> str:
+    return _canonical_sha(_answer_independent_scope(
+        question, "visual_question_content_v1"
+    ))
+
+
+def classification_scope_sha256(question: dict[str, Any]) -> str:
+    return _canonical_sha(_answer_independent_scope(
+        question, "knowledge_classification_input_v1"
+    ))
+
+
+def _restore_pre_overlay_answers(edited: dict[str, Any], snapshot: dict[str, Any]):
+    prior = copy.deepcopy(edited)
+    prior["answer_markdown"] = snapshot.get("answer_markdown", "")
+    prior["analysis_markdown"] = snapshot.get("analysis_markdown", "")
+    prior_subs = prior.get("subquestions")
+    snapshot_subs = snapshot.get("subquestions")
+    if not isinstance(prior_subs, list) or not isinstance(snapshot_subs, list):
+        raise CandidateAuditError(SAFE_REAUDIT_INPUT)
+    snapshot_by_label = {}
+    for source in snapshot_subs:
+        if not isinstance(source, dict):
+            raise CandidateAuditError(SAFE_REAUDIT_INPUT)
+        label = source.get("label")
+        if isinstance(label, str) and label and label not in snapshot_by_label:
+            snapshot_by_label[label] = source
+    for target in prior_subs:
+        if not isinstance(target, dict):
+            raise CandidateAuditError(SAFE_REAUDIT_INPUT)
+        source = snapshot_by_label.get(target.get("label"), {})
+        for field in ("answer_markdown", "analysis_markdown"):
+            if field in source:
+                target[field] = source[field]
+            else:
+                target.pop(field, None)
+    return prior
+
+
+def validated_official_answer_overlay(connection, draft: dict[str, Any]):
+    """Return the prior draft bound by a valid overlay, None for legacy/no overlay."""
+    row = connection.execute(
+        """SELECT * FROM candidate_official_answer_overlays
+           WHERE import_job_id=? AND source_question_no=?""",
+        (draft.get("import_job_id"), draft.get("source_question_no")),
+    ).fetchone()
+    if row is None:
+        return None
+    row = dict(row)
+    edited = _decode_object(draft.get("edited_json"))
+    snapshot = _decode_object(draft.get("source_snapshot_json"))
+    prior = _restore_pre_overlay_answers(edited, snapshot)
+    evidence_raw = draft.get("approval_evidence_json")
+    if not isinstance(evidence_raw, str):
+        raise CandidateAuditError(SAFE_REAUDIT_INPUT)
+    source = connection.execute(
+        "SELECT * FROM import_answer_sources WHERE import_job_id=?",
+        (draft["import_job_id"],),
+    ).fetchone()
+    extraction = connection.execute(
+        "SELECT * FROM import_answer_extraction_runs WHERE import_job_id=?",
+        (draft["import_job_id"],),
+    ).fetchone()
+    review_run = connection.execute(
+        "SELECT * FROM import_answer_review_runs WHERE import_job_id=?",
+        (draft["import_job_id"],),
+    ).fetchone()
+    answer = connection.execute(
+        """SELECT * FROM candidate_official_answers
+           WHERE import_job_id=? AND source_question_no=?""",
+        (draft["import_job_id"], draft["source_question_no"]),
+    ).fetchone()
+    review = connection.execute(
+        """SELECT * FROM candidate_official_answer_reviews
+           WHERE import_job_id=? AND source_question_no=?""",
+        (draft["import_job_id"], draft["source_question_no"]),
+    ).fetchone()
+    visual = visual_question_scope_sha256(edited)
+    classification = classification_scope_sha256(edited)
+    try:
+        subanswers = json.loads(answer["subquestions_json"]) if answer is not None else None
+    except (TypeError, json.JSONDecodeError):
+        subanswers = None
+    edited_subs = edited.get("subquestions")
+    answer_values_match = bool(
+        answer is not None and isinstance(subanswers, list)
+        and isinstance(edited_subs, list) and len(edited_subs) == len(subanswers)
+        and edited.get("answer_markdown", "") == answer["answer_markdown"]
+        and edited.get("analysis_markdown", "") == answer["analysis_markdown"]
+        and all(
+            isinstance(target, dict) and isinstance(official, dict)
+            and target.get("label") == official.get("label")
+            and target.get("answer_markdown", "") == official.get("answer_markdown", "")
+            and target.get("analysis_markdown", "") == official.get("analysis_markdown", "")
+            for target, official in zip(edited_subs, subanswers)
+        )
+    )
+    valid = bool(
+        draft.get("status") == "approved"
+        and draft.get("approval_source") == row["approval_source"]
+        and draft.get("version") == row["new_draft_version"]
+        and row["new_draft_version"] == row["prior_draft_version"] + 1
+        and _canonical_sha(edited) == row["new_edited_sha256"]
+        and _canonical_sha(prior) == row["prior_edited_sha256"]
+        and hashlib.sha256(evidence_raw.encode("utf-8")).hexdigest()
+            == row["approval_evidence_sha256"]
+        and visual == row["visual_scope_before_sha256"]
+        and visual == row["visual_scope_after_sha256"]
+        and classification == row["classification_scope_before_sha256"]
+        and classification == row["classification_scope_after_sha256"]
+        and source is not None
+        and source["source_answer_state"] == "source_answer_linked"
+        and source["applied_at"] is not None
+        and extraction is not None and extraction["status"] == "completed"
+        and extraction["output_sha256"] == row["extraction_artifact_sha256"]
+        and extraction["candidate_sha256"] == source["candidate_sha256"]
+        and extraction["draft_batch_sha256"] == source["draft_batch_sha256"]
+        and review_run is not None and review_run["status"] == "completed"
+        and review_run["output_sha256"] == row["review_artifact_sha256"]
+        and review_run["extraction_artifact_sha256"] == extraction["output_sha256"]
+        and review_run["candidate_sha256"] == source["candidate_sha256"]
+        and review_run["draft_batch_sha256"] == source["draft_batch_sha256"]
+        and review_run["answer_pages_sha256"] == extraction["answer_pages_sha256"]
+        and answer is not None
+        and answer["candidate_sha256"] == source["candidate_sha256"]
+        and answer["draft_batch_sha256"] == source["draft_batch_sha256"]
+        and answer["content_sha256"] == row["answer_content_sha256"]
+        and answer["extraction_artifact_sha256"] == extraction["output_sha256"]
+        and answer_values_match
+        and review is not None and review["decision"] == "passed"
+        and review["candidate_sha256"] == source["candidate_sha256"]
+        and review["draft_batch_sha256"] == source["draft_batch_sha256"]
+        and review["answer_pages_sha256"] == extraction["answer_pages_sha256"]
+        and review["answer_content_sha256"] == answer["content_sha256"]
+        and review["answer_analysis_sha256"] == row["answer_analysis_sha256"]
+        and review["extraction_artifact_sha256"] == extraction["output_sha256"]
+    )
+    if not valid:
+        raise CandidateAuditError(SAFE_REAUDIT_INPUT)
+    prior_draft = dict(draft)
+    prior_draft["version"] = row["prior_draft_version"]
+    prior_draft["edited_json"] = _canonical(prior)
+    return prior_draft
+
+
 def validate_ai_approval(connection, draft: dict[str, Any], candidate: dict[str, Any],
                          *, candidate_sha256: str, audit_sha256: str,
-                         audit_entry: dict[str, Any]) -> bool:
+                         audit_entry: dict[str, Any], _allow_overlay: bool = True) -> bool:
     """Validate exact AI provenance; malformed/stale claims always return false."""
     try:
         if (
@@ -277,6 +565,16 @@ def validate_ai_approval(connection, draft: dict[str, Any], candidate: dict[str,
             or draft.get("deleted_at") is not None
         ):
             return False
+        overlay_prior = (
+            validated_official_answer_overlay(connection, draft)
+            if _allow_overlay else None
+        )
+        if overlay_prior is not None:
+            return validate_ai_approval(
+                connection, overlay_prior, candidate,
+                candidate_sha256=candidate_sha256, audit_sha256=audit_sha256,
+                audit_entry=audit_entry, _allow_overlay=False,
+            )
         edited = _decode_object(draft.get("edited_json"))
         evidence = _decode_object(draft.get("approval_evidence_json"))
         method = evidence.get("method")
@@ -351,6 +649,11 @@ def _valid_edited(connection, edited: dict, source: dict) -> bool:
         return False
     if not isinstance(edited.get("stem_markdown"), str) or not edited["stem_markdown"].strip():
         return False
+    if any(
+        not isinstance(edited.get(key), str) or len(edited[key]) > 100_000
+        for key in ("answer_markdown", "analysis_markdown")
+    ):
+        return False
     types = {row[0] for row in connection.execute("SELECT code FROM question_types WHERE is_active=1")}
     points = {row[0] for row in connection.execute("SELECT code FROM knowledge_points WHERE is_active=1")}
     if edited.get("question_type_code") not in types:
@@ -375,9 +678,24 @@ def _valid_edited(connection, edited: dict, source: dict) -> bool:
         codes.append(option["code"].strip().casefold())
     if len(codes) != len(set(codes)):
         return False
+    allowed_subquestion_shapes = (
+        {"label", "stem_markdown"},
+        {"label", "stem_markdown", "answer_markdown", "analysis_markdown"},
+    )
     return all(
-        isinstance(item, dict) and set(item) == {"label", "stem_markdown"}
-        and all(isinstance(item[key], str) and item[key].strip() for key in item)
+        isinstance(item, dict)
+        and set(item) in allowed_subquestion_shapes
+        and isinstance(item.get("label"), str) and item["label"].strip()
+        and isinstance(item.get("stem_markdown"), str) and item["stem_markdown"].strip()
+        and (
+            set(item) == allowed_subquestion_shapes[0]
+            or (
+                isinstance(item.get("answer_markdown"), str)
+                and len(item["answer_markdown"]) <= 100_000
+                and isinstance(item.get("analysis_markdown"), str)
+                and len(item["analysis_markdown"]) <= 100_000
+            )
+        )
         for item in subquestions
     )
 

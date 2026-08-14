@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}原卷官方答案 · AI 数学题库{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">OFFICIAL ANSWERS · TASK #{{ job.id }}</p>
+  <h1>{{ job.paper_name }}</h1>
+  <p>只从当前任务已验证的原卷答案页转写，并由全新独立会话逐题复核；不会调用模型解题。</p>
+</section>
+
+<section class="paper-card">
+  <h2>答案覆盖</h2>
+  <dl>
+    <div><dt>来源状态</dt><dd>{{ coverage.label }}</dd></div>
+    <div><dt>应有题数 expected</dt><dd>{{ coverage.expected }}</dd></div>
+    <div><dt>已复核 linked</dt><dd>{{ coverage.linked }}</dd></div>
+    <div><dt>未解决 unresolved</dt><dd>{{ coverage.unresolved }}</dd></div>
+    <div><dt>提取状态</dt><dd>{{ extraction.status if extraction else '未开始' }}</dd></div>
+    <div><dt>独立复核状态</dt><dd>{{ review.status if review else '未开始' }}</dd></div>
+  </dl>
+  {% if extraction and extraction.error_message %}<div class="error-message" role="alert">{{ extraction.error_message }}</div>{% endif %}
+  {% if review and review.error_message %}<div class="error-message" role="alert">{{ review.error_message }}</div>{% endif %}
+</section>
+
+{% if not coverage.state %}
+<section class="paper-card">
+  <h2>登记原卷答案来源</h2>
+  <form method="post" action="/imports/{{ job.id }}/answers/register">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>来源分类
+      <select name="source_answer_state">
+        <option value="source_has_answer_unprocessed">原卷有答案，等待处理</option>
+        <option value="source_has_no_answer">原卷确实未提供答案</option>
+      </select>
+    </label>
+    <label>答案起始页 <input name="page_start" inputmode="numeric"></label>
+    <label>答案结束页 <input name="page_end" inputmode="numeric"></label>
+    <button class="button" type="submit">登记答案页范围</button>
+  </form>
+</section>
+{% elif coverage.state == 'source_has_answer_unprocessed' %}
+<section class="paper-card">
+  {% if not extraction or extraction.status != 'completed' %}
+  <form method="post" action="/imports/{{ job.id }}/answers/extract">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="button" type="submit">开始来源绑定的 Codex 转写</button>
+  </form>
+  {% elif not review or review.status != 'completed' %}
+  <form method="post" action="/imports/{{ job.id }}/answers/review">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="button" type="submit">启动全新独立答案复核</button>
+  </form>
+  {% elif coverage.linked == coverage.expected and coverage.unresolved == 0 %}
+  <form method="post" action="/imports/{{ job.id }}/answers/apply">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="button urgent" type="submit">整批应用到候选草稿</button>
+  </form>
+  {% endif %}
+</section>
+{% elif coverage.state == 'source_has_no_answer' %}
+<section class="paper-card"><p>已用显式来源分类证据登记：原卷未提供答案。</p></section>
+{% else %}
+<section class="paper-card"><p>原卷答案已逐题独立审核并应用。候选内容须重新审核与分类后才能准入。</p></section>
+{% endif %}
+{% endblock %}

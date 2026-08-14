@@ -114,6 +114,22 @@ class CropReviewSheetTests(unittest.TestCase):
         self.assertEqual(before, {path.name: (sha256(path), path.stat().st_mtime_ns)
                                   for path in self.sheets.iterdir()})
 
+    def test_default_pixel_budget_accepts_standard_300dpi_batch_above_100m(self):
+        manifest_path = self.job_dir / "question_crops.json"
+        manifest = json.loads(manifest_path.read_text())
+        for entry in manifest["questions"]:
+            entry["width"] = 4000
+            entry["height"] = 3500
+        manifest.pop("signature")
+        manifest = sign_manifest(load_hmac_key(self.job_dir), manifest)
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+
+        with patch("src.processing.crop_review_sheet._verify_input_png"), \
+                patch("src.processing.crop_review_sheet._build_sheet", return_value=b"sheet"):
+            built = generate_crop_review_sheets(
+                job_dir=self.job_dir, recropped_question_nos=list(range(1, 9)))
+        self.assertEqual(["crops_01_04.jpg", "crops_05_08.jpg"], built)
+
     def test_total_input_byte_budget_rejects_before_any_image_open(self):
         with patch("src.processing.crop_review_sheet.Image.open",
                    side_effect=AssertionError("budget must reject before Pillow")):

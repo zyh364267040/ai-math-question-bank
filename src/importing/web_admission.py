@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -25,6 +26,7 @@ from src.importing.admit_questions import (
 )
 from src.reviewing.finalize import finalize_review
 from src.reviewing.knowledge_classification import load_bound_knowledge_classification
+from src.learning.correction_dataset import harvest_completed_job
 
 
 SAFE_APPLY_FAILED = "严格整批入库未完成，可安全重试"
@@ -36,6 +38,7 @@ SAFE_NOT_READY = "当前任务不满足严格整批入库条件"
 SAFE_PREPARE_NOT_READY = "当前任务不满足严格准入准备条件"
 SAFE_PREPARE_CHANGED = "准入准备期间任务或证据已变化"
 LEASE_SECONDS = 300
+LOGGER = logging.getLogger(__name__)
 
 REASON_NAMES = {
     "human_required": "需要人工确认",
@@ -54,6 +57,10 @@ REASON_NAMES = {
     "answer_status_not_passed": "已提供答案未通过审核",
     "analysis_status_not_passed": "已提供解析未通过审核",
     "answer_analysis_sha256_mismatch": "答案或解析与审核证据不匹配",
+    "answer_source_unclassified": "原卷答案来源状态尚未显式登记",
+    "answer_source_evidence_invalid": "原卷答案来源分类未绑定当前候选版本",
+    "source_answer_unprocessed": "原卷答案待处理，整批准入已阻断",
+    "official_answer_evidence_invalid": "官方答案复核证据与当前候选或来源页不匹配",
     "batch_ai_approval_not_anchored": "整批视觉审核证据未锚定",
     "human_approval_status_invalid": "人工审核草稿未批准",
     "human_approval_source_invalid": "人工批准来源无效",
@@ -1022,7 +1029,7 @@ def _anchor_finalized_in_transaction(
 def apply_web_admission(
     database_path, private_root, job_id: int, *, backup_fn=backup_database,
     admit_fn=admit_questions, finalize_fn=finalize_review,
-    lease_seconds=LEASE_SECONDS, keeper_interval=None,
+    harvest_fn=harvest_completed_job, lease_seconds=LEASE_SECONDS, keeper_interval=None,
 ):
     """Apply one explicitly authorized strict batch, with retryable phase boundaries."""
     database_path = Path(database_path)
@@ -1159,6 +1166,10 @@ def apply_web_admission(
         _complete_run(
             database_path, job_id, run["expected_count"], result.question_codes,
         )
+        try:
+            harvest_fn(database_path, private_root, job_id)
+        except Exception:
+            LOGGER.exception("completed job %s correction sample harvest failed", job_id)
         return "completed"
     except WebAdmissionError:
         if not admitted:

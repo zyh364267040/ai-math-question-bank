@@ -17,7 +17,11 @@ from src.processing.secure_crop_artifacts import (
     locked_job,
     read_file_at,
 )
-from src.reviewing.candidate_review_ai import validate_ai_approval
+from src.reviewing.candidate_review_ai import (
+    CandidateAuditError,
+    validate_ai_approval,
+    validated_official_answer_overlay,
+)
 from src.reviewing.knowledge_classification import load_bound_knowledge_classification
 from src.web.app import AuditDataError, _validate_audit_payload
 
@@ -223,6 +227,10 @@ def _plan(connection, drafts, batch):
         )
         unedited = bound and _canonical(edited) == _canonical(candidate)
         audit = batch["audits"].get(number)
+        try:
+            validated_official_answer_overlay(connection, item)
+        except (CandidateAuditError, sqlite3.Error):
+            raise FinalizationError(f"Q{number} 官方答案覆盖证据无效")
         planned_reviewed_at = item["reviewed_at"]
         if status == "approved" and source == "human":
             if not bound or not _valid_human_evidence(item):

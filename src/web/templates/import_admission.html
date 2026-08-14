@@ -5,6 +5,7 @@
   <p class="eyebrow">STRICT ADMISSION</p>
   <h1>{{ page.paper_name }}</h1>
   <p>严格整批准入评估只读显示当前证据；正式入库每次都需要教师明确授权。</p>
+  <p><a href="/imports/{{ page.job_id }}/answers">查看原卷答案 expected / linked / unresolved 状态</a></p>
 </section>
 
 <section class="paper-card">
@@ -41,7 +42,7 @@
 {% endif %}
 
 <section class="paper-card">
-  <p><strong>原卷答案缺失时始终保持 missing，AI 不会猜测或补写答案。</strong></p>
+  <p><strong>空答案不会自动解释为原卷未提供；只有显式来源分类证据才允许该状态。已知答案页未处理会阻断整批准入。</strong></p>
   {% if page.stage != 'completed' and page.can_prepare %}
   <p>候选题与严格证据已齐全。先显式准备准入状态；此操作不会创建正式题。</p>
   <form method="post" action="/imports/{{ page.job_id }}/admission/prepare">

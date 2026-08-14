@@ -55,6 +55,7 @@ MAX_PROMPT_BYTES = 64 * 1024
 MAX_WARNINGS_PER_QUESTION = 100
 MAX_MASK_REGIONS_PER_QUESTION = 10
 MAX_MASK_REASON_LENGTH = 200
+CONTROLLED_MASK_REASONS = {"qr_code", "promotion_overlay"}
 CODEX_TIMEOUT_SECONDS = 300
 SAFE_SPLIT_ERROR = "Codex 自动切题失败，请重试"
 SAFE_CODEX_MISSING = "未配置 Codex：请设置 CODEX_BIN 或安装 Codex CLI"
@@ -271,7 +272,10 @@ def _codex_output_schema():
                 "type": "array", "minItems": 1, "maxItems": MAX_QUESTIONS,
                 "items": {
                     "type": "object", "additionalProperties": False,
-                    "required": ["question_no", "regions", "warnings", "confidence"],
+                    "required": [
+                        "question_no", "regions", "warnings", "confidence",
+                        "mask_regions_normalized",
+                    ],
                     "properties": {
                         "question_no": {"type": "integer", "minimum": 1},
                         "regions": {
@@ -353,6 +357,16 @@ def _bounded_communicate(process, timeout, stdout_limit, stderr_limit):
 
 def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _canonical_mask_reason(value):
+    if not isinstance(value, str):
+        raise TypeError
+    stripped = value.strip()
+    for reason in CONTROLLED_MASK_REASONS:
+        if stripped == reason or stripped.startswith(reason + ":") or stripped.startswith(reason + "："):
+            return reason
+    raise TypeError
 
 
 def parse_codex_question_plan(raw, job_id, page_sizes):
@@ -461,6 +475,7 @@ def parse_codex_question_plan(raw, job_id, page_sizes):
                     or len(reason) > MAX_MASK_REASON_LENGTH
                 ):
                     raise TypeError
+                reason = _canonical_mask_reason(reason)
                 left, top, right, bottom = box
                 if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
                     raise TypeError
@@ -657,7 +672,8 @@ def _prompt(job_id, pages, layout, review_feedback=(), frozen_regions=()):
         '{"question_no":连续整数,"regions":[{"page_number":整数,'
         '"bbox_normalized":[left,top,right,bottom]}],"warnings":[],"confidence":low、medium或high,'
         '"mask_regions_normalized":[{"bbox_normalized":[left,top,right,bottom],'
-        '"reason":"原因"}]}]}。mask_regions_normalized可省略，默认空列表；'
+        '"reason":"原因"}]}]}。每题必须输出mask_regions_normalized数组，'
+        "没有遮罩时输出[]；"
         "遮罩仅限经独立确认不覆盖试题内容的二维码、水印、群组或答案获取宣传层；"
         "绝不能用于隐藏题干、选项、答案、解析，也不能用于掩盖相邻题边界错误；"
         f"。import_job_id={job_id}；允许页码={','.join(str(x[0]) for x in pages)}；"
@@ -1000,6 +1016,10 @@ def _load_trusted_frozen_regions(
         for question in canonical_stored["questions"]:
             question.setdefault("mask_regions_normalized", [])
             question.setdefault("mask_regions", [])
+            for mask in question["mask_regions_normalized"]:
+                mask["reason"] = _canonical_mask_reason(mask.get("reason"))
+            for mask in question["mask_regions"]:
+                mask["reason"] = _canonical_mask_reason(mask.get("reason"))
         if normalized != canonical_stored:
             raise TypeError
         expected_numbers = tuple(range(1, question_count + 1))

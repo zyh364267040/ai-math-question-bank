@@ -24,13 +24,18 @@ from src.reviewing.knowledge_classification import (
     KnowledgeClassificationError,
     adopt_knowledge_classifications_in_connection,
 )
-from src.reviewing.candidate_review_ai import validate_ai_approval
+from src.reviewing.candidate_review_ai import (
+    classification_scope_sha256,
+    validate_ai_approval,
+    validated_official_answer_overlay,
+)
 
 
 SAFE_CLASSIFICATION_INPUT = "Codex 知识点分类输入或批准证据已变化"
 SAFE_CLASSIFICATION_BUSY = "Codex 知识点分类正在处理，请稍后刷新"
 SAFE_CLASSIFICATION_MODEL = "Codex 知识点分类失败，请稍后重试"
 SAFE_CLASSIFICATION_STORAGE = "Codex 知识点分类结果保存失败，请重试"
+SAFE_OFFICIAL_ANSWER_BINDING = "官方答案绑定证据不完整或已变化，请重新审核"
 MAX_MODEL_OUTPUT_BYTES = 512 * 1024
 MAX_PROMPT_BYTES = 2 * 1024 * 1024
 MODEL = "codex-cli"
@@ -40,6 +45,11 @@ CODEX_TIMEOUT_SECONDS = 300
 STALE_AFTER = timedelta(minutes=15)
 CONFIDENCES = {"low", "medium", "high"}
 OUTPUT_CONSTRAINT = "字段名必须逐字使用，题号必须字符串。"
+LEVEL3_RELATED_CODES_CONSTRAINT = (
+    "related_codes必须是JSON数组；每个元素必须逐字等于一个候选代码；"
+    "禁止在单个元素中用`、`、`,`、`/`、空格等拼接多个代码；最多2个；"
+    "无关联时[]；不得重复primary_code。"
+)
 STAGE_SYSTEM_MESSAGES = {
     "level2": (
         "你是二级数学知识模块分类器。只根据题干独立初判所属二级模块，"
@@ -48,15 +58,18 @@ STAGE_SYSTEM_MESSAGES = {
     "proposal": (
         "你是三级数学知识点初审分类器。请从每题给定的三级候选中独立提出"
         "主知识点和至多两个关联知识点。" + OUTPUT_CONSTRAINT
+        + LEVEL3_RELATED_CODES_CONSTRAINT
     ),
     "verifier": (
         "你是独立的三级数学知识点复核器。不得假定任何先前 proposal 正确；"
         "必须从题干重新分类，并主动寻找更合适的替代知识点。" + OUTPUT_CONSTRAINT
+        + LEVEL3_RELATED_CODES_CONSTRAINT
     ),
     "adjudicator": (
         "你是第三位独立的三级数学知识点仲裁分类器。必须从题干重新分类；"
         "不得接收、推测或复述 proposal/verifier 的答案、理由或选择。"
         + OUTPUT_CONSTRAINT
+        + LEVEL3_RELATED_CODES_CONSTRAINT
     ),
 }
 STAGE_USER_INSTRUCTIONS = {
@@ -130,6 +143,43 @@ class KnowledgeClassificationRunError(RuntimeError):
 
 class _ClassificationClaimLost(RuntimeError):
     """Internal signal that another worker owns the durable claim."""
+
+
+@dataclass
+class _ArchivedClassificationGeneration:
+    trusted_job: Any
+    archive_fd: int
+    final_name: str
+    files: tuple[str, ...]
+
+    def finalize(self) -> None:
+        os.close(self.archive_fd)
+        self.trusted_job.close()
+
+    def rollback(self) -> None:
+        final_fd = None
+        try:
+            final_fd = os.open(
+                self.final_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=self.archive_fd,
+            )
+            os.replace(
+                "knowledge_classification.json", "knowledge_classification.json",
+                src_dir_fd=final_fd, dst_dir_fd=self.trusted_job.job_fd,
+            )
+            for name in self.files:
+                if name != "knowledge_classification.json":
+                    os.unlink(name, dir_fd=final_fd)
+            os.fsync(self.trusted_job.job_fd)
+        finally:
+            if final_fd is not None:
+                os.close(final_fd)
+            try:
+                os.rmdir(self.final_name, dir_fd=self.archive_fd)
+                os.fsync(self.archive_fd)
+            finally:
+                os.close(self.archive_fd)
+                self.trusted_job.close()
 
 
 @dataclass(frozen=True)
@@ -392,6 +442,10 @@ def _authoritative_input(
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise KnowledgeClassificationRunError(SAFE_CLASSIFICATION_INPUT) from exc
         number = row["source_question_no"]
+        try:
+            overlay_prior = validated_official_answer_overlay(connection, item)
+        except Exception as exc:
+            raise KnowledgeClassificationRunError(SAFE_CLASSIFICATION_INPUT) from exc
         valid_human = bool(
             row["approval_source"] == "human"
             and reviewed.tzinfo is not None and reviewed.utcoffset() is not None
@@ -419,6 +473,15 @@ def _authoritative_input(
             "source_question_no": row["source_question_no"],
             "approved_draft_version": row["version"],
             "edited_sha256": _digest(edited),
+            "classification_scope_sha256": classification_scope_sha256(edited),
+            # Answer-only overlays retain classification binding to the prior draft.
+            "classification_binding_version": (
+                overlay_prior["version"] if overlay_prior is not None else row["version"]
+            ),
+            "classification_binding_edited_sha256": (
+                _digest(_decode_object(overlay_prior["edited_json"]))
+                if overlay_prior is not None else _digest(edited)
+            ),
             "approval_source": row["approval_source"],
             "approval_evidence_sha256": hashlib.sha256(
                 row["approval_evidence_json"].encode("utf-8")
@@ -428,10 +491,13 @@ def _authoritative_input(
     taxonomy, taxonomy_digest = _taxonomy(connection)
     input_digest = _digest({
         "job_id": job_id, "candidate_sha256": anchors[0], "audit_sha256": anchors[2],
-        "drafts": [{key: item[key] for key in (
-            "source_question_no", "approved_draft_version", "edited_sha256",
-            "approval_source", "approval_evidence_sha256",
-        )} for item in prepared],
+        "drafts": [{
+            "source_question_no": item["source_question_no"],
+            "approved_draft_version": item["classification_binding_version"],
+            "edited_sha256": item["classification_binding_edited_sha256"],
+            "approval_source": item["approval_source"],
+            "approval_evidence_sha256": item["approval_evidence_sha256"],
+        } for item in prepared],
         "taxonomy_digest": taxonomy_digest,
     })
     return tuple(prepared), taxonomy, input_digest, taxonomy_digest
@@ -690,6 +756,412 @@ def _recover_stale_replacement(connection, private_root, job_id, row):
     ).fetchone()
 
 
+def _write_archive_file(directory_fd: int, name: str, content: bytes) -> None:
+    descriptor = os.open(
+        name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600, dir_fd=directory_fd,
+    )
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short archive write")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _canonical_archive_bytes(value: object) -> bytes:
+    return (_canonical(value) + "\n").encode("utf-8")
+
+
+def _classification_generation_rows(connection, job_id):
+    run = connection.execute(
+        "SELECT * FROM import_knowledge_classification_runs WHERE import_job_id=?",
+        (job_id,),
+    ).fetchone()
+    drafts = [dict(row) for row in connection.execute(
+        "SELECT * FROM candidate_knowledge_classification_drafts "
+        "WHERE import_job_id=? ORDER BY CAST(source_question_no AS INTEGER)",
+        (job_id,),
+    )]
+    evidence = [dict(row) for row in connection.execute(
+        "SELECT * FROM candidate_knowledge_classifications "
+        "WHERE import_job_id=? ORDER BY CAST(source_question_no AS INTEGER)",
+        (job_id,),
+    )]
+    return (dict(run) if run is not None else None), drafts, evidence
+
+
+def _validate_complete_classification_generation(
+    run, drafts, evidence, expected_numbers, *, require_final_evidence,
+) -> None:
+    if run is None:
+        if drafts or evidence:
+            _fail(SAFE_CLASSIFICATION_STORAGE)
+        return
+    numbers = set(expected_numbers)
+    draft_numbers = {row.get("source_question_no") for row in drafts}
+    evidence_numbers = {row.get("source_question_no") for row in evidence}
+    if (
+        run.get("status") != "completed"
+        or run.get("question_count") != len(numbers)
+        or run.get("processed_questions") != len(numbers)
+        or not isinstance(run.get("output_sha256"), str)
+        or not isinstance(run.get("output_byte_size"), int)
+        or len(drafts) != len(numbers) or draft_numbers != numbers
+        or len(draft_numbers) != len(drafts)
+        or (evidence and (len(evidence) != len(numbers) or evidence_numbers != numbers))
+        or (require_final_evidence and len(evidence) != len(numbers))
+        or (run.get("applied_at") is not None and len(evidence) != len(numbers))
+    ):
+        _fail(SAFE_CLASSIFICATION_STORAGE)
+    by_number = {row["source_question_no"]: row for row in drafts}
+    evidence_hashes = {row.get("evidence_sha256") for row in evidence}
+    classifier_runs = {row.get("classifier_run_id") for row in evidence}
+    if evidence and (
+        len(evidence_hashes) != 1
+        or any(
+            not isinstance(value, str) or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in evidence_hashes
+        )
+        or len(classifier_runs) != 1
+        or any(
+            not isinstance(value, str) or not value or len(value) > 200
+            for value in classifier_runs
+        )
+    ):
+        _fail(SAFE_CLASSIFICATION_STORAGE)
+    for row in evidence:
+        draft = by_number[row["source_question_no"]]
+        if (
+            row.get("approved_draft_version") != draft.get("approved_draft_version")
+            or row.get("edited_sha256") != draft.get("edited_sha256")
+        ):
+            _fail(SAFE_CLASSIFICATION_STORAGE)
+
+
+def _archive_and_clear_classification_generation(
+    connection, private_root: Path, job_id: int, expected_numbers,
+    *, require_final_evidence: bool,
+) -> _ArchivedClassificationGeneration | None:
+    run, drafts, evidence = _classification_generation_rows(connection, job_id)
+    _validate_complete_classification_generation(
+        run, drafts, evidence, expected_numbers,
+        require_final_evidence=require_final_evidence,
+    )
+    if run is None:
+        return None
+    trusted_job = _open_trusted_job_directory(private_root, job_id)
+    archive_fd = stage_fd = None
+    stage_name = final_name = None
+    moved = False
+    files = (
+        "run.json", "drafts.json", "final_evidence.json",
+        "knowledge_classification.json", "manifest.json",
+    )
+    try:
+        artifact = _read_bounded(
+            "knowledge_classification.json", MAX_MODEL_OUTPUT_BYTES,
+            directory_fd=trusted_job.job_fd,
+        )
+        if (
+            len(artifact) != run["output_byte_size"]
+            or hashlib.sha256(artifact).hexdigest() != run["output_sha256"]
+        ):
+            _fail(SAFE_CLASSIFICATION_STORAGE)
+        trusted_job.verify()
+        try:
+            os.mkdir("knowledge_classification_archive", 0o700, dir_fd=trusted_job.job_fd)
+        except FileExistsError:
+            pass
+        archive_fd = os.open(
+            "knowledge_classification_archive",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=trusted_job.job_fd,
+        )
+        archive_metadata = os.fstat(archive_fd)
+        if not stat.S_ISDIR(archive_metadata.st_mode) or archive_metadata.st_nlink < 2:
+            _fail(SAFE_CLASSIFICATION_STORAGE)
+        os.fchmod(archive_fd, 0o700)
+        token = secrets.token_hex(16)
+        stage_name = f".generation-{token}.tmp"
+        final_name = f"generation-{_now().replace(':', '').replace('+', '_')}-{token}"
+        os.mkdir(stage_name, 0o700, dir_fd=archive_fd)
+        stage_fd = os.open(
+            stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=archive_fd,
+        )
+        payloads = {
+            "run.json": _canonical_archive_bytes(run),
+            "drafts.json": _canonical_archive_bytes(drafts),
+            "final_evidence.json": _canonical_archive_bytes(evidence),
+        }
+        for name, content in payloads.items():
+            _write_archive_file(stage_fd, name, content)
+        os.replace(
+            "knowledge_classification.json", "knowledge_classification.json",
+            src_dir_fd=trusted_job.job_fd, dst_dir_fd=stage_fd,
+        )
+        moved = True
+        moved_fd = os.open(
+            "knowledge_classification.json", os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=stage_fd,
+        )
+        try:
+            os.fchmod(moved_fd, 0o600)
+            os.fsync(moved_fd)
+        finally:
+            os.close(moved_fd)
+        artifacts = {
+            name: {
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "byte_size": len(content),
+            }
+            for name, content in payloads.items()
+        }
+        artifacts["knowledge_classification.json"] = {
+            "sha256": run["output_sha256"], "byte_size": run["output_byte_size"],
+        }
+        manifest = _canonical_archive_bytes({
+            "version": 1, "import_job_id": job_id,
+            "question_count": len(expected_numbers), "artifacts": artifacts,
+        })
+        _write_archive_file(stage_fd, "manifest.json", manifest)
+        os.fsync(stage_fd)
+        os.close(stage_fd)
+        stage_fd = None
+        os.replace(stage_name, final_name, src_dir_fd=archive_fd, dst_dir_fd=archive_fd)
+        stage_name = None
+        os.fsync(archive_fd)
+        authorization = secrets.token_hex(32)
+        connection.execute(
+            "INSERT INTO knowledge_classification_archival_authorizations "
+            "(import_job_id,authorization_token,created_at) VALUES(?,?,?)",
+            (job_id, authorization, _now()),
+        )
+        connection.execute(
+            "DELETE FROM knowledge_classification_replacement_snapshots WHERE import_job_id=?",
+            (job_id,),
+        )
+        connection.execute(
+            "DELETE FROM candidate_knowledge_classifications WHERE import_job_id=?", (job_id,)
+        )
+        connection.execute(
+            "DELETE FROM candidate_knowledge_classification_drafts WHERE import_job_id=?",
+            (job_id,),
+        )
+        connection.execute(
+            "DELETE FROM import_knowledge_classification_runs WHERE import_job_id=?", (job_id,)
+        )
+        connection.execute(
+            "DELETE FROM knowledge_classification_archival_authorizations WHERE import_job_id=?",
+            (job_id,),
+        )
+        return _ArchivedClassificationGeneration(
+            trusted_job, archive_fd, final_name, files
+        )
+    except Exception as exc:
+        if final_name is not None and stage_name is None and archive_fd is not None:
+            _ArchivedClassificationGeneration(
+                trusted_job, archive_fd, final_name, files
+            ).rollback()
+            archive_fd = None
+            trusted_job = None
+        if stage_fd is not None:
+            if moved:
+                try:
+                    os.replace(
+                        "knowledge_classification.json", "knowledge_classification.json",
+                        src_dir_fd=stage_fd, dst_dir_fd=trusted_job.job_fd,
+                    )
+                except OSError:
+                    pass
+            for name in files:
+                try:
+                    os.unlink(name, dir_fd=stage_fd)
+                except OSError:
+                    pass
+            os.close(stage_fd)
+        if stage_name is not None and archive_fd is not None:
+            try:
+                os.rmdir(stage_name, dir_fd=archive_fd)
+            except OSError:
+                pass
+        if archive_fd is not None:
+            os.close(archive_fd)
+        if trusted_job is not None:
+            trusted_job.close()
+        if isinstance(exc, KnowledgeClassificationRunError):
+            raise
+        raise KnowledgeClassificationRunError(SAFE_CLASSIFICATION_STORAGE) from exc
+
+
+def _official_answers_fully_bound(connection, job_id: int):
+    source = connection.execute(
+        "SELECT * FROM import_answer_sources WHERE import_job_id=?", (job_id,)
+    ).fetchone()
+    if (
+        source is None or source["source_answer_state"] != "source_answer_linked"
+        or source["applied_at"] is None
+        or connection.execute(
+            "SELECT 1 FROM question_sources WHERE import_job_id=? LIMIT 1", (job_id,)
+        ).fetchone()
+    ):
+        _fail(SAFE_OFFICIAL_ANSWER_BINDING)
+    expected_count = source["expected_question_count"]
+    drafts = [dict(row) for row in connection.execute(
+        "SELECT * FROM candidate_review_drafts WHERE import_job_id=? AND deleted_at IS NULL",
+        (job_id,),
+    )]
+    answers = [dict(row) for row in connection.execute(
+        "SELECT * FROM candidate_official_answers WHERE import_job_id=?", (job_id,)
+    )]
+    reviews = [dict(row) for row in connection.execute(
+        "SELECT * FROM candidate_official_answer_reviews WHERE import_job_id=?", (job_id,)
+    )]
+    extraction = connection.execute(
+        "SELECT * FROM import_answer_extraction_runs WHERE import_job_id=?", (job_id,)
+    ).fetchone()
+    review_run = connection.execute(
+        "SELECT * FROM import_answer_review_runs WHERE import_job_id=?", (job_id,)
+    ).fetchone()
+    numbers = {row["source_question_no"] for row in drafts}
+    if (
+        expected_count <= 0 or len(drafts) != expected_count or len(numbers) != expected_count
+        or len(answers) != expected_count or {row["source_question_no"] for row in answers} != numbers
+        or len(reviews) != expected_count or {row["source_question_no"] for row in reviews} != numbers
+        or extraction is None or extraction["status"] != "completed"
+        or extraction["question_count"] != expected_count
+        or review_run is None or review_run["status"] != "completed"
+        or review_run["question_count"] != expected_count
+        or review_run["extraction_artifact_sha256"] != extraction["output_sha256"]
+        or extraction["candidate_sha256"] != source["candidate_sha256"]
+        or extraction["draft_batch_sha256"] != source["draft_batch_sha256"]
+        or review_run["candidate_sha256"] != source["candidate_sha256"]
+        or review_run["draft_batch_sha256"] != source["draft_batch_sha256"]
+        or review_run["answer_pages_sha256"] != extraction["answer_pages_sha256"]
+    ):
+        _fail(SAFE_OFFICIAL_ANSWER_BINDING)
+    answer_by_number = {row["source_question_no"]: row for row in answers}
+    review_by_number = {row["source_question_no"]: row for row in reviews}
+    bindings = {}
+    for draft in drafts:
+        number = draft["source_question_no"]
+        answer = answer_by_number[number]
+        review = review_by_number[number]
+        try:
+            edited = json.loads(draft["edited_json"])
+            subanswers = json.loads(answer["subquestions_json"])
+            source_pages = json.loads(answer["source_pages_json"])
+        except (TypeError, json.JSONDecodeError):
+            _fail(SAFE_OFFICIAL_ANSWER_BINDING)
+        answer_payload = {
+            "source_question_no": number, "content_kind": answer["content_kind"],
+            "answer_markdown": answer["answer_markdown"],
+            "analysis_markdown": answer["analysis_markdown"],
+            "subquestions": subanswers, "source_pages": source_pages,
+        }
+        answer_analysis_payload = {
+            "source_question_no": number,
+            "answer_markdown": edited.get("answer_markdown", ""),
+            "analysis_markdown": edited.get("analysis_markdown", ""),
+            "subquestions": [{
+                "label": item.get("label", ""),
+                "stem_markdown": item.get("stem_markdown", ""),
+                "answer_markdown": item.get("answer_markdown", ""),
+                "analysis_markdown": item.get("analysis_markdown", ""),
+            } for item in edited.get("subquestions", [])],
+        }
+        if (
+            draft["status"] != "approved"
+            or draft["approval_source"] not in {"human", "ai_second_pass"}
+            or not draft["reviewed_at"] or not draft["approval_evidence_json"]
+            or answer["candidate_sha256"] != extraction["candidate_sha256"]
+            or answer["draft_batch_sha256"] != extraction["draft_batch_sha256"]
+            or answer["extraction_artifact_sha256"] != extraction["output_sha256"]
+            or review["decision"] != "passed"
+            or review["answer_content_sha256"] != answer["content_sha256"]
+            or answer["content_sha256"] != _digest(answer_payload)
+            or review["answer_analysis_sha256"] != _digest(answer_analysis_payload)
+            or review["extraction_artifact_sha256"] != extraction["output_sha256"]
+            or review["answer_pages_sha256"] != extraction["answer_pages_sha256"]
+            or review["source_pages_json"] != answer["source_pages_json"]
+            or review["source_page_hashes_json"] != answer["source_page_hashes_json"]
+            or edited.get("answer_markdown", "") != answer["answer_markdown"]
+            or edited.get("analysis_markdown", "") != answer["analysis_markdown"]
+            or len(edited.get("subquestions", [])) != len(subanswers)
+            or any(
+                target.get("label") != official.get("label")
+                or target.get("answer_markdown", "") != official.get("answer_markdown", "")
+                or target.get("analysis_markdown", "") != official.get("analysis_markdown", "")
+                for target, official in zip(edited.get("subquestions", []), subanswers)
+            )
+        ):
+            _fail(SAFE_OFFICIAL_ANSWER_BINDING)
+        bindings[number] = (draft["version"], _digest(edited))
+    return numbers, bindings
+
+
+def repair_stale_knowledge_classification_after_official_answers(
+    database_path: str | Path, private_root: str | Path, job_id: int,
+) -> int:
+    """Archive and clear the fully stale applied classification generation."""
+    if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id <= 0:
+        _fail()
+    archived = None
+    committed = False
+    try:
+        with closing(sqlite3.connect(Path(database_path), timeout=10)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("BEGIN IMMEDIATE")
+            numbers, current = _official_answers_fully_bound(connection, job_id)
+            authoritative, _, _, _ = _authoritative_input(
+                connection, Path(private_root), job_id
+            )
+            authoritative_bindings = {
+                row["source_question_no"]: (
+                    row["approved_draft_version"], row["edited_sha256"]
+                ) for row in authoritative
+            }
+            if authoritative_bindings != current:
+                _fail()
+            run, drafts, evidence = _classification_generation_rows(connection, job_id)
+            if run is None and not drafts and not evidence:
+                connection.commit()
+                return 0
+            _validate_complete_classification_generation(
+                run, drafts, evidence, numbers, require_final_evidence=True,
+            )
+            if run.get("applied_at") is None:
+                _fail()
+            old = {
+                row["source_question_no"]: (
+                    row["approved_draft_version"], row["edited_sha256"]
+                ) for row in drafts
+            }
+            if set(old) != numbers or any(old[number] == current[number] for number in numbers):
+                _fail()
+            archived = _archive_and_clear_classification_generation(
+                connection, Path(private_root), job_id, numbers,
+                require_final_evidence=True,
+            )
+            connection.commit()
+            committed = True
+        archived.finalize()
+        return 1
+    except Exception as exc:
+        if archived is not None and not committed:
+            archived.rollback()
+        if isinstance(exc, KnowledgeClassificationRunError):
+            raise
+        raise KnowledgeClassificationRunError(SAFE_CLASSIFICATION_STORAGE) from exc
+
+
 def claim_knowledge_classification(
     database_path: str | Path, private_root: str | Path, job_id: int,
     *, runner=None, replace_unapplied: bool = False,
@@ -742,9 +1214,44 @@ def claim_knowledge_classification(
                     if not replace_unapplied:
                         connection.commit()
                         return None
+                    old_drafts = connection.execute(
+                        """SELECT source_question_no,approved_draft_version,
+                                  edited_sha256
+                           FROM candidate_knowledge_classification_drafts
+                           WHERE import_job_id=?""",
+                        (job_id,),
+                    ).fetchall()
+                    expected = {
+                        item["source_question_no"]: (
+                            item["approved_draft_version"],
+                            item["edited_sha256"],
+                        )
+                        for item in questions
+                    }
+                    old_generation_complete = (
+                        len(old_drafts) == len(expected)
+                        and {
+                            draft["source_question_no"] for draft in old_drafts
+                        } == set(expected)
+                    )
+                    fully_invalidated = (
+                        row["input_digest"] != input_digest
+                        and (
+                            not old_drafts
+                            or (
+                                old_generation_complete
+                                and all(
+                                    (
+                                        draft["approved_draft_version"],
+                                        draft["edited_sha256"],
+                                    ) != expected[draft["source_question_no"]]
+                                    for draft in old_drafts
+                                )
+                            )
+                        )
+                    )
                     if (
                         job["status"] == "completed"
-                        or row["input_digest"] != input_digest
                         or row["taxonomy_digest"] != taxonomy_digest
                         or row["question_count"] != len(questions)
                         or not row["output_sha256"]
@@ -757,22 +1264,9 @@ def claim_knowledge_classification(
                     ):
                         connection.commit()
                         return None
-                    expected = {
-                        item["source_question_no"]: (
-                            item["approved_draft_version"],
-                            item["edited_sha256"],
-                        )
-                        for item in questions
-                    }
-                    old_drafts = connection.execute(
-                        """SELECT source_question_no,approved_draft_version,
-                                  edited_sha256
-                           FROM candidate_knowledge_classification_drafts
-                           WHERE import_job_id=?""",
-                        (job_id,),
-                    ).fetchall()
-                    if (
-                        len(old_drafts) != len(expected)
+                    if not fully_invalidated and (
+                        row["input_digest"] != input_digest
+                        or len(old_drafts) != len(expected)
                         or {
                             draft["source_question_no"] for draft in old_drafts
                         } != set(expected)
@@ -860,7 +1354,8 @@ def claim_knowledge_classification(
                      input_digest=excluded.input_digest,taxonomy_digest=excluded.taxonomy_digest,
                      output_sha256=NULL,output_byte_size=NULL,error_message=NULL,
                      claim_token=excluded.claim_token,started_at=excluded.started_at,
-                     completed_at=NULL,updated_at=excluded.updated_at,stage='waiting',
+                     completed_at=NULL,applied_at=NULL,
+                     updated_at=excluded.updated_at,stage='waiting',
                      replacement_active=0""",
                 (job_id, len(questions), MODEL, input_digest, taxonomy_digest,
                  token, timestamp, timestamp),
@@ -1350,6 +1845,7 @@ def run_claimed_knowledge_classification(claim: ClassificationClaim) -> None:
                 "source_question_no": number,
                 "approved_draft_version": source["approved_draft_version"],
                 "edited_sha256": source["edited_sha256"],
+                "classification_scope_sha256": source["classification_scope_sha256"],
                 "level2": level2[number],
                 "proposal": first, "verifier": second, "adjudicator": third,
                 "final_primary_code": final["primary_code"],
@@ -1418,16 +1914,18 @@ def run_claimed_knowledge_classification(claim: ClassificationClaim) -> None:
                 connection.execute(
                     """INSERT INTO candidate_knowledge_classification_drafts
                        (import_job_id,source_question_no,approved_draft_version,edited_sha256,
+                        classification_scope_sha256,
                         proposal_primary_code,proposal_related_codes_json,proposal_confidence,
                         proposal_reason,verifier_primary_code,verifier_related_codes_json,
                         verifier_confidence,verifier_reason,adjudicator_primary_code,
                         adjudicator_related_codes_json,adjudicator_confidence,
                         adjudicator_reason,final_primary_code,final_related_codes_json,
                         final_reason,status,approval_source,reviewed_at,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         claim.job_id, item["source_question_no"], item["approved_draft_version"],
-                        item["edited_sha256"], item["proposal"]["primary_code"],
+                        item["edited_sha256"], item["classification_scope_sha256"],
+                        item["proposal"]["primary_code"],
                         _canonical(item["proposal"]["related_codes"]), item["proposal"]["confidence"],
                         item["proposal"]["reason"], item["verifier"]["primary_code"],
                         _canonical(item["verifier"]["related_codes"]), item["verifier"]["confidence"],
@@ -1541,12 +2039,29 @@ def _artifact_level3_matches_database(row, artifact, prefix):
     )
 
 
-def _validate_draft_provenance(row, artifact):
+def _validate_draft_provenance(connection, row, artifact):
     if (
         artifact.get("approved_draft_version") != row["approved_draft_version"]
         or artifact.get("edited_sha256") != row["edited_sha256"]
     ):
-        _fail()
+        overlay = connection.execute(
+            """SELECT prior_draft_version,prior_edited_sha256,
+                      new_draft_version,new_edited_sha256,
+                      classification_scope_after_sha256
+               FROM candidate_official_answer_overlays
+               WHERE import_job_id=? AND source_question_no=?""",
+            (row["import_job_id"], row["source_question_no"]),
+        ).fetchone()
+        if (
+            overlay is None
+            or row["approved_draft_version"] != overlay["new_draft_version"]
+            or row["edited_sha256"] != overlay["new_edited_sha256"]
+            or row.get("classification_scope_sha256")
+                != overlay["classification_scope_after_sha256"]
+            or artifact.get("approved_draft_version") != overlay["prior_draft_version"]
+            or artifact.get("edited_sha256") != overlay["prior_edited_sha256"]
+        ):
+            _fail()
     source = row["approval_source"]
     if source == "human":
         if (
@@ -1862,7 +2377,7 @@ def apply_classification_evidence(
                 _fail()
             for row in rows:
                 _validate_draft_provenance(
-                    row, artifacts[row["source_question_no"]]
+                    connection, row, artifacts[row["source_question_no"]]
                 )
             sources = {row["approval_source"] for row in rows}
             source_classifier = (

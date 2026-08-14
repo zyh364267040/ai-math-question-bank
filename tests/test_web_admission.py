@@ -931,6 +931,43 @@ class WebAdmissionTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM question_sources WHERE import_job_id=1"
             ).fetchone()[0])
 
+    def test_completed_harvest_failure_is_best_effort(self):
+        self._approve_and_classify_all()
+        harvest = mock.Mock(side_effect=OSError("injected learning write failure"))
+
+        with self.assertLogs("src.importing.web_admission", level="ERROR") as logs:
+            self.assertEqual(
+                "completed",
+                apply_web_admission(self.db, self.private, 1, harvest_fn=harvest),
+            )
+
+        harvest.assert_called_once_with(self.db, self.private, 1)
+        self.assertIn("correction sample harvest failed", "\n".join(logs.output))
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual("completed", connection.execute(
+                "SELECT status FROM import_jobs WHERE id=1"
+            ).fetchone()[0])
+            self.assertEqual(("completed", "completed"), connection.execute(
+                "SELECT status,stage FROM import_web_admission_runs WHERE import_job_id=1"
+            ).fetchone())
+
+    def test_harvest_runs_once_only_for_this_completion_transition(self):
+        self._approve_and_classify_all()
+        harvest = mock.Mock()
+
+        self.assertEqual(
+            "completed",
+            apply_web_admission(self.db, self.private, 1, harvest_fn=harvest),
+        )
+        harvest.assert_called_once_with(self.db, self.private, 1)
+
+        harvest.reset_mock()
+        self.assertEqual(
+            "completed",
+            apply_web_admission(self.db, self.private, 1, harvest_fn=harvest),
+        )
+        harvest.assert_not_called()
+
     def test_completed_shortcuts_require_one_exact_coordinated_batch(self):
         self._approve_and_classify_all()
         self.assertEqual("completed", apply_web_admission(self.db, self.private, 1))

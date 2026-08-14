@@ -633,5 +633,238 @@ class DatabaseSchemaTests(unittest.TestCase):
             )
 
 
+    def test_initializer_repairs_stale_replacement_snapshot_foreign_key_and_preserves_rows(self):
+        source_id = self.connection.execute(
+            """INSERT INTO source_papers
+               (sha256,file_size,original_filename,stored_path,region_code,
+                exam_type_code,paper_name)
+               VALUES(?,1,'legacy.pdf','raw_papers/TJ/legacy.pdf','TJ','GK','迁移测试卷')""",
+            ("f" * 64,),
+        ).lastrowid
+        self.connection.execute(
+            "INSERT INTO import_jobs(id,source_paper_id,status) VALUES(99,?,'pending')",
+            (source_id,),
+        )
+        self.connection.execute(
+            "INSERT INTO import_knowledge_classification_runs(import_job_id,status) "
+            "VALUES(99,'pending')"
+        )
+        self.connection.commit()
+        self.connection.close()
+
+        legacy = sqlite3.connect(self.db_path)
+        legacy.execute("PRAGMA foreign_keys=OFF")
+        legacy.execute("DROP TABLE knowledge_classification_replacement_snapshots")
+        legacy.execute("""
+            CREATE TABLE knowledge_classification_replacement_snapshots (
+                import_job_id INTEGER PRIMARY KEY
+                    REFERENCES import_knowledge_classification_runs__migration_old(import_job_id)
+                    ON DELETE RESTRICT,
+                claim_token TEXT NOT NULL UNIQUE,
+                run_snapshot_json TEXT NOT NULL,
+                drafts_snapshot_json TEXT NOT NULL,
+                output_sha256 TEXT NOT NULL,
+                output_byte_size INTEGER NOT NULL,
+                backup_name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        legacy.execute(
+            """INSERT INTO knowledge_classification_replacement_snapshots
+               VALUES(99,?,?,?,?,?,?,?)""",
+            ("a" * 64, '{"status":"completed"}', '[]', "b" * 64, 12,
+             '.classification-legacy.bak', '2026-08-09T00:00:00+00:00'),
+        )
+        legacy.commit()
+        legacy.close()
+
+        self.connection = initialize_database(self.db_path)
+        self.assertEqual(
+            "import_knowledge_classification_runs",
+            self.connection.execute(
+                "PRAGMA foreign_key_list(knowledge_classification_replacement_snapshots)"
+            ).fetchone()[2],
+        )
+        self.assertEqual(
+            (99, "a" * 64, '.classification-legacy.bak'),
+            self.connection.execute(
+                """SELECT import_job_id,claim_token,backup_name
+                   FROM knowledge_classification_replacement_snapshots"""
+            ).fetchone(),
+        )
+        self.assertEqual([], self.connection.execute("PRAGMA foreign_key_check").fetchall())
+        self.connection.close()
+        self.connection = initialize_database(self.db_path)
+        self.assertEqual(1, self.connection.execute(
+            "SELECT COUNT(*) FROM knowledge_classification_replacement_snapshots"
+        ).fetchone()[0])
+
+    def test_initializer_migrates_legacy_classification_evidence_and_overlay_schema_idempotently(self):
+        source_id = self.connection.execute(
+            """INSERT INTO source_papers
+               (sha256,file_size,original_filename,stored_path,region_code,
+                exam_type_code,paper_name)
+               VALUES(?,1,'scope.pdf','raw_papers/TJ/scope.pdf','TJ','GK','scope迁移卷')""",
+            ("9" * 64,),
+        ).lastrowid
+        job_id = self.connection.execute(
+            "INSERT INTO import_jobs(source_paper_id,status) VALUES(?,'pending')",
+            (source_id,),
+        ).lastrowid
+        self.connection.execute(
+            """INSERT INTO candidate_knowledge_classifications
+               (import_job_id,source_question_no,approved_draft_version,
+                edited_sha256,primary_knowledge_point_code,
+                related_knowledge_point_codes_json,classifier,reviewer,
+                approval_source,classifier_run_id,evidence_sha256,reason,created_at)
+               VALUES(?,'1',1,?,'01.01.06','[]','legacy','legacy','human',?,?,
+                      '旧证据','2026-08-01T00:00:00+00:00')""",
+            (job_id, "a" * 64, "legacy-run", "b" * 64),
+        )
+        self.connection.commit()
+        self.connection.close()
+
+        legacy = sqlite3.connect(self.db_path)
+        legacy.execute("PRAGMA foreign_keys=OFF")
+        legacy.execute("DROP TRIGGER candidate_knowledge_classifications_immutable")
+        legacy.execute("DROP TRIGGER candidate_knowledge_classifications_delete_immutable")
+        columns = [
+            row[1] for row in legacy.execute(
+                "PRAGMA table_info(candidate_knowledge_classifications)"
+            ) if row[1] != "classification_scope_sha256"
+        ]
+        selected = ",".join(columns)
+        legacy.execute(
+            "ALTER TABLE candidate_knowledge_classifications RENAME TO legacy_scope_evidence"
+        )
+        legacy.execute(
+            f"CREATE TABLE candidate_knowledge_classifications AS "
+            f"SELECT {selected} FROM legacy_scope_evidence"
+        )
+        legacy.execute("DROP TABLE legacy_scope_evidence")
+        legacy.commit()
+        legacy.close()
+
+        self.connection = initialize_database(self.db_path)
+        columns = {
+            row[1] for row in self.connection.execute(
+                "PRAGMA table_info(candidate_knowledge_classifications)"
+            )
+        }
+        self.assertIn("classification_scope_sha256", columns)
+        self.assertEqual(
+            (job_id, "1", "a" * 64, None),
+            self.connection.execute(
+                """SELECT import_job_id,source_question_no,edited_sha256,
+                          classification_scope_sha256
+                   FROM candidate_knowledge_classifications"""
+            ).fetchone(),
+        )
+        self.assertEqual(
+            "candidate_review_drafts",
+            self.connection.execute(
+                "PRAGMA foreign_key_list(candidate_official_answer_overlays)"
+            ).fetchone()[2],
+        )
+        self.assertEqual([], self.connection.execute("PRAGMA foreign_key_check").fetchall())
+        self.connection.close()
+        self.connection = initialize_database(self.db_path)
+        self.assertEqual(1, self.connection.execute(
+            "SELECT count(*) FROM candidate_knowledge_classifications"
+        ).fetchone()[0])
+
+    def test_initializer_strengthens_draft_classification_scope_hash_check_safely(self):
+        source_id = self.connection.execute(
+            """INSERT INTO source_papers
+               (sha256,file_size,original_filename,stored_path,region_code,
+                exam_type_code,paper_name)
+               VALUES(?,1,'draft-scope.pdf','raw_papers/TJ/draft-scope.pdf',
+                      'TJ','GK','draft scope迁移卷')""",
+            ("8" * 64,),
+        ).lastrowid
+        job_id = self.connection.execute(
+            "INSERT INTO import_jobs(source_paper_id,status) VALUES(?,'pending')",
+            (source_id,),
+        ).lastrowid
+        self.connection.execute(
+            """INSERT INTO candidate_knowledge_classification_drafts
+               (import_job_id,source_question_no,approved_draft_version,
+                edited_sha256,classification_scope_sha256,proposal_primary_code,
+                proposal_related_codes_json,proposal_confidence,proposal_reason,
+                verifier_primary_code,verifier_related_codes_json,
+                verifier_confidence,verifier_reason,final_primary_code,
+                final_related_codes_json,status,created_at,updated_at)
+               VALUES(?,'1',1,?,?,'01.01.06','[]','high','旧初审',
+                      '01.01.06','[]','high','旧复核','01.01.06','[]','pending',?,?)""",
+            (job_id, "a" * 64, "b" * 64,
+             "2026-08-11T00:00:00+00:00", "2026-08-11T00:00:00+00:00"),
+        )
+        self.connection.commit()
+        self.connection.close()
+
+        legacy = sqlite3.connect(self.db_path)
+        legacy.execute("PRAGMA foreign_keys=OFF")
+        create_sql = legacy.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='candidate_knowledge_classification_drafts'"
+        ).fetchone()[0]
+        columns = [
+            row[1] for row in legacy.execute(
+                "PRAGMA table_info(candidate_knowledge_classification_drafts)"
+            )
+        ]
+        legacy.execute(
+            "ALTER TABLE candidate_knowledge_classification_drafts "
+            "RENAME TO candidate_knowledge_classification_drafts_old"
+        )
+        legacy.execute(create_sql.replace(
+            "classification_scope_sha256 IS NULL OR (\n"
+            "            length(classification_scope_sha256)=64\n"
+            "            AND classification_scope_sha256 NOT GLOB '*[^0-9a-f]*'\n"
+            "        )",
+            "classification_scope_sha256 IS NULL OR "
+            "length(classification_scope_sha256)=64",
+        ))
+        quoted = ",".join(f'"{column}"' for column in columns)
+        legacy.execute(
+            f"INSERT INTO candidate_knowledge_classification_drafts ({quoted}) "
+            f"SELECT {quoted} FROM candidate_knowledge_classification_drafts_old"
+        )
+        legacy.execute("DROP TABLE candidate_knowledge_classification_drafts_old")
+        legacy.commit()
+        legacy.close()
+
+        self.connection = initialize_database(self.db_path)
+        self.assertEqual(
+            (job_id, "1", "b" * 64),
+            self.connection.execute(
+                "SELECT import_job_id,source_question_no,classification_scope_sha256 "
+                "FROM candidate_knowledge_classification_drafts"
+            ).fetchone(),
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                "UPDATE candidate_knowledge_classification_drafts "
+                "SET classification_scope_sha256=?",
+                ("A" * 64,),
+            )
+        first_schema = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='candidate_knowledge_classification_drafts'"
+        ).fetchone()[0]
+        self.connection.close()
+        self.connection = initialize_database(self.db_path)
+        self.assertEqual(
+            first_schema,
+            self.connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='candidate_knowledge_classification_drafts'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(1, self.connection.execute(
+            "SELECT count(*) FROM candidate_knowledge_classification_drafts"
+        ).fetchone()[0])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -116,6 +116,32 @@ class AdmitQuestionsTests(unittest.TestCase):
                  crop_payload["signature"], hashlib.sha256(audit_raw).hexdigest(),
                     len(audit_raw)),
                 )
+                candidate_sha = hashlib.sha256(candidate_raw).hexdigest()
+                draft_batch_sha = hashlib.sha256(json.dumps({
+                    "version": 1,
+                    "import_job_id": 1,
+                    "questions": json.loads(candidate_raw)["questions"],
+                }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )).hexdigest()
+                con.execute(
+                    """INSERT INTO import_answer_sources
+                       (import_job_id,source_answer_state,candidate_sha256,
+                        expected_question_count,classification_evidence_sha256,
+                        draft_batch_sha256,created_at,updated_at)
+                       VALUES(1,'source_has_no_answer',?,?,?,?,
+                              '2026-07-16T00:00:00+00:00','2026-07-16T00:00:00+00:00')
+                       ON CONFLICT(import_job_id) DO UPDATE SET
+                         source_answer_state=excluded.source_answer_state,
+                         candidate_sha256=excluded.candidate_sha256,
+                         expected_question_count=excluded.expected_question_count,
+                         classification_evidence_sha256=excluded.classification_evidence_sha256,
+                         draft_batch_sha256=excluded.draft_batch_sha256,
+                         updated_at=excluded.updated_at""",
+                    (candidate_sha, question_count, hashlib.sha256(
+                        f"synthetic-no-answer:{candidate_sha}:{question_count}".encode()
+                    ).hexdigest(), draft_batch_sha),
+                )
         except sqlite3.OperationalError:
             pass
 
@@ -266,6 +292,30 @@ class AdmitQuestionsTests(unittest.TestCase):
         self.assertEqual(22, len(report.eligible))
         self.assertEqual(["12"], [item.question_no for item in report.ineligible])
         self.assertIn("human_required", report.ineligible[0].reasons)
+
+    def test_unclassified_or_unprocessed_official_answers_block_the_whole_batch(self):
+        with sqlite3.connect(self.db) as connection:
+            connection.execute("DELETE FROM import_answer_sources WHERE import_job_id=1")
+        report = assess_job(self.db, self.private, 1)
+        self.assertEqual(23, len(report.ineligible))
+        self.assertTrue(all(
+            "answer_source_unclassified" in item.reasons for item in report.ineligible
+        ))
+
+        self._anchor_batch_audit()
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                """UPDATE import_answer_sources
+                   SET source_answer_state='source_has_answer_unprocessed',
+                       answer_page_start=3,answer_page_end=4,
+                       render_manifest_sha256=? WHERE import_job_id=1""",
+                ("f" * 64,),
+            )
+        report = assess_job(self.db, self.private, 1)
+        self.assertEqual(23, len(report.ineligible))
+        self.assertTrue(all(
+            "source_answer_unprocessed" in item.reasons for item in report.ineligible
+        ))
 
     def test_strict_complete_batch_rejects_any_ineligible_before_inserting(self):
         with self.assertRaises(AdmissionError):
@@ -1721,7 +1771,8 @@ class AdmitQuestionsTests(unittest.TestCase):
                 """SELECT r.notes FROM question_reviews r JOIN questions q ON q.id=r.question_id
                    WHERE q.source_question_no='1' AND r.review_item='usability'"""
             ).fetchone()[0]
-        self.assertIn("原卷答案已通过审核", review_note)
+        self.assertIn("AI候选答案已审核", review_note)
+        self.assertIn("原卷未提供答案", review_note)
 
     def test_admits_subquestion_answer_and_analysis(self):
         candidate_path, candidate = self._json("candidate_questions.json")
@@ -1758,8 +1809,9 @@ class AdmitQuestionsTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(("$2$", "provided", "先化简，再求值。"), row)
         self.assertEqual(("missing", "not_applicable", "not_applicable"), parent_statuses)
-        self.assertNotIn("未提供答案", review_note)
-        self.assertIn("答案已通过审核", review_note)
+        self.assertIn("AI候选答案已审核", review_note)
+        self.assertIn("原卷未提供答案", review_note)
+        self.assertIn("AI候选答案已审核", review_note)
 
     def test_complete_batch_rejects_tampered_subquestion_score_atomically(self):
         self._approve_human_draft("12")

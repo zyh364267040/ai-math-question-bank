@@ -22,6 +22,7 @@ from src.processing.secure_crop_artifacts import (
     fsync_directory,
     load_hmac_key,
     locked_job,
+    open_directory_at,
     read_file_at,
     sign_manifest,
     validate_signed_manifest,
@@ -63,6 +64,10 @@ TRANSACTION_NAMES = {
 
 class CropReviewError(ValueError):
     """A safe, fail-closed crop review persistence failure."""
+
+
+class _FrozenReviewValidationError(Exception):
+    """An expected frozen-review evidence mismatch."""
 
 
 @dataclass(frozen=True)
@@ -202,6 +207,94 @@ def validate_current_crop_review(
         expected_output_signature=manifest["signature"],
         expected_questions=expected_questions,
     )
+
+
+def _validate_frozen_previous_crop_review(
+    database_path: Path, job_fd: int, key: bytes, manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Accept only a genuine previous review fully anchored by frozen crop rows."""
+    try:
+        snapshot = read_file_at(job_fd, REVIEW_NAME, max_bytes=MAX_REVIEW_BYTES)
+        raw = _parse_json(snapshot.data, "独立题图审核记录")
+        evidence = _validate_evidence(
+            raw, key,
+            expected_job_id=manifest["import_job_id"],
+            expected_generation_id=raw["input_generation_id"],
+            expected_output_sha256=raw["output_manifest_sha256"],
+            expected_output_signature=raw["output_manifest_signature"],
+        )
+        if (
+            evidence["input_generation_id"] == manifest["generation_id"]
+            or not HEX_64.fullmatch(evidence["output_manifest_sha256"])
+            or not HEX_64.fullmatch(evidence["output_manifest_signature"])
+        ):
+            raise _FrozenReviewValidationError
+        decisions = {item["question_no"]: item for item in evidence["questions"]}
+        current = {item["question_no"]: item for item in manifest["questions"]}
+        if set(decisions) != set(current):
+            raise _FrozenReviewValidationError
+        passed_numbers = {
+            number for number, decision in decisions.items()
+            if decision["status"] == "ai_review_passed"
+        }
+        if any(
+            current[number]["review_status"] not in (
+                {"ai_review_passed", "pending_ai_review"}
+                if number in passed_numbers else {"pending_ai_review"}
+            )
+            for number in current
+        ):
+            raise _FrozenReviewValidationError
+        expected_archive = f"frozen_crop_reviews/evidence_{snapshot.sha256}.json"
+        with closing(sqlite3.connect(database_path)) as connection:
+            rows = connection.execute(
+                """SELECT question_no,crop_sha256,manifest_entry_sha256,
+                          source_manifest_sha256,source_manifest_signature,
+                          review_evidence_sha256,review_evidence_signature,
+                          evidence_relative_path,reviewer
+                   FROM import_frozen_crop_reviews AS frozen
+                   WHERE frozen.import_job_id=? AND frozen.crop_generation_id=?""",
+                (manifest["import_job_id"], evidence["input_generation_id"]),
+            ).fetchall()
+        if {row[0] for row in rows} != passed_numbers or len(rows) != len(passed_numbers):
+            raise _FrozenReviewValidationError
+        for row in rows:
+            entry = current[row[0]]
+            entry_digest = hashlib.sha256(json.dumps(
+                entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest()
+            if (
+                not isinstance(row[1], str) or not HEX_64.fullmatch(row[1])
+                or not isinstance(row[2], str) or not HEX_64.fullmatch(row[2])
+                or row[3] != evidence["output_manifest_sha256"]
+                or row[4] != evidence["output_manifest_signature"]
+                or row[5] != snapshot.sha256
+                or row[6] != evidence["signature"]
+                or row[7] != expected_archive
+                or row[8] != evidence["reviewer_run_id"]
+            ):
+                raise _FrozenReviewValidationError
+            if entry["review_status"] == "ai_review_passed" and (
+                row[1] != entry["sha256"] or row[2] != entry_digest
+            ):
+                raise _FrozenReviewValidationError
+        archive_fd = open_directory_at(job_fd, "frozen_crop_reviews")
+        try:
+            archived = read_file_at(
+                archive_fd, f"evidence_{snapshot.sha256}.json",
+                max_bytes=MAX_REVIEW_BYTES,
+            )
+        finally:
+            os.close(archive_fd)
+        if archived.data != snapshot.data:
+            raise _FrozenReviewValidationError
+        return evidence
+    except (
+        KeyError, OSError, sqlite3.Error, ValueError,
+        _FrozenReviewValidationError,
+        SecureCropArtifactError,
+    ) as error:
+        raise CropReviewError("独立题图审核记录真实性校验失败") from error
 
 
 def load_current_crop_review(
@@ -499,9 +592,14 @@ def record_crop_ai_review(database_path: Any, private_root: Any, payload: Any) -
             try:
                 if not evidence_exists:
                     raise FileNotFoundError
-                evidence = validate_current_crop_review(
-                    lock.descriptor, key, manifest, manifest_snapshot.sha256,
-                )
+                try:
+                    evidence = validate_current_crop_review(
+                        lock.descriptor, key, manifest, manifest_snapshot.sha256,
+                    )
+                except CropReviewError:
+                    evidence = _validate_frozen_previous_crop_review(
+                        database_path, lock.descriptor, key, manifest,
+                    )
             except FileNotFoundError:
                 evidence = None
             if evidence is not None and evidence["request_sha256"] == request_digest:

@@ -16,6 +16,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
+from src.reviewing.candidate_review_ai import (
+    CandidateAuditError,
+    classification_scope_sha256,
+    validated_official_answer_overlay,
+)
+
 SAFE_CLASSIFICATION_ERROR = "知识点分类证据无效"
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
 NUMBER_PATTERN = re.compile(r"[1-9][0-9]{0,2}")
@@ -184,14 +190,15 @@ def adopt_knowledge_classifications_in_connection(
                 if primary not in valid_points or any(code not in valid_points for code in related):
                     _fail()
                 prepared.append((
-                    number, draft["version"], _canonical_sha(edited), primary,
+                    number, draft["version"], _canonical_sha(edited),
+                    classification_scope_sha256(edited), primary,
                     json.dumps(related, ensure_ascii=False, separators=(",", ":")),
                     item["reason"], item.get("reviewer", payload["reviewer"]),
                     item.get("approval_source"),
                 ))
             inserted = 0
             for (
-                number, version, edited_sha, primary, related_json, reason, reviewer,
+                number, version, edited_sha, scope_sha, primary, related_json, reason, reviewer,
                 approval_source,
             ) in prepared:
                 existing = connection.execute(
@@ -220,12 +227,13 @@ def adopt_knowledge_classifications_in_connection(
                 connection.execute(
                     """INSERT INTO candidate_knowledge_classifications
                        (import_job_id,source_question_no,approved_draft_version,
-                        edited_sha256,primary_knowledge_point_code,
+                        edited_sha256,classification_scope_sha256,
+                        primary_knowledge_point_code,
                         related_knowledge_point_codes_json,classifier,reviewer,
                         approval_source,classifier_run_id,evidence_sha256,reason,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        job_id, number, version, edited_sha, primary, related_json,
+                        job_id, number, version, edited_sha, scope_sha, primary, related_json,
                         payload["source_classifier"],
                         reviewer, approval_source,
                         classifier_run_id, evidence_sha, reason, now,
@@ -254,7 +262,8 @@ def load_bound_knowledge_classification(
         return None
     try:
         edited = json.loads(draft["edited_json"])
-    except (KeyError, TypeError, json.JSONDecodeError):
+        validated_official_answer_overlay(connection, draft)
+    except (CandidateAuditError, KeyError, TypeError, json.JSONDecodeError, sqlite3.Error):
         return None
     row = connection.execute(
         """SELECT * FROM candidate_knowledge_classifications
@@ -265,6 +274,11 @@ def load_bound_knowledge_classification(
     if row is None:
         return None
     row = dict(row)
+    if (
+        row.get("classification_scope_sha256") is not None
+        and row["classification_scope_sha256"] != classification_scope_sha256(edited)
+    ):
+        return None
     try:
         related = json.loads(row["related_knowledge_point_codes_json"])
     except (TypeError, json.JSONDecodeError):

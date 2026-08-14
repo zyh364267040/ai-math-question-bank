@@ -221,14 +221,18 @@ class CandidateAuditorTests(unittest.TestCase):
                 parse_candidate_audit_output(raw, self.job_id, self.candidate["questions"])
 
     def test_prompt_contains_untrusted_candidate_mapping_and_review_boundaries(self):
-        prompt = _audit_prompt(self.job_id, self.candidate["questions"])
+        questions = copy.deepcopy(self.candidate["questions"])
+        questions[0]["answer_markdown"] = "$3$"
+        prompt = _audit_prompt(self.job_id, questions)
         for phrase in (
             "不可信文本", "逐像素", "题号", "题干", "公式", "上下标", "选项",
             "公共条件", "小问", "必要配图", "裁切边界", "不得 auto_pass",
-            "不解题", "不分类知识点", "不检查答案", "warnings", "首个页面",
+            "不解题", "不分类知识点", "不检查答案", "答案或解析字段可能已由独立来源答案流程写入",
+            "审核时完全忽略答案与解析字段", "warnings", "首个页面",
             '"1":[1]', '"23":[4]', "合成候选题干 1",
         ):
             self.assertIn(phrase, prompt)
+        self.assertNotIn("当前答案为空", prompt)
 
     def test_cli_runner_is_ephemeral_read_only_bounded_and_whitelist_only(self):
         executable = self.root / "fake-codex"
@@ -453,6 +457,41 @@ class CandidateAuditorTests(unittest.TestCase):
                 )
             connection.commit()
 
+    def _complete_reextracted_audit(self):
+        candidate = copy.deepcopy(self.candidate)
+        candidate["questions"][16]["stem_markdown"] += " Q17重新裁图识别"
+        candidate["questions"][17]["stem_markdown"] += " Q18重新裁图识别"
+        raw = (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode()
+        candidate_path = self.job_dir / "candidate_questions.json"
+        candidate_path.write_bytes(raw)
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """UPDATE import_candidate_extraction_runs
+                   SET output_sha256=?,output_byte_size=? WHERE import_job_id=?""",
+                (hashlib.sha256(raw).hexdigest(), len(raw), self.job_id),
+            )
+            connection.commit()
+        self.candidate = candidate
+        self.audit = self._audit_payload()
+        self.audit["questions"][18].update(
+            audit_status="disputed", text_match=False,
+            audit_confidence="medium", issues=["Q19需要人工确认"],
+        )
+        self.audit["counts"] = {
+            "auto_pass": 22, "disputed": 1, "human_required": 0,
+        }
+        self.runner = FakeRunner(self.audit, run_id="audit-reextracted-2")
+        run_claimed_candidate_audit(claim_candidate_audit(
+            self.database, self.private, self.job_id, runner=self.runner,
+        ))
+        return hashlib.sha256(raw).hexdigest()
+
+    def _draft_rows(self):
+        with sqlite3.connect(self.database) as connection:
+            return connection.execute(
+                "SELECT * FROM candidate_review_drafts ORDER BY id"
+            ).fetchall()
+
     def _single_audit(self, edited, *, confidence="high", issues=None):
         issues = [] if issues is None else issues
         passed = confidence == "high" and not issues
@@ -521,6 +560,183 @@ class CandidateAuditorTests(unittest.TestCase):
         self.assertEqual("batch_auto_pass", evidence["method"])
         self.assertEqual(self.runner.run_id, evidence["audit_run_id"])
         self.assertEqual(64, len(evidence["audit_output_sha256"]))
+
+    def test_batch_auto_pass_replaces_wholly_machine_owned_stale_candidate_batch(self):
+        from src.reviewing.candidate_review_ai import apply_batch_auto_pass
+
+        for index in (20, 21, 22):
+            self.audit["questions"][index].update(
+                audit_status="disputed", text_match=False,
+                audit_confidence="medium", issues=["首批次待人工确认"],
+            )
+        self.audit["counts"] = {
+            "auto_pass": 20, "disputed": 3, "human_required": 0,
+        }
+        self.runner.payload = self.audit
+        self._complete_audit_and_seed_drafts()
+        first = apply_batch_auto_pass(self.database, self.private, self.job_id)
+        self.assertEqual((20, 20), (first.eligible, first.changed))
+        old_sha = hashlib.sha256(
+            (self.job_dir / "candidate_questions.json").read_bytes()
+        ).hexdigest()
+
+        new_sha = self._complete_reextracted_audit()
+        self.assertNotEqual(old_sha, new_sha)
+        second = apply_batch_auto_pass(self.database, self.private, self.job_id)
+
+        self.assertEqual((22, 22), (second.eligible, second.changed))
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT * FROM candidate_review_drafts ORDER BY CAST(source_question_no AS INTEGER)"
+            ).fetchall()
+        self.assertEqual([str(number) for number in range(1, 24)], [
+            row["source_question_no"] for row in rows
+        ])
+        self.assertEqual({new_sha}, {row["source_candidate_sha256"] for row in rows})
+        self.assertEqual(
+            ("pending", None), (rows[18]["status"], rows[18]["approval_source"])
+        )
+        for row, source in zip(rows, self.candidate["questions"], strict=True):
+            self.assertEqual(source, json.loads(row["source_snapshot_json"]))
+            self.assertEqual(source, json.loads(row["edited_json"]))
+            if row["source_question_no"] != "19":
+                self.assertEqual(
+                    ("approved", "ai_second_pass"),
+                    (row["status"], row["approval_source"]),
+                )
+
+    def test_stale_batch_replacement_rejects_tampered_machine_evidence_unchanged(self):
+        from src.reviewing.candidate_review_ai import apply_batch_auto_pass
+
+        self._complete_audit_and_seed_drafts()
+        apply_batch_auto_pass(self.database, self.private, self.job_id)
+        with sqlite3.connect(self.database) as connection:
+            evidence = json.loads(connection.execute(
+                "SELECT approval_evidence_json FROM candidate_review_drafts WHERE source_question_no='1'"
+            ).fetchone()[0])
+            evidence["audit_run_id"] = "tampered-run"
+            connection.execute(
+                "UPDATE candidate_review_drafts SET approval_evidence_json=? WHERE source_question_no='1'",
+                (json.dumps(evidence, ensure_ascii=False, separators=(",", ":")),),
+            )
+            connection.commit()
+        self._complete_reextracted_audit()
+        before = self._draft_rows()
+        with self.assertRaises(CandidateAuditError):
+            apply_batch_auto_pass(self.database, self.private, self.job_id)
+        self.assertEqual(before, self._draft_rows())
+
+    def test_stale_batch_replacement_rejects_human_edit_unchanged(self):
+        from src.reviewing.candidate_review_ai import apply_batch_auto_pass
+
+        self._complete_audit_and_seed_drafts()
+        apply_batch_auto_pass(self.database, self.private, self.job_id)
+        with sqlite3.connect(self.database) as connection:
+            edited = json.loads(connection.execute(
+                "SELECT edited_json FROM candidate_review_drafts WHERE source_question_no='2'"
+            ).fetchone()[0])
+            edited["stem_markdown"] += " 人工编辑"
+            connection.execute(
+                """UPDATE candidate_review_drafts
+                   SET edited_json=?,status='draft',version=3,reviewed_at=NULL,
+                       approval_source=NULL,approval_evidence_json=NULL,
+                       review_notes='人工核对过'
+                   WHERE source_question_no='2'""",
+                (json.dumps(edited, ensure_ascii=False, separators=(",", ":")),),
+            )
+            connection.commit()
+        self._complete_reextracted_audit()
+        before = self._draft_rows()
+        with self.assertRaises(CandidateAuditError):
+            apply_batch_auto_pass(self.database, self.private, self.job_id)
+        self.assertEqual(before, self._draft_rows())
+
+    def test_stale_batch_replacement_rejects_human_approval_unchanged(self):
+        from src.reviewing.candidate_review_ai import apply_batch_auto_pass
+
+        self._complete_audit_and_seed_drafts()
+        apply_batch_auto_pass(self.database, self.private, self.job_id)
+        reviewed_at = "2026-07-17T00:00:00+00:00"
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """UPDATE candidate_review_drafts
+                   SET status='approved',version=3,reviewed_at=?,approval_source='human',
+                       approval_evidence_json=? WHERE source_question_no='3'""",
+                (
+                    reviewed_at,
+                    json.dumps({"method": "workbench", "reviewed_at": reviewed_at}),
+                ),
+            )
+            connection.commit()
+        self._complete_reextracted_audit()
+        before = self._draft_rows()
+        with self.assertRaises(CandidateAuditError):
+            apply_batch_auto_pass(self.database, self.private, self.job_id)
+        self.assertEqual(before, self._draft_rows())
+
+    def test_stale_batch_replacement_rejects_deletion_unchanged(self):
+        from src.reviewing.candidate_review_ai import apply_batch_auto_pass
+
+        self._complete_audit_and_seed_drafts()
+        apply_batch_auto_pass(self.database, self.private, self.job_id)
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """UPDATE candidate_review_drafts
+                   SET deleted_at='2026-07-17T00:00:00+00:00',
+                       deletion_reason='unneeded',deletion_note='人工删除',version=3
+                   WHERE source_question_no='4'"""
+            )
+            connection.commit()
+        self._complete_reextracted_audit()
+        before = self._draft_rows()
+        with self.assertRaises(CandidateAuditError):
+            apply_batch_auto_pass(self.database, self.private, self.job_id)
+        self.assertEqual(before, self._draft_rows())
+
+    def test_stale_batch_replacement_rejects_existing_formal_question_unchanged(self):
+        from src.reviewing.candidate_review_ai import apply_batch_auto_pass
+
+        self._complete_audit_and_seed_drafts()
+        apply_batch_auto_pass(self.database, self.private, self.job_id)
+        with sqlite3.connect(self.database) as connection:
+            question_id = connection.execute(
+                """INSERT INTO questions
+                   (question_code,stem_markdown,region_code,exam_type_code,
+                    question_type_code,primary_knowledge_point_id,content_hash,
+                    answer_status)
+                   SELECT 'FORMAL-STALE-BATCH','已入库题','TJ','QT','solution',id,?,'missing'
+                   FROM knowledge_points LIMIT 1""",
+                ("f" * 64,),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO question_sources VALUES(?,?,?,?,?)",
+                (question_id, self.source_id, self.job_id, "1", "[1]"),
+            )
+            connection.commit()
+        self._complete_reextracted_audit()
+        before = self._draft_rows()
+        with self.assertRaises(CandidateAuditError):
+            apply_batch_auto_pass(self.database, self.private, self.job_id)
+        self.assertEqual(before, self._draft_rows())
+
+    def test_stale_batch_replacement_database_failure_rolls_back_old_rows(self):
+        from src.reviewing.candidate_review_ai import apply_batch_auto_pass
+
+        self._complete_audit_and_seed_drafts()
+        apply_batch_auto_pass(self.database, self.private, self.job_id)
+        self._complete_reextracted_audit()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """CREATE TRIGGER reject_stale_batch_insert
+                   BEFORE INSERT ON candidate_review_drafts
+                   BEGIN SELECT RAISE(ABORT, 'synthetic replacement failure'); END"""
+            )
+            connection.commit()
+        before = self._draft_rows()
+        with self.assertRaises(CandidateAuditError):
+            apply_batch_auto_pass(self.database, self.private, self.job_id)
+        self.assertEqual(before, self._draft_rows())
 
     def test_external_corrected_adopt_binds_exact_version_and_preserves_history(self):
         from src.reviewing.candidate_review_ai import adopt_corrected_draft_audit
@@ -596,6 +812,32 @@ class CandidateAuditorTests(unittest.TestCase):
                 reviewed_draft_version=2,
                 edited_sha256=evidence["edited_sha256"],
             )
+
+    def test_corrected_reaudit_can_run_after_official_answers_mark_job_needs_review(self):
+        from src.reviewing.candidate_review_ai import claim_corrected_draft_audit
+
+        self._complete_audit_and_seed_drafts()
+        with sqlite3.connect(self.database) as connection:
+            edited = json.loads(connection.execute(
+                "SELECT edited_json FROM candidate_review_drafts WHERE source_question_no='2'"
+            ).fetchone()[0])
+            edited["answer_markdown"] = "$3$"
+            connection.execute(
+                """UPDATE candidate_review_drafts SET edited_json=?,status='needs_fix',version=2,
+                   reviewed_at=NULL,approval_source=NULL,approval_evidence_json=NULL
+                   WHERE source_question_no='2'""",
+                (json.dumps(edited, ensure_ascii=False, separators=(",", ":")),),
+            )
+            connection.execute(
+                "UPDATE import_jobs SET status='needs_review' WHERE id=?", (self.job_id,)
+            )
+            connection.commit()
+        claim = claim_corrected_draft_audit(
+            self.database, self.private, self.job_id, "2",
+            runner=FakeRunner(self._single_audit(edited), run_id="answer-refresh-run"),
+        )
+        self.assertIsNotNone(claim)
+        claim.close()
 
     def test_corrected_nonpass_never_approves_and_new_version_can_retry(self):
         from src.reviewing.candidate_review_ai import (

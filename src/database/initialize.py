@@ -275,6 +275,67 @@ def _classification_schema_targets(schema):
     return tables, triggers
 
 
+def _schema_table_definition(schema, table):
+    for statement in _schema_statements(schema):
+        normalized = _normalize_schema_sql(statement)
+        words = normalized.split()
+        if words[:2] == ["create", "table"]:
+            name = words[2].split("(", 1)[0]
+            if name == table:
+                return statement[statement.lower().find("create "):]
+    raise sqlite3.OperationalError(f"missing schema table definition: {table}")
+
+
+def _capture_and_drop_table(connection, table):
+    quoted = _quote_catalog_identifier(table)
+    columns = [
+        row[1] for row in connection.execute(f"PRAGMA table_info({quoted})")
+    ]
+    rows = connection.execute(f"SELECT * FROM {quoted}").fetchall()
+    connection.execute(f"DROP TABLE {quoted}")
+    return columns, rows
+
+
+def _restore_table_rows(connection, table, snapshot):
+    columns, rows = snapshot
+    if not rows:
+        return
+    quoted = _quote_catalog_identifier(table)
+    current = {
+        row[1] for row in connection.execute(f"PRAGMA table_info({quoted})")
+    }
+    if not columns or any(column not in current for column in columns):
+        raise sqlite3.OperationalError(f"cannot restore migrated table: {table}")
+    names = ",".join(_quote_catalog_identifier(column) for column in columns)
+    placeholders = ",".join("?" for _ in columns)
+    connection.executemany(
+        f"INSERT INTO {quoted} ({names}) VALUES ({placeholders})", rows
+    )
+
+
+def _repair_classification_replacement_snapshot_table(connection, schema):
+    table = "knowledge_classification_replacement_snapshots"
+    actual = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    definition = _schema_table_definition(schema, table)
+    foreign_keys = connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+    correct_parent = any(
+        row[2] == "import_knowledge_classification_runs" for row in foreign_keys
+    )
+    if (
+        actual is not None
+        and _normalize_schema_sql(actual[0]) == _normalize_schema_sql(definition)
+        and correct_parent
+    ):
+        return False
+    snapshot = _capture_and_drop_table(connection, table) if actual is not None else None
+    connection.execute(definition)
+    if snapshot is not None:
+        _restore_table_rows(connection, table, snapshot)
+    return True
+
+
 def _restore_autoincrement_sequence(connection, table, prior_sequence):
     if prior_sequence is None:
         return
@@ -351,19 +412,40 @@ def _refresh_knowledge_classification_schema(connection, schema):
         )
     )
     if not mismatched_tables and triggers_match:
+        if _repair_classification_replacement_snapshot_table(connection, schema):
+            _execute_script_transactionally(connection, schema)
         return
     for name in actual_triggers:
         connection.execute(
             f"DROP TRIGGER {_quote_catalog_identifier(name)}"
         )
+    replacement_snapshot = None
+    replacement_table = "knowledge_classification_replacement_snapshots"
+    if (
+        "import_knowledge_classification_runs" in mismatched_tables
+        and connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (replacement_table,),
+        ).fetchone() is not None
+    ):
+        replacement_snapshot = _capture_and_drop_table(
+            connection, replacement_table
+        )
     for name in target_tables:
         if name in mismatched_tables:
             _rebuild_table_from_definition(connection, name, target_tables[name])
+    if replacement_snapshot is not None:
+        connection.execute(_schema_table_definition(schema, replacement_table))
+        _restore_table_rows(
+            connection, replacement_table, replacement_snapshot
+        )
     for definition in target_triggers.values():
         connection.execute(definition)
     # Rebuilding renames and drops the old indexes.  Re-running the canonical
     # schema recreates only missing indexes and is still inside the transaction.
     _execute_script_transactionally(connection, schema)
+    if _repair_classification_replacement_snapshot_table(connection, schema):
+        _execute_script_transactionally(connection, schema)
 
 
 def _refresh_web_admission_protection_triggers(connection, schema):
@@ -554,6 +636,16 @@ def _ensure_schema_migrations(connection):
             "('codex_double_pass','codex_adjudicated','local_double_pass','human') "
             "OR approval_source IS NULL)"
         )
+    if (
+        classification_evidence_columns
+        and "classification_scope_sha256" not in classification_evidence_columns
+    ):
+        connection.execute(
+            "ALTER TABLE candidate_knowledge_classifications ADD COLUMN "
+            "classification_scope_sha256 TEXT CHECK ("
+            "classification_scope_sha256 IS NULL OR "
+            "length(classification_scope_sha256)=64)"
+        )
     schema = SCHEMA_PATH.read_text(encoding="utf-8")
     _refresh_knowledge_classification_schema(connection, schema)
     web_admission_sql = connection.execute(
@@ -579,6 +671,24 @@ def _ensure_schema_migrations(connection):
             connection.execute(
                 f"ALTER TABLE import_web_admission_runs ADD COLUMN {name} "
                 f"TEXT CHECK ({name} IS NULL OR length({name})=64)"
+            )
+    for table in (
+        "import_answer_sources",
+        "import_answer_extraction_runs",
+        "candidate_official_answers",
+        "import_answer_review_runs",
+        "candidate_official_answer_reviews",
+    ):
+        answer_columns = {
+            row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if answer_columns and "draft_batch_sha256" not in answer_columns:
+            # Legacy official-answer rows cannot be truthfully backfilled: the
+            # draft may already have changed.  Runtime replacement is the only
+            # safe path for those NULL anchors.
+            connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN draft_batch_sha256 TEXT "
+                "CHECK (draft_batch_sha256 IS NULL OR length(draft_batch_sha256)=64)"
             )
     _refresh_web_admission_protection_triggers(connection, schema)
     connection.execute(

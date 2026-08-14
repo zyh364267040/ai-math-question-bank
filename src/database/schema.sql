@@ -642,6 +642,12 @@ CREATE TABLE IF NOT EXISTS candidate_knowledge_classifications (
     source_question_no TEXT NOT NULL CHECK (length(trim(source_question_no)) BETWEEN 1 AND 3),
     approved_draft_version INTEGER NOT NULL CHECK (approved_draft_version > 0),
     edited_sha256 TEXT NOT NULL CHECK (length(edited_sha256) = 64 AND edited_sha256 NOT GLOB '*[^0-9a-f]*'),
+    classification_scope_sha256 TEXT CHECK (
+        classification_scope_sha256 IS NULL OR (
+            length(classification_scope_sha256)=64
+            AND classification_scope_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
     primary_knowledge_point_code TEXT NOT NULL REFERENCES knowledge_points(code) ON DELETE RESTRICT,
     related_knowledge_point_codes_json TEXT NOT NULL,
     classifier TEXT NOT NULL CHECK (length(trim(classifier)) BETWEEN 1 AND 100),
@@ -663,12 +669,20 @@ ON candidate_knowledge_classifications(import_job_id, source_question_no, approv
 
 CREATE TRIGGER IF NOT EXISTS candidate_knowledge_classifications_immutable
 BEFORE UPDATE ON candidate_knowledge_classifications
+WHEN NOT EXISTS (
+    SELECT 1 FROM official_answer_overlay_authorizations a
+    WHERE a.import_job_id=OLD.import_job_id
+)
 BEGIN
     SELECT RAISE(ABORT, 'completed knowledge classification is immutable');
 END;
 
 CREATE TRIGGER IF NOT EXISTS candidate_knowledge_classifications_delete_immutable
 BEFORE DELETE ON candidate_knowledge_classifications
+WHEN NOT EXISTS (
+    SELECT 1 FROM knowledge_classification_archival_authorizations a
+    WHERE a.import_job_id=OLD.import_job_id
+)
 BEGIN
     SELECT RAISE(ABORT, 'completed knowledge classification is immutable');
 END;
@@ -729,6 +743,12 @@ CREATE TABLE IF NOT EXISTS candidate_knowledge_classification_drafts (
     source_question_no TEXT NOT NULL CHECK (length(trim(source_question_no)) BETWEEN 1 AND 3),
     approved_draft_version INTEGER NOT NULL CHECK (approved_draft_version > 0),
     edited_sha256 TEXT NOT NULL CHECK (length(edited_sha256)=64),
+    classification_scope_sha256 TEXT CHECK (
+        classification_scope_sha256 IS NULL OR (
+            length(classification_scope_sha256)=64
+            AND classification_scope_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
     proposal_primary_code TEXT NOT NULL REFERENCES knowledge_points(code) ON DELETE RESTRICT,
     proposal_related_codes_json TEXT NOT NULL CHECK (json_valid(proposal_related_codes_json)),
     proposal_confidence TEXT NOT NULL CHECK (proposal_confidence IN ('low','medium','high')),
@@ -768,6 +788,15 @@ CREATE TABLE IF NOT EXISTS candidate_knowledge_classification_drafts (
 CREATE INDEX IF NOT EXISTS idx_knowledge_classification_draft_review
 ON candidate_knowledge_classification_drafts(import_job_id, status, source_question_no);
 
+CREATE TABLE IF NOT EXISTS knowledge_classification_archival_authorizations (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    authorization_token TEXT NOT NULL UNIQUE CHECK (
+        length(authorization_token)=64
+        AND authorization_token NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS knowledge_classification_replacement_snapshots (
     import_job_id INTEGER PRIMARY KEY
         REFERENCES import_knowledge_classification_runs(import_job_id) ON DELETE RESTRICT,
@@ -797,7 +826,11 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS knowledge_classification_completed_run_delete_immutable
 BEFORE DELETE ON import_knowledge_classification_runs
-WHEN OLD.status='completed' OR OLD.applied_at IS NOT NULL
+WHEN (OLD.status='completed' OR OLD.applied_at IS NOT NULL)
+AND NOT EXISTS (
+    SELECT 1 FROM knowledge_classification_archival_authorizations a
+    WHERE a.import_job_id=OLD.import_job_id
+)
 BEGIN
     SELECT RAISE(ABORT, 'completed knowledge classification run is immutable');
 END;
@@ -832,6 +865,9 @@ BEFORE UPDATE ON candidate_knowledge_classification_drafts
 WHEN EXISTS (
     SELECT 1 FROM import_knowledge_classification_runs r
     WHERE r.import_job_id=OLD.import_job_id AND r.applied_at IS NOT NULL
+) AND NOT EXISTS (
+    SELECT 1 FROM official_answer_overlay_authorizations a
+    WHERE a.import_job_id=OLD.import_job_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'applied knowledge classification draft is immutable');
@@ -842,6 +878,10 @@ BEFORE DELETE ON candidate_knowledge_classification_drafts
 WHEN EXISTS (
     SELECT 1 FROM import_knowledge_classification_runs r
     WHERE r.import_job_id=OLD.import_job_id AND r.applied_at IS NOT NULL
+)
+AND NOT EXISTS (
+    SELECT 1 FROM knowledge_classification_archival_authorizations a
+    WHERE a.import_job_id=OLD.import_job_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'applied knowledge classification draft is immutable');
@@ -1353,3 +1393,196 @@ CREATE INDEX IF NOT EXISTS idx_import_upload_receipts_source ON import_upload_re
 CREATE INDEX IF NOT EXISTS idx_import_question_split_status ON import_question_split_runs(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_import_candidate_extraction_status ON import_candidate_extraction_runs(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_import_candidate_audit_status ON import_candidate_audit_runs(status, updated_at);
+
+-- Official answer sections are a separate source-bound trust domain.  A blank
+-- candidate answer never implies that the source paper had no answer section.
+CREATE TABLE IF NOT EXISTS import_answer_sources (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    source_answer_state TEXT NOT NULL CHECK (source_answer_state IN (
+        'source_has_no_answer','source_has_answer_unprocessed','source_answer_linked'
+    )),
+    answer_page_start INTEGER CHECK (answer_page_start IS NULL OR answer_page_start > 0),
+    answer_page_end INTEGER CHECK (answer_page_end IS NULL OR answer_page_end > 0),
+    render_manifest_sha256 TEXT CHECK (
+        render_manifest_sha256 IS NULL OR length(render_manifest_sha256)=64
+    ),
+    candidate_sha256 TEXT NOT NULL CHECK (length(candidate_sha256)=64),
+    draft_batch_sha256 TEXT NOT NULL CHECK (length(draft_batch_sha256)=64),
+    expected_question_count INTEGER NOT NULL CHECK (expected_question_count > 0),
+    classification_evidence_sha256 TEXT NOT NULL CHECK (length(classification_evidence_sha256)=64),
+    applied_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (source_answer_state='source_has_no_answer' AND answer_page_start IS NULL
+         AND answer_page_end IS NULL AND render_manifest_sha256 IS NULL)
+        OR
+        (source_answer_state!='source_has_no_answer' AND answer_page_start IS NOT NULL
+         AND answer_page_end IS NOT NULL AND answer_page_start<=answer_page_end
+         AND render_manifest_sha256 IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS import_answer_pages (
+    import_job_id INTEGER NOT NULL REFERENCES import_answer_sources(import_job_id) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL CHECK (page_number > 0),
+    relative_path TEXT NOT NULL CHECK (
+        relative_path GLOB 'pages/page_[0-9][0-9][0-9].png'
+        AND relative_path NOT LIKE '%..%' AND relative_path NOT LIKE '%\%'
+    ),
+    png_sha256 TEXT NOT NULL CHECK (length(png_sha256)=64),
+    byte_size INTEGER NOT NULL CHECK (byte_size > 0),
+    pixel_width INTEGER NOT NULL CHECK (pixel_width > 0),
+    pixel_height INTEGER NOT NULL CHECK (pixel_height > 0),
+    PRIMARY KEY(import_job_id,page_number)
+);
+
+CREATE TABLE IF NOT EXISTS import_answer_extraction_runs (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_answer_sources(import_job_id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')),
+    candidate_sha256 TEXT NOT NULL CHECK (length(candidate_sha256)=64),
+    draft_batch_sha256 TEXT NOT NULL CHECK (length(draft_batch_sha256)=64),
+    answer_pages_sha256 TEXT NOT NULL CHECK (length(answer_pages_sha256)=64),
+    model_run_id TEXT UNIQUE CHECK (model_run_id IS NULL OR length(model_run_id) BETWEEN 1 AND 200),
+    raw_artifact_sha256 TEXT CHECK (raw_artifact_sha256 IS NULL OR length(raw_artifact_sha256)=64),
+    raw_artifact_byte_size INTEGER CHECK (raw_artifact_byte_size IS NULL OR raw_artifact_byte_size > 0),
+    output_sha256 TEXT CHECK (output_sha256 IS NULL OR length(output_sha256)=64),
+    output_byte_size INTEGER CHECK (output_byte_size IS NULL OR output_byte_size > 0),
+    question_count INTEGER NOT NULL CHECK (question_count > 0),
+    claim_token TEXT UNIQUE CHECK (claim_token IS NULL OR length(claim_token)=64),
+    lease_expires_at TEXT,
+    error_message TEXT CHECK (error_message IS NULL OR length(error_message)<=100),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL,
+    CHECK (status!='completed' OR (
+        model_run_id IS NOT NULL AND raw_artifact_sha256 IS NOT NULL
+        AND raw_artifact_byte_size IS NOT NULL AND output_sha256 IS NOT NULL
+        AND output_byte_size IS NOT NULL AND completed_at IS NOT NULL
+    ))
+);
+
+CREATE TABLE IF NOT EXISTS candidate_official_answers (
+    import_job_id INTEGER NOT NULL REFERENCES import_answer_extraction_runs(import_job_id) ON DELETE RESTRICT,
+    source_question_no TEXT NOT NULL CHECK (length(trim(source_question_no)) BETWEEN 1 AND 3),
+    candidate_sha256 TEXT NOT NULL CHECK (length(candidate_sha256)=64),
+    draft_batch_sha256 TEXT NOT NULL CHECK (length(draft_batch_sha256)=64),
+    content_kind TEXT NOT NULL CHECK (content_kind IN ('short_answer','worked_solution')),
+    answer_markdown TEXT NOT NULL,
+    analysis_markdown TEXT NOT NULL,
+    subquestions_json TEXT NOT NULL CHECK (json_valid(subquestions_json)),
+    source_pages_json TEXT NOT NULL CHECK (json_valid(source_pages_json)),
+    source_page_hashes_json TEXT NOT NULL CHECK (json_valid(source_page_hashes_json)),
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256)=64),
+    extraction_artifact_sha256 TEXT NOT NULL CHECK (length(extraction_artifact_sha256)=64),
+    PRIMARY KEY(import_job_id,source_question_no)
+);
+
+CREATE TABLE IF NOT EXISTS import_answer_review_runs (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_answer_extraction_runs(import_job_id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN ('processing','completed','failed')),
+    candidate_sha256 TEXT NOT NULL CHECK (length(candidate_sha256)=64),
+    draft_batch_sha256 TEXT NOT NULL CHECK (length(draft_batch_sha256)=64),
+    answer_pages_sha256 TEXT NOT NULL CHECK (length(answer_pages_sha256)=64),
+    extraction_artifact_sha256 TEXT NOT NULL CHECK (length(extraction_artifact_sha256)=64),
+    producer_model_run_id TEXT NOT NULL CHECK (length(producer_model_run_id) BETWEEN 1 AND 200),
+    reviewer_model_run_id TEXT UNIQUE CHECK (reviewer_model_run_id IS NULL OR length(reviewer_model_run_id) BETWEEN 1 AND 200),
+    raw_artifact_sha256 TEXT CHECK (raw_artifact_sha256 IS NULL OR length(raw_artifact_sha256)=64),
+    output_sha256 TEXT CHECK (output_sha256 IS NULL OR length(output_sha256)=64),
+    question_count INTEGER NOT NULL CHECK (question_count > 0),
+    claim_token TEXT UNIQUE CHECK (claim_token IS NULL OR length(claim_token)=64),
+    lease_expires_at TEXT,
+    error_message TEXT CHECK (error_message IS NULL OR length(error_message)<=100),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL,
+    CHECK (reviewer_model_run_id IS NULL OR reviewer_model_run_id != producer_model_run_id),
+    CHECK (status!='completed' OR (
+        reviewer_model_run_id IS NOT NULL AND raw_artifact_sha256 IS NOT NULL
+        AND output_sha256 IS NOT NULL AND completed_at IS NOT NULL
+    ))
+);
+
+CREATE TABLE IF NOT EXISTS candidate_official_answer_reviews (
+    import_job_id INTEGER NOT NULL REFERENCES import_answer_review_runs(import_job_id) ON DELETE RESTRICT,
+    source_question_no TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('passed','failed')),
+    candidate_sha256 TEXT NOT NULL CHECK (length(candidate_sha256)=64),
+    draft_batch_sha256 TEXT NOT NULL CHECK (length(draft_batch_sha256)=64),
+    answer_pages_sha256 TEXT NOT NULL CHECK (length(answer_pages_sha256)=64),
+    extraction_artifact_sha256 TEXT NOT NULL CHECK (length(extraction_artifact_sha256)=64),
+    answer_content_sha256 TEXT NOT NULL CHECK (length(answer_content_sha256)=64),
+    answer_analysis_sha256 TEXT NOT NULL CHECK (length(answer_analysis_sha256)=64),
+    source_pages_json TEXT NOT NULL CHECK (json_valid(source_pages_json)),
+    source_page_hashes_json TEXT NOT NULL CHECK (json_valid(source_page_hashes_json)),
+    review_evidence_json TEXT NOT NULL CHECK (json_valid(review_evidence_json)),
+    reviewed_at TEXT NOT NULL,
+    PRIMARY KEY(import_job_id,source_question_no)
+);
+
+-- A short-lived row authorizes only the answer-overlay transaction to rebind
+-- immutable applied classification rows.  It is deleted before commit.
+CREATE TABLE IF NOT EXISTS official_answer_overlay_authorizations (
+    import_job_id INTEGER PRIMARY KEY REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    authorization_token TEXT NOT NULL UNIQUE CHECK (
+        length(authorization_token)=64
+        AND authorization_token NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS candidate_official_answer_overlays (
+    import_job_id INTEGER NOT NULL,
+    source_question_no TEXT NOT NULL,
+    prior_draft_version INTEGER NOT NULL CHECK (prior_draft_version > 0),
+    prior_edited_sha256 TEXT NOT NULL CHECK (length(prior_edited_sha256)=64),
+    new_draft_version INTEGER NOT NULL CHECK (new_draft_version=prior_draft_version+1),
+    new_edited_sha256 TEXT NOT NULL CHECK (length(new_edited_sha256)=64),
+    visual_scope_before_sha256 TEXT NOT NULL CHECK (length(visual_scope_before_sha256)=64),
+    visual_scope_after_sha256 TEXT NOT NULL CHECK (length(visual_scope_after_sha256)=64),
+    classification_scope_before_sha256 TEXT NOT NULL CHECK (length(classification_scope_before_sha256)=64),
+    classification_scope_after_sha256 TEXT NOT NULL CHECK (length(classification_scope_after_sha256)=64),
+    approval_source TEXT NOT NULL CHECK (approval_source IN ('human','ai_second_pass')),
+    approval_evidence_sha256 TEXT NOT NULL CHECK (length(approval_evidence_sha256)=64),
+    extraction_artifact_sha256 TEXT NOT NULL CHECK (length(extraction_artifact_sha256)=64),
+    review_artifact_sha256 TEXT NOT NULL CHECK (length(review_artifact_sha256)=64),
+    answer_content_sha256 TEXT NOT NULL CHECK (length(answer_content_sha256)=64),
+    answer_analysis_sha256 TEXT NOT NULL CHECK (length(answer_analysis_sha256)=64),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(import_job_id,source_question_no),
+    FOREIGN KEY(import_job_id,source_question_no)
+        REFERENCES candidate_review_drafts(import_job_id,source_question_no)
+        ON DELETE RESTRICT,
+    CHECK (visual_scope_before_sha256=visual_scope_after_sha256),
+    CHECK (classification_scope_before_sha256=classification_scope_after_sha256)
+);
+
+CREATE TRIGGER IF NOT EXISTS candidate_official_answer_overlays_immutable
+BEFORE UPDATE ON candidate_official_answer_overlays
+BEGIN
+    SELECT RAISE(ABORT, 'official answer overlay evidence is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS candidate_official_answer_overlays_delete_immutable
+BEFORE DELETE ON candidate_official_answer_overlays
+BEGIN
+    SELECT RAISE(ABORT, 'official answer overlay evidence is immutable');
+END;
+
+-- Parser-rejected model output is retained only as untrusted diagnostic evidence.
+-- No admission/review query consumes this table.
+CREATE TABLE IF NOT EXISTS import_answer_raw_diagnostics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_job_id INTEGER NOT NULL REFERENCES import_jobs(id) ON DELETE RESTRICT,
+    stage TEXT NOT NULL CHECK (stage IN ('extraction','review')),
+    model_run_id TEXT NOT NULL CHECK (length(model_run_id) BETWEEN 1 AND 200),
+    artifact_relative_path TEXT NOT NULL UNIQUE CHECK (
+        artifact_relative_path GLOB 'official_answer_diagnostics/[a-z0-9_-]*.json'
+        AND artifact_relative_path NOT LIKE '%..%' AND artifact_relative_path NOT LIKE '%\%'
+    ),
+    raw_sha256 TEXT NOT NULL CHECK (length(raw_sha256)=64),
+    byte_size INTEGER NOT NULL CHECK (byte_size > 0),
+    trusted INTEGER NOT NULL DEFAULT 0 CHECK (trusted=0),
+    created_at TEXT NOT NULL,
+    UNIQUE(import_job_id,stage,model_run_id,raw_sha256)
+);

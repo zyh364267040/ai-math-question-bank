@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from src.database.initialize import initialize_database
 from src.importing.admit_questions import admit_questions
-from src.web.app import _required_question_content, create_app
+from src.web.app import _required_question_content, _verified_asset_path, create_app
 from tests.fixture_factory import (
     anchor_synthetic_candidate_audit,
     anchor_synthetic_figure_reviews,
@@ -300,6 +300,65 @@ class QuestionsWebTests(unittest.TestCase):
         self.assertNotIn("（3）", detail)
         self.assertNotIn("（2）（i）", detail)
 
+    def test_detail_renders_source_linked_answers_stored_on_subquestions(self):
+        with sqlite3.connect(self.db) as con:
+            question_id, code = con.execute(
+                "SELECT id,question_code FROM questions WHERE source_question_no='22'"
+            ).fetchone()
+            subquestion_ids = [
+                row[0] for row in con.execute(
+                    "SELECT id FROM subquestions WHERE question_id=? ORDER BY display_order",
+                    (question_id,),
+                )
+            ]
+            self.assertEqual(4, len(subquestion_ids))
+            for index, subquestion_id in enumerate(subquestion_ids, 1):
+                con.execute(
+                    "UPDATE subquestions SET answer_markdown=?,analysis_markdown=?,answer_status='provided' WHERE id=?",
+                    (f"小问答案{index}", f"小问解析{index}", subquestion_id),
+                )
+            con.execute(
+                "UPDATE questions SET answer_markdown='',analysis_markdown=NULL WHERE id=?",
+                (question_id,),
+            )
+            con.execute(
+                "UPDATE import_answer_sources SET source_answer_state='source_answer_linked',"
+                "answer_page_start=1,answer_page_end=4,render_manifest_sha256=? "
+                "WHERE import_job_id=1",
+                ("f" * 64,),
+            )
+
+        detail = self.client.get(f"/questions/{code}")
+
+        self.assertEqual(200, detail.status_code)
+        self.assertIn("原卷答案已审核", detail.text)
+        for index in range(1, 5):
+            self.assertIn(f"小问答案{index}", detail.text)
+            self.assertIn(f"小问解析{index}", detail.text)
+
+    def test_detail_keeps_legacy_provided_answer_without_answer_source_row_visible(self):
+        with sqlite3.connect(self.db) as con:
+            code = con.execute(
+                "SELECT question_code FROM questions WHERE source_question_no='1'"
+            ).fetchone()[0]
+            answer = "旧流程候选答案"
+            analysis = "旧流程候选解析"
+            con.execute(
+                "UPDATE questions SET answer_markdown=?,answer_status='provided',"
+                "answer_review_status='passed',analysis_markdown=?,"
+                "analysis_review_status='passed' WHERE question_code=?",
+                (answer, analysis, code),
+            )
+            con.execute("DELETE FROM import_answer_sources WHERE import_job_id=1")
+
+        detail = self.client.get(f"/questions/{code}")
+
+        self.assertEqual(200, detail.status_code)
+        self.assertIn("AI候选答案", detail.text)
+        self.assertIn(answer, detail.text)
+        self.assertIn(analysis, detail.text)
+        self.assertNotIn("原卷答案待处理", detail.text)
+
     def test_formal_images_are_db_whitelisted_and_manifest_verified(self):
         with sqlite3.connect(self.db) as con:
             code, path = con.execute(
@@ -313,6 +372,67 @@ class QuestionsWebTests(unittest.TestCase):
         data = json.loads(manifest.read_text()); data["questions"][2]["sha256"] = "0"*64
         manifest.write_text(json.dumps(data), encoding="utf-8")
         self.assertEqual(404, self.client.get(f"/question-assets/{code}/{path}").status_code)
+
+    def test_pending_question_figure_with_passed_db_row_is_served(self):
+        with sqlite3.connect(self.db) as con:
+            con.row_factory = sqlite3.Row
+            asset = con.execute(
+                """SELECT a.*,q.question_code FROM questions q JOIN question_assets a ON a.question_id=q.id
+                   WHERE q.source_question_no='16' AND a.asset_kind='question_figure'"""
+            ).fetchone()
+
+        self.assertIsInstance(asset, sqlite3.Row)
+        self.assertTrue(_verified_asset_path(self.private, asset).is_file())
+        response = self.client.get(
+            f"/question-assets/{asset['question_code']}/{asset['relative_path']}"
+        )
+        self.assertEqual(200, response.status_code)
+
+    def test_legacy_passed_question_figure_with_passed_db_is_served(self):
+        with sqlite3.connect(self.db) as con:
+            code, path = con.execute(
+                """SELECT q.question_code,a.relative_path FROM questions q JOIN question_assets a ON a.question_id=q.id
+                   WHERE q.source_question_no='16' AND a.asset_kind='question_figure'"""
+            ).fetchone()
+        manifest_path = self.private / "processing/import_job_1/figure_assets.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = next(item for item in manifest["assets"] if item["output_relative_path"] == path)
+        entry["review_status"] = "ai_review_passed"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        self.assertEqual(200, self.client.get(f"/question-assets/{code}/{path}").status_code)
+
+    def test_question_figure_other_review_status_combinations_fail_closed(self):
+        with sqlite3.connect(self.db) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute(
+                """SELECT a.* FROM questions q JOIN question_assets a ON a.question_id=q.id
+                   WHERE q.source_question_no='16' AND a.asset_kind='question_figure'"""
+            ).fetchone()
+        manifest_path = self.private / "processing/import_job_1/figure_assets.json"
+
+        for manifest_status, database_status in (
+            ("pending_ai_review", "pending_ai_review"),
+            ("ai_review_passed", "pending_ai_review"),
+            ("rejected", "ai_review_passed"),
+            (None, "ai_review_passed"),
+        ):
+            with self.subTest(manifest=manifest_status, database=database_status):
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                entry = next(
+                    item for item in manifest["assets"]
+                    if item["output_relative_path"] == row["relative_path"]
+                )
+                if manifest_status is None:
+                    entry.pop("review_status", None)
+                else:
+                    entry["review_status"] = manifest_status
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                asset = dict(row)
+                asset["review_status"] = database_status
+
+                with self.assertRaises(ValueError):
+                    _verified_asset_path(self.private, asset)
 
     def test_html_is_escaped(self):
         with sqlite3.connect(self.db) as con:

@@ -12,7 +12,7 @@
   <div class="question-list-item">
     <article>
       <div class="question-card-tags">
-        <span class="tag tag-number">原题号 {{ q.source_question_no }}</span><span class="tag">{{ q.question_type_name }}</span><span class="tag">{{ '含图' if q.has_figure else '无图' }}</span><span class="tag {{ 'tag-warning' if q.answer_status == 'missing' else 'tag-ready' }}">{{ '答案缺失' if q.answer_status == 'missing' else '已有答案' }}</span>
+        <span class="tag tag-number">原题号 {{ q.source_question_no }}</span><span class="tag">{{ q.question_type_name }}</span><span class="tag">{{ '含图' if q.has_figure else '无图' }}</span><span class="tag {{ 'tag-warning' if q.answer_status == 'missing' else 'tag-ready' }}">{% if q.source_answer_state == 'source_answer_linked' %}原卷答案已审核{% elif q.source_answer_state == 'source_has_no_answer' %}{{ 'AI候选答案' if q.answer_status == 'provided' else '原卷未提供答案' }}{% else %}原卷答案待处理{% endif %}</span>
       </div>
       <div class="question-stem">{{ q.stem_markdown }}</div>
       {% if q.options %}<div class="question-list-options">{% for option in q.options %}

@@ -79,6 +79,16 @@ from src.processing.candidate_extractor import (
     load_completed_candidates,
     run_claimed_candidate_extraction,
 )
+from src.processing.official_answer_ingestion import (
+    OfficialAnswerError,
+    answer_coverage,
+    apply_reviewed_official_answers,
+    claim_answer_extraction,
+    claim_answer_review,
+    register_answer_source,
+    run_answer_extraction,
+    run_answer_review,
+)
 from src.processing.secure_crop_artifacts import (
     MAX_MANIFEST_BYTES,
     SecureCropArtifactError,
@@ -928,11 +938,13 @@ def _basket_questions(connection):
     rows = connection.execute(
         """SELECT q.*,bi.position,qt.name AS question_type_name,kp.name AS primary_knowledge_name,
                   s.paper_name AS source_paper_name,s.exam_year,qs.import_job_id,qs.source_question_no,
+                  ans.source_answer_state,
                   (q.figure_review_status='passed') AS has_figure
            FROM baskets b JOIN basket_items bi ON bi.basket_id=b.id JOIN questions q ON q.id=bi.question_id
            JOIN question_types qt ON qt.code=q.question_type_code
            JOIN knowledge_points kp ON kp.id=q.primary_knowledge_point_id
            JOIN question_sources qs ON qs.question_id=q.id JOIN source_papers s ON s.id=qs.source_paper_id
+           LEFT JOIN import_answer_sources ans ON ans.import_job_id=qs.import_job_id
            WHERE b.basket_key='default' AND q.deleted_at IS NULL ORDER BY bi.position"""
     ).fetchall()
     result = []
@@ -967,8 +979,8 @@ def _verified_asset_path(private_root, asset):
         and (
             manifest.get("review_status") == "ai_review_passed"
             if asset["asset_kind"] == "complete_question"
-            else manifest.get("review_status") == "pending_ai_review"
-            and asset.get("review_status") == "ai_review_passed"
+            else manifest.get("review_status") in {"pending_ai_review", "ai_review_passed"}
+            and asset["review_status"] == "ai_review_passed"
         )
     )
     if (not source_status_valid
@@ -1013,11 +1025,17 @@ def _exercise_questions(questions, options):
         )
         item.update(content)
         item["image_placeholders"] = content["image_options"]
-        item["answer_display"] = (
-            question["answer_markdown"] if question["answer_status"] == "provided"
-            else "原卷未提供答案"
+        source_state = question.get("source_answer_state")
+        if question["answer_status"] == "provided":
+            prefix = "原卷答案已审核：" if source_state == "source_answer_linked" else "AI候选答案："
+            item["answer_display"] = prefix + question["answer_markdown"]
+        elif source_state == "source_has_no_answer":
+            item["answer_display"] = "原卷未提供答案"
+        else:
+            item["answer_display"] = "原卷答案待处理"
+        item["analysis_display"] = question["analysis_markdown"] or (
+            "原卷未提供解析" if source_state == "source_has_no_answer" else "原卷解析待处理"
         )
-        item["analysis_display"] = question["analysis_markdown"] or "原卷未提供解析"
         for asset in item["display_assets"]:
             asset["preview_url"] = (
                 f"/question-assets/{quote(question['question_code'], safe='')}/"
@@ -1127,6 +1145,8 @@ def create_app(
     audit_runner=None,
     corrected_audit_runner=None,
     classification_runner=None,
+    answer_extraction_runner=None,
+    answer_review_runner=None,
     web_admission_service=None,
     web_admission_prepare_service=None,
     _initialize_schema=True,
@@ -1147,6 +1167,8 @@ def create_app(
     application.state.audit_runner = audit_runner
     application.state.corrected_audit_runner = corrected_audit_runner or audit_runner
     application.state.classification_runner = classification_runner
+    application.state.answer_extraction_runner = answer_extraction_runner
+    application.state.answer_review_runner = answer_review_runner
     application.state.web_admission_service = web_admission_service
     application.state.web_admission_prepare_service = web_admission_prepare_service
 
@@ -1194,7 +1216,7 @@ def create_app(
         response.headers["X-AI-Math-Question-Bank"] = "1"
         if (
             request.method == "GET"
-            and re.fullmatch(r"/imports/[^/]+/(?:layout|split|candidates|audit|classification|admission)", request.url.path)
+            and re.fullmatch(r"/imports/[^/]+/(?:layout|split|candidates|audit|classification|answers|admission)", request.url.path)
         ):
             response.headers["Cache-Control"] = "no-store"
         if cookie_token != token:
@@ -1914,6 +1936,113 @@ def create_app(
             request=request, name="import_audit.html",
             context={"run": run, "audit": audit, "applied": applied},
             headers={"Cache-Control": "no-store"},
+        )
+
+    @application.get("/imports/{job_id}/answers", response_class=HTMLResponse)
+    def official_answer_status(request: Request, job_id: int, notice: str = ""):
+        """Read DB-backed coverage only; GET never invokes a model or writes state."""
+        try:
+            with _connect(database_path) as connection:
+                job = connection.execute(
+                    """SELECT j.id,s.paper_name FROM import_jobs j
+                       JOIN source_papers s ON s.id=j.source_paper_id WHERE j.id=?""",
+                    (job_id,),
+                ).fetchone()
+                extraction = connection.execute(
+                    "SELECT status,error_message FROM import_answer_extraction_runs WHERE import_job_id=?",
+                    (job_id,),
+                ).fetchone()
+                review = connection.execute(
+                    "SELECT status,error_message FROM import_answer_review_runs WHERE import_job_id=?",
+                    (job_id,),
+                ).fetchone()
+            if job is None:
+                return _error(request, templates, "未找到导入任务", 404)
+            coverage = answer_coverage(database_path, job_id)
+        except sqlite3.Error:
+            return _error(request, templates, "官方答案状态暂时无法读取", 500)
+        return templates.TemplateResponse(
+            request=request, name="import_answers.html",
+            context={
+                "job": dict(job), "coverage": coverage,
+                "extraction": dict(extraction) if extraction else None,
+                "review": dict(review) if review else None, "notice": notice,
+            }, headers={"Cache-Control": "no-store"},
+        )
+
+    @application.post("/imports/{job_id}/answers/register")
+    async def register_official_answer_pages(request: Request, job_id: int):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        allowed = {"csrf_token", "source_answer_state", "page_start", "page_end"}
+        if set(form.keys()) != allowed or any(len(form.getlist(name)) != 1 for name in allowed):
+            return _error(request, templates, "官方答案来源登记参数无效", 400)
+        state = str(form.get("source_answer_state", ""))
+        try:
+            start_raw, end_raw = str(form.get("page_start", "")), str(form.get("page_end", ""))
+            start = None if state == "source_has_no_answer" and not start_raw else int(start_raw)
+            end = None if state == "source_has_no_answer" and not end_raw else int(end_raw)
+            register_answer_source(database_path, private_root, job_id, state, start, end)
+        except (ValueError, OfficialAnswerError) as error:
+            return _error(request, templates, str(error), 409)
+        return RedirectResponse(f"/imports/{job_id}/answers?notice=registered", status_code=303)
+
+    @application.post("/imports/{job_id}/answers/extract")
+    async def extract_official_answers(
+        request: Request, job_id: int, background_tasks: BackgroundTasks
+    ):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "官方答案提取请求参数无效", 400)
+        try:
+            claim_token = claim_answer_extraction(database_path, private_root, job_id)
+        except OfficialAnswerError as error:
+            return _error(request, templates, str(error), 409)
+        if claim_token is not None:
+            background_tasks.add_task(
+                run_answer_extraction, database_path, private_root, job_id,
+                application.state.answer_extraction_runner, _claim_token=claim_token,
+            )
+        return RedirectResponse(f"/imports/{job_id}/answers", status_code=303)
+
+    @application.post("/imports/{job_id}/answers/review")
+    async def review_official_answers(
+        request: Request, job_id: int, background_tasks: BackgroundTasks
+    ):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "官方答案独立复核请求参数无效", 400)
+        try:
+            claim_token = claim_answer_review(database_path, private_root, job_id)
+        except OfficialAnswerError as error:
+            return _error(request, templates, str(error), 409)
+        if claim_token is not None:
+            background_tasks.add_task(
+                run_answer_review, database_path, private_root, job_id,
+                application.state.answer_review_runner, _claim_token=claim_token,
+            )
+        return RedirectResponse(f"/imports/{job_id}/answers", status_code=303)
+
+    @application.post("/imports/{job_id}/answers/apply")
+    async def apply_official_answers(request: Request, job_id: int):
+        form = await require_csrf(request)
+        if form is None:
+            return _error(request, templates, "CSRF 校验失败", 403)
+        if set(form.keys()) != {"csrf_token"} or len(list(form.multi_items())) != 1:
+            return _error(request, templates, "官方答案整批应用请求参数无效", 400)
+        try:
+            changed = apply_reviewed_official_answers(
+                database_path, private_root, job_id
+            )
+        except OfficialAnswerError as error:
+            return _error(request, templates, str(error), 409)
+        return RedirectResponse(
+            f"/imports/{job_id}/answers?notice=applied-{changed}", status_code=303
         )
 
     @application.post("/imports/{job_id}/classification/start")
@@ -2802,12 +2931,13 @@ def create_app(
                 rows = connection.execute(
                     """SELECT q.id,q.question_code,q.stem_markdown,q.source_question_no,q.answer_status,q.question_type_code,q.figure_review_status,
                               qt.name AS question_type_name,kp.name AS primary_knowledge_name,kp.code AS primary_knowledge_code,
-                              s.paper_name,s.exam_year,
+                              s.paper_name,s.exam_year,ans.source_answer_state,
                               (q.figure_review_status='passed') AS has_figure,
                               EXISTS(SELECT 1 FROM basket_items bi JOIN baskets b ON b.id=bi.basket_id WHERE bi.question_id=q.id AND b.basket_key='default') AS in_basket
                        FROM questions q JOIN question_types qt ON qt.code=q.question_type_code
                        JOIN knowledge_points kp ON kp.id=q.primary_knowledge_point_id
-                       JOIN question_sources qs ON qs.question_id=q.id JOIN source_papers s ON s.id=qs.source_paper_id""" + where +
+                       JOIN question_sources qs ON qs.question_id=q.id JOIN source_papers s ON s.id=qs.source_paper_id
+                       LEFT JOIN import_answer_sources ans ON ans.import_job_id=qs.import_job_id""" + where +
                     " ORDER BY s.exam_year DESC, qs.import_job_id DESC, CAST(qs.source_question_no AS INTEGER)", params
                 ).fetchall()
                 questions = [dict(row) for row in rows]
@@ -2992,10 +3122,12 @@ def create_app(
             with _connect(database_path) as connection:
                 row = connection.execute(
                     """SELECT q.*,qt.name AS question_type_name,kp.name AS primary_knowledge_name,kp.code AS primary_knowledge_code,
-                              s.paper_name AS source_paper_name,s.exam_year,qs.import_job_id,qs.source_pages_json
+                              s.paper_name AS source_paper_name,s.exam_year,qs.import_job_id,qs.source_pages_json,
+                              ans.source_answer_state
                        FROM questions q JOIN question_types qt ON qt.code=q.question_type_code
                        JOIN knowledge_points kp ON kp.id=q.primary_knowledge_point_id
                        JOIN question_sources qs ON qs.question_id=q.id JOIN source_papers s ON s.id=qs.source_paper_id
+                       LEFT JOIN import_answer_sources ans ON ans.import_job_id=qs.import_job_id
                        WHERE q.question_code=?""", (question_code,)
                 ).fetchone()
                 if row is None: return _error(request, templates, "未找到正式题目", 404)

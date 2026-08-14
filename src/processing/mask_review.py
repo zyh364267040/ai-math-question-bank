@@ -35,6 +35,16 @@ MAX_APPROVED_COVERAGE = 0.12
 HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 
 
+def _canonical_reason(value):
+    if not isinstance(value, str):
+        raise MaskReviewError(SAFE_MASK_ERROR)
+    stripped = value.strip()
+    for reason in CONTROLLED_REASONS:
+        if stripped == reason or stripped.startswith(reason + ":") or stripped.startswith(reason + "："):
+            return reason
+    raise MaskReviewError(SAFE_MASK_ERROR)
+
+
 class MaskReviewError(ValueError):
     """A mask proposal is not independently authorized for application."""
 
@@ -183,7 +193,15 @@ def record_mask_review(database_path, private_root, payload):
                 "page_number": payload["page_number"], "bbox": payload["bbox"],
                 "reason": payload["reason"],
             }
-            if entry is None or proposal not in entry.get("mask_regions", []):
+            if entry is None:
+                raise MaskReviewError(SAFE_MASK_ERROR)
+            matching_proposals = [
+                item for item in entry.get("mask_regions", [])
+                if item.get("page_number") == payload["page_number"]
+                and item.get("bbox") == payload["bbox"]
+                and _canonical_reason(item.get("reason")) == payload["reason"]
+            ]
+            if len(matching_proposals) != 1:
                 raise MaskReviewError(SAFE_MASK_ERROR)
             region = next(
                 (item for item in entry["regions"] if item["page_number"] == payload["page_number"]
@@ -230,8 +248,8 @@ def record_mask_review(database_path, private_root, payload):
                 pass
             review_fd = open_directory_at(lock.descriptor, "mask_review")
             try:
-                preview_name = f"preview_{subject_digest}.png"
-                evidence_name = f"evidence_{subject_digest}.json"
+                preview_name = f"preview_{manifest['generation_id']}_{subject_digest}.png"
+                evidence_name = f"evidence_{manifest['generation_id']}_{subject_digest}.json"
                 for name, content in ((preview_name, preview_bytes), (evidence_name, evidence_bytes)):
                     try:
                         write_file_at(review_fd, name, content)
@@ -268,7 +286,8 @@ def record_mask_review(database_path, private_root, payload):
 
 
 def _approved_evidence(connection, lock, manifest, entry, mask):
-    subject = _subject(entry, mask, mask["reason"])
+    canonical_mask = {**mask, "reason": _canonical_reason(mask.get("reason"))}
+    subject = _subject(entry, canonical_mask, canonical_mask["reason"])
     subject_digest = _digest(subject)
     row = connection.execute(
         """SELECT source_sha256,artifact_sha256,preview_sha256,evidence_sha256,
@@ -278,12 +297,19 @@ def _approved_evidence(connection, lock, manifest, entry, mask):
              AND generation_id=? AND subject_digest=?""",
         (manifest["import_job_id"], entry["question_no"], manifest["generation_id"], subject_digest),
     ).fetchone()
-    if row is None or row[6] != "approved" or row[7] != mask["reason"] or json.loads(row[8]) != mask["bbox"]:
+    if (row is None or row[6] != "approved" or row[7] != canonical_mask["reason"]
+            or json.loads(row[8]) != canonical_mask["bbox"]):
         raise MaskReviewError(SAFE_MASK_ERROR)
     review_fd = open_directory_at(lock.descriptor, "mask_review")
     try:
-        evidence_snapshot = read_file_at(review_fd, f"evidence_{subject_digest}.json", max_bytes=128 * 1024)
-        preview_snapshot = read_file_at(review_fd, f"preview_{subject_digest}.png", max_bytes=16 * 1024 * 1024)
+        evidence_snapshot = read_file_at(
+            review_fd, f"evidence_{manifest['generation_id']}_{subject_digest}.json",
+            max_bytes=128 * 1024,
+        )
+        preview_snapshot = read_file_at(
+            review_fd, f"preview_{manifest['generation_id']}_{subject_digest}.png",
+            max_bytes=16 * 1024 * 1024,
+        )
     finally:
         os.close(review_fd)
     evidence = json.loads(evidence_snapshot.data)
