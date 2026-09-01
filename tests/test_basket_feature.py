@@ -5,12 +5,13 @@ import tempfile
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from src.database.initialize import initialize_database
 from src.importing.admit_questions import admit_questions
-from src.web.app import create_app
+from src.web.app import _verified_asset, create_app
 from tests.fixture_factory import (
     anchor_synthetic_candidate_audit,
     anchor_synthetic_figure_reviews,
@@ -226,6 +227,48 @@ class BasketFeatureTests(unittest.TestCase):
         second = self.post("/basket/export", {"include_images":"off"})
         self.assertEqual(303, second.status_code)
         self.assertNotEqual(response.headers["location"], second.headers["location"])
+
+    def test_question_figure_export_uses_bytes_fixed_during_verification(self):
+        code = self.code_for_source_number(16)
+        with sqlite3.connect(self.db) as connection:
+            connection.row_factory = sqlite3.Row
+            asset = connection.execute(
+                """SELECT a.* FROM question_assets a
+                   JOIN question_sources qs ON qs.question_id=a.question_id
+                   WHERE qs.source_question_no='16'
+                     AND a.asset_kind='question_figure'"""
+            ).fetchone()
+        target = (
+            self.private
+            / f"processing/import_job_{asset['import_job_id']}"
+            / asset["relative_path"]
+        )
+        verified_png = target.read_bytes()
+        self.post(f"/basket/add/{code}")
+        csrf_token = self.csrf()
+
+        def replace_path_after_verification(private_root, candidate, connection=None):
+            verified = _verified_asset(private_root, candidate, connection)
+            target.write_bytes(b"replaced after ordinary figure verification")
+            return verified
+
+        with patch(
+            "src.web.app._verified_asset", side_effect=replace_path_after_verification
+        ):
+            response = self.client.post(
+                "/basket/export",
+                data={"csrf_token": csrf_token},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(303, response.status_code)
+        with sqlite3.connect(self.db) as connection:
+            output_path = connection.execute(
+                "SELECT output_path FROM basket_exports ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        export_dir = (self.private / output_path).parent
+        exported = export_dir / "assets/001_01_question_figure.png"
+        self.assertEqual(verified_png, exported.read_bytes())
 
     def test_export_text_question_ignores_registered_complete_question_and_has_no_assets_directory(self):
         code = self.code_for_source_number(1)

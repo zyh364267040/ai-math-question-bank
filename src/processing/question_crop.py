@@ -68,6 +68,7 @@ class QuestionCropReport:
     recropped_question_nos: list[int]
     reused_question_nos: list[int]
     generation_id: str
+    manifest_sha256: str
     publication_mode: str = "atomic_snapshot"
 
 
@@ -76,6 +77,7 @@ class _CropPair:
     manifest: dict[str, Any]
     files: dict[int, PinnedBytes]
     manifest_size: int
+    manifest_sha256: str
 
 
 def _positive_integer(value: Any, label: str) -> int:
@@ -235,7 +237,7 @@ def _validate_pair(job_fd: int, directory_name: str, manifest_name: str, key: by
                 files[entry["question_no"]] = artifact
         finally:
             os.close(directory_fd)
-        return _CropPair(manifest, files, raw_manifest.size)
+        return _CropPair(manifest, files, raw_manifest.size, raw_manifest.sha256)
     except (SecureCropArtifactError, OSError, QuestionCropError):
         return None
 
@@ -641,9 +643,14 @@ def _png_bytes(image: Image.Image) -> bytes:
     return data
 
 
+def _manifest_sha256(content: bytes) -> str:
+    """Digest staged manifest bytes before any formal-path publication."""
+    return hashlib.sha256(content).hexdigest()
+
+
 def _build_manifest(job_id: int, generation_id: str, pages: dict[int, dict[str, Any]],
                     sources: dict[int, PinnedBytes], entries: list[dict[str, Any]],
-                    key: bytes) -> dict[str, Any]:
+                    key: bytes, *, include_review_summary: bool = False) -> dict[str, Any]:
     unsigned = {
         "version": 2,
         "import_job_id": job_id,
@@ -657,6 +664,13 @@ def _build_manifest(job_id: int, generation_id: str, pages: dict[int, dict[str, 
         ],
         "questions": entries,
     }
+    if include_review_summary:
+        unsigned["review_status"] = "pending"
+        unsigned["review_summary"] = {
+            "approved_count": 0,
+            "rejected_count": 0,
+            "pending_count": len(entries),
+        }
     return sign_manifest(key, unsigned)
 
 
@@ -672,7 +686,7 @@ def generate_question_crops_report(*, job_dir, questions, expected_question_nos,
                                    max_total_output_bytes=MAX_TOTAL_OUTPUT_BYTES,
                                    min_free_disk_bytes=MIN_FREE_DISK_BYTES,
                                    source_page_bytes=None, job_lock=None,
-                                   force_recrop_question_nos=()):
+                                   force_recrop_question_nos=(), reset_review_summary=False):
     """Generate a signed complete batch and report its published generation."""
     min_width = _positive_integer(min_width, "最小宽度")
     min_height = _positive_integer(min_height, "最小高度")
@@ -763,7 +777,7 @@ def generate_question_crops_report(*, job_dir, questions, expected_question_nos,
                             "现有裁图PNG与manifest总输出字节超出资源预算")
                     return QuestionCropReport(
                         old_pair.manifest, [], reused_numbers,
-                        old_pair.manifest["generation_id"])
+                        old_pair.manifest["generation_id"], old_pair.manifest_sha256)
 
                 generation_id = secrets.token_hex(16)
                 temporary_dir = f".question_crops.{generation_id}.tmp"
@@ -845,10 +859,14 @@ def generate_question_crops_report(*, job_dir, questions, expected_question_nos,
                         )
                     entries.append(entry)
                 fsync_directory(directory_fd)
-                manifest = _build_manifest(job_id, generation_id, pages, sources, entries, key)
+                manifest = _build_manifest(
+                    job_id, generation_id, pages, sources, entries, key,
+                    include_review_summary=bool(reset_review_summary),
+                )
                 validate_signed_manifest(
                     manifest, key, expected_job_id=job_id, expected_question_nos=expected)
                 manifest_bytes = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode()
+                manifest_sha256 = _manifest_sha256(manifest_bytes)
                 if len(manifest_bytes) > MAX_MANIFEST_BYTES:
                     raise QuestionCropError("question_crops manifest超过大小预算")
                 if output_bytes + len(manifest_bytes) > limits["max_total_output_bytes"]:
@@ -857,7 +875,8 @@ def generate_question_crops_report(*, job_dir, questions, expected_question_nos,
                 published = _publish(
                     lock.descriptor, temporary_dir, temporary_manifest, key)
                 return QuestionCropReport(
-                    published.manifest, recropped, reused, published.manifest["generation_id"])
+                    published.manifest, recropped, reused, published.manifest["generation_id"],
+                    manifest_sha256)
     except QuestionCropError:
         raise
     except SecureCropArtifactError as error:

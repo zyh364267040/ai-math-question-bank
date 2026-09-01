@@ -35,6 +35,8 @@ TOP_LEVEL_KEYS = {
     "version", "import_job_id", "generation_id", "question_count",
     "source_pages", "questions", "signature",
 }
+REVIEW_SUMMARY_KEYS = {"approved_count", "rejected_count", "pending_count"}
+REVIEW_TOP_LEVEL_KEYS = TOP_LEVEL_KEYS | {"review_status", "review_summary"}
 SOURCE_KEYS = {"page_number", "relative_path", "pixel_width", "pixel_height", "sha256"}
 QUESTION_KEYS = {
     "question_no", "regions", "composition", "output_relative_path", "width", "height",
@@ -243,7 +245,9 @@ def _validate_bbox(value: Any) -> bool:
 def validate_signed_manifest(data: Any, key: bytes, *, expected_job_id: int | None = None,
                              expected_question_nos: list[int] | None = None) -> dict[str, Any]:
     try:
-        if not isinstance(data, dict) or set(data) != TOP_LEVEL_KEYS:
+        if not isinstance(data, dict) or set(data) not in {
+            frozenset(TOP_LEVEL_KEYS), frozenset(REVIEW_TOP_LEVEL_KEYS),
+        }:
             raise TypeError
         signature = data["signature"]
         if not isinstance(signature, str) or not HEX_64.fullmatch(signature):
@@ -261,6 +265,15 @@ def validate_signed_manifest(data: Any, key: bytes, *, expected_job_id: int | No
                 or not isinstance(data["questions"], list)
                 or data["question_count"] != len(data["questions"])):
             raise TypeError
+        if "review_summary" in data:
+            summary = data["review_summary"]
+            if (
+                data["review_status"] not in {"pending", "approved", "rejected"}
+                or not isinstance(summary, dict)
+                or set(summary) != REVIEW_SUMMARY_KEYS
+                or any(not _strict_int(value, minimum=0) for value in summary.values())
+            ):
+                raise TypeError
         source_numbers: list[int] = []
         for source in data["source_pages"]:
             if not isinstance(source, dict) or set(source) != SOURCE_KEYS:
@@ -407,6 +420,26 @@ def validate_signed_manifest(data: Any, key: bytes, *, expected_job_id: int | No
             raise TypeError
         if expected_question_nos is not None and question_numbers != expected_question_nos:
             raise TypeError
+        if "review_summary" in data:
+            expected_summary = {
+                "approved_count": sum(
+                    item["review_status"] == "ai_review_passed" for item in data["questions"]
+                ),
+                "rejected_count": sum(
+                    item["review_status"] in {"needs_fix", "needs_recrop"}
+                    for item in data["questions"]
+                ),
+                "pending_count": sum(
+                    item["review_status"] == "pending_ai_review" for item in data["questions"]
+                ),
+            }
+            expected_status = (
+                "pending" if expected_summary["pending_count"]
+                else "approved" if expected_summary["approved_count"] == data["question_count"]
+                else "rejected"
+            )
+            if data["review_summary"] != expected_summary or data["review_status"] != expected_status:
+                raise TypeError
         return data
     except SecureCropArtifactError:
         raise

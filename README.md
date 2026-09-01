@@ -116,6 +116,67 @@
 
 正式执行前会自动备份SQLite数据库。流程具有事务保护、版本检查和幂等性，重复执行不会重复修改题目。
 
+## 历史 v1 裁图恢复
+
+历史无签名 `question_crops.json` 只能通过专用恢复入口迁移。默认命令是零写入检查：
+
+`python3 -m src.processing.historical_v1_crop_recovery --job-id 1 --database data/private/question-bank.db --private-root data/private`
+
+确认 JSON 报告为 `ready` 后，必须显式添加 `--apply` 才会调用生产裁图器对权威题号全集执行 `0 reused` 全量重裁，并登记新的 v2 generation 与 SQLite split anchors：
+
+`python3 -m src.processing.historical_v1_crop_recovery --job-id 1 --database data/private/question-bank.db --private-root data/private --apply`
+
+恢复不会继承旧题图审核、候选提取/视觉二审、草稿视觉批准或知识点分类批准，也不会写入、删除或改写任何正式题。已有正式题保持不变；旧 `candidate_questions.json` 与 draft 只作为恢复时哈希固定的历史快照保留，不能作为新准入证据。恢复记录只登记无审批权限的 `system_migration_placeholder`，不会伪造历史 reviewer，也不会创建 `crop_ai_review.json`。
+
+此后仍须依次取得与 split run 身份不同的 fresh 独立整批题图审核、fresh 候选提取、fresh 候选视觉二审、人工编辑草稿的 fresh 单题复审、fresh 知识点分类、严格 dry assessment，以及用户对剩余题正式写入的明确确认。旧任务若完全缺失 render-run 行，dry-run 会继续严格验证归档 PDF、render manifest 和每页 PNG；只有 `--apply` 的单一数据库事务才补建 completed render anchor。已有但不完整或不一致的 render row 一律拒绝修复。
+
+若历史恢复和 fresh 整批题图审核已经完成，但任务被人工置为 `needs_review`，先用专用 resume 阶段做只读检查：
+
+`python3 -m src.processing.historical_v1_crop_recovery --resume-fresh-pipeline --job-id 1 --database data/private/question-bank.db --private-root data/private`
+
+只有报告为 `ready` 后才显式写入；该命令只把任务从 `needs_review` 改为 `pending`、清理旧错误并写入不可变 resume 锚点，不会自动启动候选提取或后续准入：
+
+`python3 -m src.processing.historical_v1_crop_recovery --resume-fresh-pipeline --job-id 1 --database data/private/question-bank.db --private-root data/private --apply`
+
+更早的 legacy 任务可能同时缺少 `question_regions.json` 和 split-run 行。仅在二者确实同时缺失时，恢复入口才允许把严格验证过的 v1 `question_crops.json` 中的 regions 当作无归属历史输入，按生产切题计划的页码、像素 bbox、题号全集、固定路径及 PNG 元数据规则归一化，并以 `historical-v1-manifest-unattributed-<摘要>` 标识补建 split anchor。只要 split-run 行已经存在但 regions 文件缺失，就会拒绝恢复，不会猜测或修补已有权威声明。
+
+### 历史恢复剩余题 lane
+
+当历史恢复任务已有部分正式题时，不得用普通整批分类或普通 Web“正式入库并完成任务”绕过整批准入。专用 residual lane 只接受 `historical_v1_crop_recoveries.question_nos_json - 冻结正式题号` 的机械差集，调用者不能传题号。它要求差集非空、冻结正式题 count/hash 未漂移、fresh 候选/audit/签名裁图 generation 完整一致，以及剩余题当前 source-bound 的 human/AI 批准；`existing_approval` 不能批准首次入库。
+
+先运行 fresh Codex 多阶段分类，并将专用不可变证据应用到剩余题（不会创建或修改普通整批 classification run）：
+
+`python3 -m src.reviewing.historical_residual classify --job-id 1 --database data/private/question-bank.db --private-root data/private`
+
+`python3 -m src.reviewing.historical_residual apply-classification --job-id 1 --database data/private/question-bank.db --private-root data/private`
+
+若原卷确实无答案，必须先归档既有用户确认到
+`processing/import_job_<id>/historical_no_answer_authority.json`。其 provenance 必须是
+`archived_user_confirmation_migration`，并固定绑定 job、source paper、归档 PDF SHA/字节数、
+原确认文本摘要与 SHA、会话引用、记录时间、外部 receipt SHA 和
+`source_has_no_answer` 结论。调用方还必须通过 `--confirmation-receipt` 提供原始 receipt
+文件；无 receipt、receipt 改变或源 PDF 改变均拒绝。项目 HMAC 只防止本地文件意外篡改，
+不构成独立外部信任域，也绝不把应用自签字段标成 `human`。在本地单用户威胁模型中，
+能够任意执行本地代码并读取项目密钥的主体本来就拥有应用权限；本迁移只诚实保存用户
+既有确认的 provenance，不虚构项目当前无法验证的外部签名能力。先零写入验证并取得 token，
+再登记：
+
+`python3 -m src.reviewing.historical_residual assess-no-answer --job-id 1 --database data/private/question-bank.db --private-root data/private --confirmation-receipt /path/to/archived-confirmation.receipt`
+
+`python3 -m src.reviewing.historical_residual register-no-answer --job-id 1 --database data/private/question-bank.db --private-root data/private --confirmation-receipt /path/to/archived-confirmation.receipt --confirmation-token '<NO_ANSWER_CONFIRMATION_TOKEN>'`
+
+随后执行零写入 dry-run。输出包含精确源文件名、试卷标题、总题数、冻结正式题号、机械剩余题号、逐题 eligibility/reasons、assessment SHA 和 confirmation token：
+
+`python3 -m src.reviewing.historical_residual dry-run --job-id 1 --database data/private/question-bank.db --private-root data/private`
+
+只有 dry-run 为 `ready` 时，才把该次输出的完整 token 显式传回。apply 在 `BEGIN IMMEDIATE` 单事务中重算同一快照，并从同一事务连接序列化备份到固定 backup-dir fd 下持续打开的独占 inode；任一剩余题失败则零插入，成功时只新增差集、核验完整题号全集/FK/integrity 后完成 job。相同 token 重放为零变化：
+
+`python3 -m src.reviewing.historical_residual admit --job-id 1 --database data/private/question-bank.db --private-root data/private --confirmation-token '<DRY_RUN_CONFIRMATION_TOKEN>'`
+
+该入口不修改已有正式题及其旧草稿，不覆盖旧 classification，也不改变普通 classifier/admission 的整批严格语义。classification processing claim 使用 10 分钟有界 lease，并在每个最长 5 分钟的模型阶段前后续租；未过期 claim 不可抢占，只有 lease 过期且输入快照完全一致才允许原子回收。完成后复用 completed web admission 的不可变题图谱保护，最终摘要覆盖题目、来源、选项、小题、公式、配图、资产、知识点、标签、审查和版本关系。源无答案登记会重新验证归档 PDF、归档确认文件和 receipt 绑定，不会生成答案或制造人工证据。
+
+历史 residual 测试分两层：精确 22+1 组件用例可用 fixture/SQL 搭建候选、audit 等上游证据；生产链用例必须实际调用 `recover_historical_v1_crops`、`resume_historical_v1_fresh_pipeline` 和 residual admission，禁止直接插入 recovery/resumption 记录。为本次历史数据导入，候选 extraction/audit 仍使用确定性 fixture，因此验证范围是恢复、续跑边界、分类证据应用、无答案登记和最终准入，不声称重新调用了真实模型。
+
 ## 数据安全
 
 以下内容不会进入Git：

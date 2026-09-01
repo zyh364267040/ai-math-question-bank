@@ -299,16 +299,20 @@ def _validate_frozen_previous_crop_review(
 
 def load_current_crop_review(
     database_path: Any, private_root: Any, job_id: int, *, recover: bool = False,
+    expected_job_status: str = "pending",
 ) -> dict[str, Any]:
     """Load only recovery-clean, signed evidence for the DB-anchored crop generation."""
     if not _strict_int(job_id):
         raise CropReviewError("题图审核任务参数无效")
     database_path = Path(database_path)
+    if expected_job_status not in {"pending", "needs_review"}:
+        raise CropReviewError("题图审核任务状态约束无效")
     job_dir = Path(private_root) / "processing" / f"import_job_{job_id}"
     try:
         with locked_job(job_dir) as lock:
             return _load_current_crop_review_locked(
                 database_path, lock, job_id, recover=recover,
+                expected_job_status=expected_job_status,
             )
     except CropReviewError:
         raise
@@ -318,6 +322,7 @@ def load_current_crop_review(
 
 def _load_current_crop_review_locked(
     database_path: Path, lock: Any, job_id: int, *, recover: bool,
+    expected_job_status: str = "pending",
 ) -> dict[str, Any]:
     """Validate review evidence while the caller retains the artifact lock."""
     key = load_hmac_key(lock.path)
@@ -329,7 +334,7 @@ def _load_current_crop_review_locked(
         _recover_if_needed(database_path, lock.descriptor, key, job_id)
     row = _database_row(database_path, job_id)
     if (
-        row is None or row[0] != "pending"
+        row is None or row[0] != expected_job_status
         or row[1] not in {"completed", "failed", "processing"}
         or not _strict_int(row[2], maximum=MAX_QUESTIONS)
         or any(value is None for value in row[3:6])
@@ -358,7 +363,7 @@ def _database_row(database_path: Path, job_id: int) -> tuple[Any, ...] | None:
     with closing(sqlite3.connect(database_path)) as connection:
         return connection.execute(
             """SELECT j.status,s.status,s.question_count,s.crop_manifest_sha256,
-                      s.crop_generation_id,s.crop_manifest_signature
+                      s.crop_generation_id,s.crop_manifest_signature,s.codex_run_id
                FROM import_jobs j JOIN import_question_split_runs s
                  ON s.import_job_id=j.id WHERE j.id=?""", (job_id,),
         ).fetchone()
@@ -530,9 +535,11 @@ def record_crop_ai_review(database_path: Any, private_root: Any, payload: Any) -
             if (
                 row is None or row[0] != "pending" or row[1] != "completed"
                 or not _strict_int(row[2], maximum=MAX_QUESTIONS)
-                or any(value is None for value in row[3:6])
+                or any(value is None for value in row[3:7])
             ):
                 raise CropReviewError("仅可审核数据库绑定且已完成的当前切题结果")
+            if payload["reviewer_run_id"] == row[6]:
+                raise CropReviewError("独立题图审核 reviewer 必须与切题运行身份不同")
             manifest_snapshot = read_file_at(
                 lock.descriptor, MANIFEST_NAME, max_bytes=MAX_MANIFEST_BYTES,
             )
@@ -615,6 +622,24 @@ def record_crop_ai_review(database_path: Any, private_root: Any, payload: Any) -
             ):
                 crop["review_status"] = decision["status"]
                 crop["warnings"] = list(decision["warnings"])
+            approved_count = sum(
+                crop["review_status"] == "ai_review_passed" for crop in updated["questions"]
+            )
+            rejected_count = sum(
+                crop["review_status"] in {"needs_fix", "needs_recrop"}
+                for crop in updated["questions"]
+            )
+            pending_count = len(updated["questions"]) - approved_count - rejected_count
+            updated["review_summary"] = {
+                "approved_count": approved_count,
+                "rejected_count": rejected_count,
+                "pending_count": pending_count,
+            }
+            updated["review_status"] = (
+                "pending" if pending_count
+                else "approved" if approved_count == len(updated["questions"])
+                else "rejected"
+            )
             updated = sign_manifest(key, updated)
             manifest_content = _json_bytes(updated)
             manifest_digest = hashlib.sha256(manifest_content).hexdigest()

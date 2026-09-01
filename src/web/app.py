@@ -3,6 +3,7 @@
 import json
 import hashlib
 import hmac
+import io
 import os
 import re
 import secrets
@@ -92,6 +93,7 @@ from src.processing.official_answer_ingestion import (
 from src.processing.secure_crop_artifacts import (
     MAX_MANIFEST_BYTES,
     SecureCropArtifactError,
+    load_hmac_key,
     read_file_at,
     validate_signed_manifest,
 )
@@ -964,40 +966,226 @@ def _basket_questions(connection):
     return result
 
 
-def _verified_asset_path(private_root, asset):
+def _verified_recovered_crop(connection, private_root, asset):
+    if asset["asset_kind"] != "complete_question":
+        raise ValueError("图片清单验证失败")
+    recovery = connection.execute(
+        """SELECT question_nos_json,source_paper_id,source_pdf_sha256,
+                  formal_question_count,formal_batch_sha256,
+                  new_crop_generation_id
+           FROM historical_v1_crop_recoveries WHERE import_job_id=?""",
+        (asset["import_job_id"],),
+    ).fetchone()
+    resumption = connection.execute(
+        """SELECT source_paper_id,source_pdf_sha256,formal_question_count,
+                  formal_batch_sha256,crop_question_count,crop_manifest_sha256,
+                  crop_generation_id,crop_manifest_signature
+           FROM historical_v1_pipeline_resumptions WHERE import_job_id=?""",
+        (asset["import_job_id"],),
+    ).fetchone()
+    source = connection.execute(
+        """SELECT import_job_id,source_question_no FROM question_sources
+           WHERE question_id=?""",
+        (asset["question_id"],),
+    ).fetchone()
+    if recovery is None or resumption is None or source is None:
+        raise ValueError("图片清单验证失败")
+    try:
+        question_nos = json.loads(recovery["question_nos_json"])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("图片清单验证失败") from error
+    if (
+        not isinstance(question_nos, list)
+        or not question_nos
+        or any(
+            not isinstance(number, int) or isinstance(number, bool) or number < 1
+            for number in question_nos
+        )
+        or len(question_nos) != len(set(question_nos))
+        or recovery["source_paper_id"] != resumption["source_paper_id"]
+        or recovery["source_pdf_sha256"] != resumption["source_pdf_sha256"]
+        or recovery["formal_question_count"]
+        != resumption["formal_question_count"]
+        or recovery["formal_batch_sha256"] != resumption["formal_batch_sha256"]
+        or recovery["new_crop_generation_id"]
+        != resumption["crop_generation_id"]
+        or resumption["crop_question_count"] != len(question_nos)
+        or source["import_job_id"] != asset["import_job_id"]
+        or not isinstance(source["source_question_no"], str)
+        or not source["source_question_no"].isdigit()
+    ):
+        raise ValueError("图片清单验证失败")
+    question_no = int(source["source_question_no"])
+    if source["source_question_no"] != str(question_no) or question_no not in question_nos:
+        raise ValueError("图片清单验证失败")
+
+    root_fd = None
+    try:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        root_fd = os.open(Path(private_root), flags)
+        manifest_relative = (
+            f"processing/import_job_{asset['import_job_id']}/question_crops.json"
+        )
+        manifest_bytes = read_file_at(
+            root_fd, manifest_relative, max_bytes=MAX_MANIFEST_BYTES,
+        )
+        if manifest_bytes.sha256 != resumption["crop_manifest_sha256"]:
+            raise ValueError("图片清单验证失败")
+        manifest = validate_signed_manifest(
+            json.loads(manifest_bytes.data.decode("utf-8")),
+            load_hmac_key(_job_dir(private_root, asset["import_job_id"])),
+            expected_job_id=asset["import_job_id"],
+        )
+        if (
+            manifest["import_job_id"] != asset["import_job_id"]
+            or manifest["generation_id"] != resumption["crop_generation_id"]
+            or manifest["signature"] != resumption["crop_manifest_signature"]
+        ):
+            raise ValueError("图片清单验证失败")
+        question_matches = [
+            entry for entry in manifest["questions"]
+            if entry["question_no"] == question_no
+        ]
+        path_matches = [
+            entry for entry in manifest["questions"]
+            if entry["output_relative_path"] == asset["relative_path"]
+        ]
+        if (
+            len(question_matches) != 1
+            or len(path_matches) != 1
+            or question_matches[0] is not path_matches[0]
+        ):
+            raise ValueError("图片清单验证失败")
+        entry = question_matches[0]
+        if entry["review_status"] != "ai_review_passed":
+            raise ValueError("图片清单验证失败")
+        image_relative = (
+            f"processing/import_job_{asset['import_job_id']}/{asset['relative_path']}"
+        )
+        image_bytes = read_file_at(
+            root_fd, image_relative, max_bytes=64 * 1024 * 1024,
+        )
+        if (
+            image_bytes.sha256 != entry["sha256"]
+            or image_bytes.size != entry["byte_size"]
+        ):
+            raise ValueError("图片文件验证失败")
+        with Image.open(io.BytesIO(image_bytes.data)) as image:
+            image.load()
+            if image.format != "PNG" or image.size != (entry["width"], entry["height"]):
+                raise ValueError("图片格式验证失败")
+        return image_bytes.data
+    except (SecureCropArtifactError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("图片清单验证失败") from error
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def _verified_asset(private_root, asset, connection=None):
     job_dir = _job_dir(private_root, asset["import_job_id"])
     manifest_name = "question_crops.json" if asset["asset_kind"] == "complete_question" else "figure_assets.json"
-    payload = _load_json(job_dir / manifest_name, "图片清单")
-    if not isinstance(payload, dict):
-        raise ValueError("图片清单验证失败")
-    entries = payload.get("questions", []) if asset["asset_kind"] == "complete_question" else payload.get("assets", [])
-    if not isinstance(entries, list):
-        raise ValueError("图片清单验证失败")
-    manifest = next((x for x in entries if isinstance(x, dict) and x.get("output_relative_path") == asset["relative_path"]), None)
-    source_status_valid = (
-        manifest is not None
-        and (
-            manifest.get("review_status") == "ai_review_passed"
-            if asset["asset_kind"] == "complete_question"
-            else manifest.get("review_status") in {"pending_ai_review", "ai_review_passed"}
-            and asset["review_status"] == "ai_review_passed"
-        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
     )
-    if (not source_status_valid
-            or any(manifest.get(key) != asset[key] for key in ("width", "height", "byte_size", "sha256"))):
-        raise ValueError("图片清单验证失败")
-    relative = str(asset["relative_path"])
-    relative_path = PurePosixPath(relative)
-    target = (job_dir / relative_path).resolve()
-    if (relative_path.is_absolute() or ".." in relative_path.parts or "\\" in relative
-            or not target.is_relative_to(job_dir.resolve()) or not target.is_file()
-            or target.suffix.lower() != ".png" or _file_sha256(target) != asset["sha256"]
-            or target.stat().st_size != asset["byte_size"]):
-        raise ValueError("图片文件验证失败")
-    with Image.open(target) as image:
-        if image.format != "PNG" or image.size != (asset["width"], asset["height"]):
-            raise ValueError("图片格式验证失败")
-    return target
+    try:
+        root_fd = os.open(Path(private_root), flags)
+    except OSError as error:
+        raise ValueError("图片清单验证失败") from error
+    fallback_to_recovery = False
+    try:
+        try:
+            manifest_relative = (
+                f"processing/import_job_{asset['import_job_id']}/{manifest_name}"
+            )
+            manifest_bytes = read_file_at(
+                root_fd, manifest_relative, max_bytes=MAX_MANIFEST_BYTES
+            )
+            payload = json.loads(manifest_bytes.data.decode("utf-8"))
+        except (
+            SecureCropArtifactError, UnicodeError, json.JSONDecodeError
+        ) as error:
+            raise ValueError("图片清单验证失败") from error
+        if not isinstance(payload, dict):
+            raise ValueError("图片清单验证失败")
+        entries = (
+            payload.get("questions", [])
+            if asset["asset_kind"] == "complete_question"
+            else payload.get("assets", [])
+        )
+        if not isinstance(entries, list):
+            raise ValueError("图片清单验证失败")
+        manifest = next(
+            (
+                entry for entry in entries
+                if isinstance(entry, dict)
+                and entry.get("output_relative_path") == asset["relative_path"]
+            ),
+            None,
+        )
+        source_status_valid = (
+            manifest is not None
+            and (
+                manifest.get("review_status") == "ai_review_passed"
+                if asset["asset_kind"] == "complete_question"
+                else manifest.get("review_status")
+                in {"pending_ai_review", "ai_review_passed"}
+                and asset["review_status"] == "ai_review_passed"
+            )
+        )
+        metadata_matches = source_status_valid and not any(
+            manifest.get(key) != asset[key]
+            for key in ("width", "height", "byte_size", "sha256")
+        )
+        if not metadata_matches:
+            if connection is None or asset["asset_kind"] != "complete_question":
+                raise ValueError("图片清单验证失败")
+            fallback_to_recovery = True
+        else:
+            relative = str(asset["relative_path"])
+            relative_path = PurePosixPath(relative)
+            if relative_path.suffix.lower() != ".png":
+                raise ValueError("图片文件验证失败")
+            image_relative = (
+                f"processing/import_job_{asset['import_job_id']}/{relative}"
+            )
+            try:
+                image_bytes = read_file_at(
+                    root_fd, image_relative, max_bytes=64 * 1024 * 1024
+                )
+            except SecureCropArtifactError as error:
+                raise ValueError("图片文件验证失败") from error
+            if (
+                image_bytes.sha256 != asset["sha256"]
+                or image_bytes.size != asset["byte_size"]
+            ):
+                raise ValueError("图片文件验证失败")
+            with Image.open(io.BytesIO(image_bytes.data)) as image:
+                image.load()
+                if image.format != "PNG" or image.size != (
+                    asset["width"], asset["height"]
+                ):
+                    raise ValueError("图片格式验证失败")
+            target = (job_dir / relative_path).resolve()
+            return target, image_bytes.data
+    finally:
+        os.close(root_fd)
+    if fallback_to_recovery:
+        content = _verified_recovered_crop(connection, private_root, asset)
+        relative = str(asset["relative_path"])
+        target = (job_dir / PurePosixPath(relative)).resolve()
+        return target, content
+    raise ValueError("图片清单验证失败")
+
+
+def _verified_asset_path(private_root, asset, connection=None):
+    return _verified_asset(private_root, asset, connection)[0]
 
 
 EXPORT_OPTION_NAMES = (
@@ -1045,7 +1233,7 @@ def _exercise_questions(questions, options):
     return result
 
 
-def _export_markdown(private_root, questions, options, destination):
+def _export_markdown(private_root, questions, options, destination, connection):
     lines = ["# 数学练习", ""]
     assets_dir = destination / "assets"
     for question in _exercise_questions(questions, options):
@@ -1067,10 +1255,11 @@ def _export_markdown(private_root, questions, options, destination):
                 lines += [f"{sub['display_label']}{sub['stem_markdown']}", ""]
         if question["display_assets"]:
             for index, asset in enumerate(question["display_assets"], 1):
-                source = _verified_asset_path(private_root, asset)
+                _source, content = _verified_asset(private_root, asset, connection)
                 assets_dir.mkdir(exist_ok=True)
                 filename = f"{number:03d}_{index:02d}_{asset['asset_kind']}.png"
-                shutil.copyfile(source, assets_dir / filename)
+                output = assets_dir / filename
+                output.write_bytes(content)
                 lines += [f"![第{number}题图片](assets/{filename})", ""]
         if options["include_source"]:
             lines += [f"来源：{question['source_paper_name']} · {question['exam_year'] or '年份未知'} · 原题号 {question['source_question_no']}", ""]
@@ -2984,7 +3173,7 @@ def create_app(
                     if content["display_assets"]:
                         try:
                             for index, asset in enumerate(content["display_assets"], 1):
-                                _verified_asset_path(private_root, asset)
+                                _verified_asset_path(private_root, asset, connection)
                                 asset["url"] = (
                                     f"/question-assets/{quote(question['question_code'], safe='')}/"
                                     f"{quote(asset['relative_path'], safe='/')}"
@@ -3230,24 +3419,37 @@ def create_app(
             options = _parse_export_options(form)
         except ValueError as error:
             return _error(request, templates, str(error), 400)
-        with _connect(database_path) as connection:
-            questions = _basket_questions(connection)
-            if not questions: return _error(request, templates, "空选题篮不能导出", 400)
-            basket_id = connection.execute("SELECT id FROM baskets WHERE basket_key='default'").fetchone()[0]
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        final_dir = private_root / "exports" / stamp
-        staging = Path(tempfile.mkdtemp(prefix="basket-export-", dir=private_root))
+        staging = None
+        final_dir = None
         try:
-            target = _export_markdown(private_root, questions, options, staging)
-            digest = _file_sha256(target)
-            final_dir.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(staging, final_dir)
-            relative = final_dir.relative_to(private_root).joinpath("练习.md").as_posix()
+            with _connect(database_path) as connection:
+                connection.execute("PRAGMA query_only = ON")
+                questions = _basket_questions(connection)
+                if not questions:
+                    return _error(request, templates, "空选题篮不能导出", 400)
+                basket_id = connection.execute(
+                    "SELECT id FROM baskets WHERE basket_key='default'"
+                ).fetchone()[0]
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                final_dir = private_root / "exports" / stamp
+                staging = Path(
+                    tempfile.mkdtemp(prefix="basket-export-", dir=private_root)
+                )
+                target = _export_markdown(
+                    private_root, questions, options, staging, connection
+                )
+                digest = _file_sha256(target)
+                final_dir.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(staging, final_dir)
+                relative = final_dir.relative_to(private_root).joinpath("练习.md").as_posix()
             with _connect(database_path) as connection:
                 with connection:
                     export_id = connection.execute("INSERT INTO basket_exports(basket_id,question_count,options_json,output_path,sha256) VALUES(?,?,?,?,?)", (basket_id,len(questions),json.dumps(options,ensure_ascii=False,sort_keys=True),relative,digest)).lastrowid
         except (OSError, ValueError, sqlite3.Error, UnidentifiedImageError):
-            shutil.rmtree(staging, ignore_errors=True); shutil.rmtree(final_dir, ignore_errors=True)
+            if staging is not None:
+                shutil.rmtree(staging, ignore_errors=True)
+            if final_dir is not None:
+                shutil.rmtree(final_dir, ignore_errors=True)
             return _error(request, templates, "导出失败，未留下半成品", 500)
         return RedirectResponse(f"/basket/exports/{export_id}", status_code=303)
 
@@ -3282,10 +3484,10 @@ def create_app(
                        WHERE q.question_code=? AND q.deleted_at IS NULL AND a.relative_path=?""", (question_code, path.as_posix())
                 ).fetchone()
                 if asset is None: return _error(request, templates, "不允许访问该文件", 403)
-            target = _verified_asset_path(private_root, asset)
+                _target, content = _verified_asset(private_root, asset, connection)
         except (sqlite3.Error, ValueError, OSError, UnidentifiedImageError):
             return _error(request, templates, "图片暂时无法读取", 404)
-        return FileResponse(target, media_type="image/png")
+        return Response(content=content, media_type="image/png")
 
     @application.get("/review/{job_id}", response_class=HTMLResponse)
     def review(request: Request, job_id: int, status: str | None = None):

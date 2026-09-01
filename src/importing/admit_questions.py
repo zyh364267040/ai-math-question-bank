@@ -50,6 +50,54 @@ MAX_JSON_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_PNG_ARTIFACT_BYTES = 64 * 1024 * 1024
 
 
+@dataclass(frozen=True)
+class BackupFileIdentity:
+    file_dev: int
+    file_ino: int
+    file_size: int
+    parent_dev: int
+    parent_ino: int
+
+
+def verify_backup_file_identity(path: str | Path, identity: BackupFileIdentity) -> None:
+    """Prove the canonical parent entry and target still name the backed-up inode."""
+    target = Path(os.path.abspath(os.fspath(path)))
+    if target.parts[:2] == (os.sep, "var"):
+        target = Path("/private").joinpath(*target.parts[1:])
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory or target.name in {"", ".", ".."}:
+        raise AdmissionError("数据库备份创建失败")
+    descriptors = [os.open(os.sep, os.O_RDONLY | directory | nofollow)]
+    target_fd = None
+    try:
+        for part in target.parent.parts[1:]:
+            descriptors.append(os.open(
+                part, os.O_RDONLY | directory | nofollow, dir_fd=descriptors[-1],
+            ))
+        parent = os.fstat(descriptors[-1])
+        target_fd = os.open(target.name, os.O_RDONLY | nofollow, dir_fd=descriptors[-1])
+        current = os.fstat(target_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or (parent.st_dev, parent.st_ino) != (identity.parent_dev, identity.parent_ino)
+            or (current.st_dev, current.st_ino, current.st_size)
+            != (identity.file_dev, identity.file_ino, identity.file_size)
+        ):
+            raise AdmissionError("数据库备份创建失败")
+    except (OSError, AdmissionError) as exc:
+        if isinstance(exc, AdmissionError):
+            raise
+        raise AdmissionError("数据库备份创建失败") from exc
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 class AdmissionError(ValueError):
     """The batch cannot be admitted without weakening its safety guarantees."""
 
@@ -313,7 +361,14 @@ def _valid_question_number(value: object) -> bool:
     )
 
 
-def _load_context(connection, private_root: Path, job_id: int, artifact_lock=None):
+def _load_context(
+    connection,
+    private_root: Path,
+    job_id: int,
+    artifact_lock=None,
+    *,
+    eligible_question_numbers: tuple[str, ...] | None = None,
+):
     job = connection.execute(
         """SELECT j.id,j.source_paper_id,s.sha256,s.region_code,s.exam_year,
                   s.exam_type_code,s.paper_name,s.stored_path
@@ -326,7 +381,11 @@ def _load_context(connection, private_root: Path, job_id: int, artifact_lock=Non
         job_dir = private_root / "processing" / f"import_job_{job_id}"
         with _job_artifact_lock(job_dir) as acquired:
             return _load_context(
-                connection, private_root, job_id, artifact_lock=acquired
+                connection,
+                private_root,
+                job_id,
+                artifact_lock=acquired,
+                eligible_question_numbers=eligible_question_numbers,
             )
     job_dir = artifact_lock.path
     job_fd = artifact_lock.descriptor
@@ -344,6 +403,13 @@ def _load_context(connection, private_root: Path, job_id: int, artifact_lock=Non
             or any(not _valid_question_number(number) for number in numbers)
             or len(set(numbers)) != len(numbers)):
         raise AdmissionError("候选题号非法或重复")
+    eligible_numbers = (
+        set(numbers)
+        if eligible_question_numbers is None
+        else set(eligible_question_numbers)
+    )
+    if not eligible_numbers or not eligible_numbers.issubset(numbers):
+        raise AdmissionError("准入题号范围非法")
     _validate_optional_markdown_fields(questions)
     audit, _audit_snapshot = _read_artifact_json(
         job_fd, "ai_audit.json", "AI审核清单", snapshots
@@ -399,7 +465,11 @@ def _load_context(connection, private_root: Path, job_id: int, artifact_lock=Non
         if not isinstance(entry, dict) or entry.get("kind") != "question_figure":
             continue
         number = entry.get("question_no")
-        if number in figures or number not in numbers or entry.get("review_status") != "pending_ai_review":
+        if number not in numbers:
+            raise AdmissionError("必要配图未通过审核")
+        if number not in eligible_numbers:
+            continue
+        if number in figures or entry.get("review_status") != "pending_ai_review":
             raise AdmissionError("必要配图未通过审核")
         _safe_png(
             job_dir, job_fd, entry.get("output_relative_path"), entry, snapshots
@@ -1094,16 +1164,127 @@ def admit_questions(
             connection.close()
 
 
-def backup_database(database_path=DEFAULT_DATABASE_PATH, backup_dir=None):
+def backup_database(
+    database_path=DEFAULT_DATABASE_PATH, backup_dir=None, *, _with_identity=False,
+    _source_connection=None,
+):
     source = Path(database_path)
     target_dir = Path(backup_dir or source.parent / "backups")
-    target_dir.mkdir(parents=True, exist_ok=True)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory:
+        raise AdmissionError("数据库备份创建失败")
+    absolute_dir = Path(os.path.abspath(os.fspath(target_dir)))
+    if absolute_dir.parts[:2] == (os.sep, "var"):
+        absolute_dir = Path("/private").joinpath(*absolute_dir.parts[1:])
+    if len(absolute_dir.parts) < 2:
+        raise AdmissionError("数据库备份创建失败")
+    directory_fds = [os.open(os.sep, os.O_RDONLY | directory | nofollow)]
+    try:
+        for part in absolute_dir.parts[1:-1]:
+            directory_fds.append(os.open(
+                part, os.O_RDONLY | directory | nofollow,
+                dir_fd=directory_fds[-1],
+            ))
+        try:
+            os.mkdir(absolute_dir.name, 0o700, dir_fd=directory_fds[-1])
+            os.fsync(directory_fds[-1])
+        except FileExistsError:
+            pass
+        directory_fds.append(os.open(
+            absolute_dir.name, os.O_RDONLY | directory | nofollow,
+            dir_fd=directory_fds[-1],
+        ))
+    except BaseException:
+        for item in reversed(directory_fds):
+            os.close(item)
+        raise
+    target_dir_fd = directory_fds[-1]
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    target = target_dir / f"question-bank-{stamp}.db"
-    with closing(sqlite3.connect(source)) as src:
-        with closing(sqlite3.connect(target)) as dst:
-            src.backup(dst)
-    return target, _sha256(target)
+    target_name = f"question-bank-{stamp}.db"
+    # Preserve the caller-visible spelling (notably macOS /var) while every
+    # identity check below normalizes and walks the canonical /private path.
+    target = Path(os.path.abspath(os.fspath(target_dir))) / target_name
+    descriptor = os.open(
+        target_name, os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow,
+        0o600, dir_fd=target_dir_fd,
+    )
+    created = os.fstat(descriptor)
+    owns_source = _source_connection is None
+    src = _source_connection
+    try:
+        if src is None:
+            source_info = source.lstat()
+            if (
+                not stat.S_ISREG(source_info.st_mode)
+                or source_info.st_nlink != 1
+                or source.is_symlink()
+            ):
+                raise AdmissionError("数据库备份创建失败")
+            src = sqlite3.connect(source)
+            current = source.lstat()
+            if (current.st_dev, current.st_ino) != (source_info.st_dev, source_info.st_ino):
+                raise AdmissionError("数据库备份创建失败")
+        payload = src.serialize()
+        if not payload:
+            raise AdmissionError("数据库备份创建失败")
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+        check_fd = os.open(target_name, os.O_RDONLY | nofollow, dir_fd=target_dir_fd)
+        try:
+            current = os.fstat(check_fd)
+        finally:
+            os.close(check_fd)
+        written_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(written_info.st_mode)
+            or written_info.st_nlink != 1
+            or (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino)
+            or (written_info.st_dev, written_info.st_ino) != (created.st_dev, created.st_ino)
+            or written_info.st_size != len(payload)
+        ):
+            raise AdmissionError("数据库备份创建失败")
+        with closing(sqlite3.connect(":memory:")) as verify:
+            verify.deserialize(payload)
+            if verify.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise AdmissionError("数据库备份创建失败")
+        os.fsync(target_dir_fd)
+        parent_info = os.fstat(target_dir_fd)
+        identity = BackupFileIdentity(
+            written_info.st_dev, written_info.st_ino, written_info.st_size,
+            parent_info.st_dev, parent_info.st_ino,
+        )
+        verify_backup_file_identity(target, identity)
+    except BaseException:
+        try:
+            current_fd = os.open(target_name, os.O_RDONLY | nofollow, dir_fd=target_dir_fd)
+            try:
+                current = os.fstat(current_fd)
+            finally:
+                os.close(current_fd)
+            if (
+                stat.S_ISREG(current.st_mode)
+                and current.st_nlink == 1
+                and (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino)
+            ):
+                os.unlink(target_name, dir_fd=target_dir_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        if owns_source and src is not None:
+            src.close()
+        os.close(descriptor)
+        for item in reversed(directory_fds):
+            os.close(item)
+    digest = hashlib.sha256(payload).hexdigest()
+    result = (target, digest)
+    if _with_identity:
+        return (*result, identity)
+    return result
 
 
 def main():

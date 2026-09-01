@@ -67,6 +67,194 @@ class DatabaseSchemaTests(unittest.TestCase):
             "SELECT id FROM knowledge_points WHERE code = ?", (code,)
         ).fetchone()[0]
 
+    def test_initializer_adds_historical_residual_no_answer_authority_idempotently(self):
+        self.connection.execute(
+            "DROP TRIGGER historical_residual_no_answer_decisions_immutable"
+        )
+        self.connection.execute(
+            "DROP TRIGGER historical_residual_no_answer_decisions_delete_immutable"
+        )
+        self.connection.execute("DROP TABLE historical_residual_no_answer_decisions")
+        self.connection.commit()
+        self.connection.close()
+
+        self.connection = initialize_database(self.db_path)
+        columns = {
+            row[1] for row in self.connection.execute(
+                "PRAGMA table_info(historical_residual_no_answer_decisions)"
+            )
+        }
+        self.assertEqual(
+            {"import_job_id", "confirmation_token", "evidence_json",
+             "evidence_sha256", "decided_at"},
+            columns,
+        )
+        triggers = {
+            row[0] for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'historical_residual_no_answer_decisions_%'"
+            )
+        }
+        self.assertEqual(
+            {"historical_residual_no_answer_decisions_immutable",
+             "historical_residual_no_answer_decisions_delete_immutable"},
+            triggers,
+        )
+        self.connection.close()
+        self.connection = initialize_database(self.db_path)
+        self.assertEqual(1, self.connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' "
+            "AND name='historical_residual_no_answer_decisions'"
+        ).fetchone()[0])
+
+    def test_initializer_adds_historical_residual_classification_lease_idempotently(self):
+        columns = {
+            row[1] for row in self.connection.execute(
+                "PRAGMA table_info(historical_residual_classification_runs)"
+            )
+        }
+        self.assertTrue({"heartbeat_at", "lease_expires_at", "updated_at"} <= columns)
+        self.connection.close()
+        self.connection = initialize_database(self.db_path)
+        columns_after = {
+            row[1] for row in self.connection.execute(
+                "PRAGMA table_info(historical_residual_classification_runs)"
+            )
+        }
+        self.assertEqual(columns, columns_after)
+
+    def test_initializer_migrates_completed_legacy_residual_classification_safely(self):
+        self.connection.execute(
+            "DROP TABLE historical_residual_classification_runs"
+        )
+        self.connection.execute(
+            """CREATE TABLE historical_residual_classification_runs (
+                import_job_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                question_count INTEGER NOT NULL,
+                full_question_nos_json TEXT NOT NULL,
+                existing_question_nos_json TEXT NOT NULL,
+                residual_question_nos_json TEXT NOT NULL,
+                formal_question_count INTEGER NOT NULL,
+                formal_batch_sha256 TEXT NOT NULL,
+                candidate_sha256 TEXT NOT NULL,
+                audit_sha256 TEXT NOT NULL,
+                crop_manifest_sha256 TEXT NOT NULL,
+                crop_generation_id TEXT NOT NULL,
+                crop_manifest_signature TEXT NOT NULL,
+                audit_completed_at TEXT NOT NULL,
+                draft_bindings_sha256 TEXT NOT NULL,
+                taxonomy_sha256 TEXT NOT NULL,
+                input_sha256 TEXT NOT NULL,
+                evidence_json TEXT,
+                evidence_sha256 TEXT,
+                claim_token TEXT,
+                error_message TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                applied_at TEXT
+            )"""
+        )
+        legacy_columns = tuple(
+            row[1] for row in self.connection.execute(
+                "PRAGMA table_info(historical_residual_classification_runs)"
+            )
+        )
+        legacy_values = (
+            41, "completed", "completed", 2, '["12","13"]', '["12"]',
+            '["13"]', 1, "a" * 64, "b" * 64, "c" * 64, "d" * 64,
+            "e" * 32, "f" * 64, "2026-06-01T01:02:03+00:00",
+            "1" * 64, "2" * 64, "3" * 64,
+            '{"questions":[{"source_question_no":"13"}]}', "4" * 64,
+            None, None, "2026-06-01T02:03:04+00:00",
+            "2026-06-01T03:04:05+00:00", "2026-06-01T04:05:06+00:00",
+        )
+        self.connection.execute(
+            f"INSERT INTO historical_residual_classification_runs "
+            f"({','.join(legacy_columns)}) VALUES "
+            f"({','.join('?' for _ in legacy_columns)})",
+            legacy_values,
+        )
+        self.connection.execute(
+            """CREATE TRIGGER historical_residual_classification_completed_immutable
+               BEFORE UPDATE ON historical_residual_classification_runs
+               WHEN OLD.status='completed'
+               BEGIN
+                   SELECT RAISE(
+                       ABORT,
+                       'completed historical residual classification is immutable'
+                   );
+               END"""
+        )
+        self.connection.commit()
+        before_sequence = self.sequence_snapshot(self.connection)
+        before_business_row = self.connection.execute(
+            f"SELECT {','.join(legacy_columns)} "
+            "FROM historical_residual_classification_runs"
+        ).fetchone()
+        before_database = self.database_snapshot(self.connection)
+        self.connection.close()
+
+        with mock.patch.object(
+            initialize_module,
+            "_upsert_knowledge_points",
+            side_effect=RuntimeError("injected post-migration failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "injected post-migration failure"
+            ):
+                initialize_database(self.db_path)
+        self.connection = sqlite3.connect(self.db_path)
+        self.assertEqual(before_sequence, self.sequence_snapshot(self.connection))
+        self.assertEqual(before_database, self.database_snapshot(self.connection))
+        self.connection.close()
+
+        self.connection = initialize_database(self.db_path)
+
+        self.assertEqual(
+            before_business_row,
+            self.connection.execute(
+                f"SELECT {','.join(legacy_columns)} "
+                "FROM historical_residual_classification_runs"
+            ).fetchone(),
+        )
+        self.assertEqual(
+            (
+                "2026-06-01T02:03:04+00:00",
+                None,
+                "2026-06-01T02:03:04+00:00",
+            ),
+            self.connection.execute(
+                "SELECT heartbeat_at,lease_expires_at,updated_at "
+                "FROM historical_residual_classification_runs"
+            ).fetchone(),
+        )
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type='trigger' "
+                "AND name='historical_residual_classification_completed_immutable'"
+            ).fetchone()[0],
+        )
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "completed historical residual classification is immutable",
+        ):
+            self.connection.execute(
+                "UPDATE historical_residual_classification_runs "
+                "SET applied_at='changed' WHERE import_job_id=41"
+            )
+        self.connection.rollback()
+        self.assertEqual(before_sequence, self.sequence_snapshot(self.connection))
+        after_first_database = self.database_snapshot(self.connection)
+        after_first_sequence = self.sequence_snapshot(self.connection)
+
+        initialize_database(self.db_path).close()
+
+        self.assertEqual(after_first_sequence, self.sequence_snapshot(self.connection))
+        self.assertEqual(after_first_database, self.database_snapshot(self.connection))
+
     def insert_question(self, code="TJ-2025-GK-MATH-001", **overrides):
         knowledge_point_id = overrides.pop(
             "primary_knowledge_point_id", self.insert_knowledge_point()

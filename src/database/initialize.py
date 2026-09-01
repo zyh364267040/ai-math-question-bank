@@ -286,6 +286,17 @@ def _schema_table_definition(schema, table):
     raise sqlite3.OperationalError(f"missing schema table definition: {table}")
 
 
+def _schema_trigger_definition(schema, trigger):
+    for statement in _schema_statements(schema):
+        normalized = _normalize_schema_sql(statement)
+        words = normalized.split()
+        if words[:2] == ["create", "trigger"] and words[2] == trigger:
+            return statement[statement.lower().find("create "):]
+    raise sqlite3.OperationalError(
+        f"missing schema trigger definition: {trigger}"
+    )
+
+
 def _capture_and_drop_table(connection, table):
     quoted = _quote_catalog_identifier(table)
     columns = [
@@ -491,6 +502,31 @@ def _refresh_web_admission_protection_triggers(connection, schema):
     _execute_script_transactionally(connection, trigger_schema)
 
 
+def _refresh_completed_formal_admissions_view(connection, schema):
+    """Install the canonical authority shared by every formal-data guard."""
+    definition = None
+    for statement in _schema_statements(schema):
+        normalized = _normalize_schema_sql(statement)
+        if normalized.startswith("create view completed_formal_admissions "):
+            definition = statement[statement.lower().find("create "):]
+            break
+    if definition is None:
+        raise sqlite3.OperationalError(
+            "completed formal admission authority view is missing"
+        )
+    actual = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='view' "
+        "AND name='completed_formal_admissions'"
+    ).fetchone()
+    if (
+        actual is not None
+        and _normalize_schema_sql(actual[0]) == _normalize_schema_sql(definition)
+    ):
+        return
+    connection.execute("DROP VIEW IF EXISTS completed_formal_admissions")
+    connection.execute(definition)
+
+
 def _ensure_schema_migrations(connection):
     columns = {row[1] for row in connection.execute("PRAGMA table_info(knowledge_points)")}
     if "sort_order" not in columns:
@@ -648,6 +684,39 @@ def _ensure_schema_migrations(connection):
         )
     schema = SCHEMA_PATH.read_text(encoding="utf-8")
     _refresh_knowledge_classification_schema(connection, schema)
+    residual_classification_columns = {
+        row[1] for row in connection.execute(
+            "PRAGMA table_info(historical_residual_classification_runs)"
+        )
+    }
+    residual_classification_missing = [
+        name for name in ("heartbeat_at", "lease_expires_at", "updated_at")
+        if residual_classification_columns and name not in residual_classification_columns
+    ]
+    if residual_classification_missing:
+        trigger = "historical_residual_classification_completed_immutable"
+        # BEGIN IMMEDIATE already excludes concurrent writers. SQLite DDL is
+        # transactional, so any later failure restores the old trigger and
+        # table shape instead of exposing completed rows without protection.
+        connection.execute(
+            f"DROP TRIGGER IF EXISTS {_quote_catalog_identifier(trigger)}"
+        )
+        for name in residual_classification_missing:
+            connection.execute(
+                f"ALTER TABLE historical_residual_classification_runs ADD COLUMN {name} TEXT"
+            )
+        connection.execute(
+            """UPDATE historical_residual_classification_runs
+               SET heartbeat_at=COALESCE(heartbeat_at,started_at),
+                   lease_expires_at=CASE WHEN status='processing'
+                       THEN COALESCE(lease_expires_at,'1970-01-01T00:00:00+00:00')
+                       ELSE NULL END,
+                   updated_at=COALESCE(updated_at,started_at)
+               WHERE heartbeat_at IS NULL OR updated_at IS NULL
+                  OR (status='processing' AND lease_expires_at IS NULL)
+                  OR (status!='processing' AND lease_expires_at IS NOT NULL)"""
+        )
+        connection.execute(_schema_trigger_definition(schema, trigger))
     web_admission_sql = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' "
         "AND name='import_web_admission_runs'"
@@ -690,6 +759,7 @@ def _ensure_schema_migrations(connection):
                 f"ALTER TABLE {table} ADD COLUMN draft_batch_sha256 TEXT "
                 "CHECK (draft_batch_sha256 IS NULL OR length(draft_batch_sha256)=64)"
             )
+    _refresh_completed_formal_admissions_view(connection, schema)
     _refresh_web_admission_protection_triggers(connection, schema)
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_questions_deleted ON questions(deleted_at)"
