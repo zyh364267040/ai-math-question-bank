@@ -6,12 +6,12 @@ AI参考答案属于独立数据域，不会写入题目及小问的原卷答案
 
 公共迁移新增 `ai_reference_answers` 主表和 `ai_reference_subquestion_answers` 子表。主表以 `question_id` 唯一绑定正式题目，保存题目内容哈希、答案与解析、三个模型标识、最终复核结论和备注、四份输入文件的 SHA-256 及创建时间；子表通过外键和 `display_order` 保存小问答案与解析。子表的 INSERT，以及修改 `ai_reference_answer_id`、`subquestion_id` 或 `display_order` 的 UPDATE，都会经过数据库触发器校验：小问必须属于 AI 主记录对应的同一题，且子记录顺序必须等于正式小问顺序；违反时分别以固定错误 `AI reference subquestion question mismatch` 或 `AI reference subquestion display_order mismatch` ABORT。
 
-导入只接受同时满足以下条件的 10 题清单：
+导入只接受同时满足以下条件的每批 1—10 题清单：
 
 - 题目已进入 `questions` 且有 `question_sources` 正式来源绑定；
 - 题目未删除，数据库中的当前 `content_hash` 与四份文件完全一致；
 - `import_answer_sources.source_answer_state` 明确等于 `source_has_no_answer`；
-- generator、independent、final-review 与 source 的 10 个 code/hash 逐项同序一致；
+- generator、independent、final-review 与 source 的题数必须相同，且全部 code/hash 逐项同序一致；
 - generator、independent 和 final-review 的模型标识都必须是非空且无首尾空白的规范字符串；generator 与 independent 的模型标识必须不同，final-review 可以与 independent 使用相同模型标识；
 - source、generator、independent、final-review 四份输入文件的实际字节 SHA-256 必须两两不同；
 - generator、independent 以及 final-review 中 `passed` 项的小问 `display_order` 与正式题现有小问完全一致；

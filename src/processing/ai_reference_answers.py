@@ -9,7 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 
-SOURCE_QUESTION_COUNT = 10
+MIN_BATCH_QUESTION_COUNT = 1
+MAX_BATCH_QUESTION_COUNT = 10
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_ANSWER_LENGTH = 50_000
 MAX_ANALYSIS_LENGTH = 100_000
@@ -139,8 +140,11 @@ def _parse_source(payload):
     if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
         raise AiReferenceAnswerError("unsupported source schema_version")
     questions = payload["questions"]
-    if not isinstance(questions, list) or len(questions) != SOURCE_QUESTION_COUNT:
-        raise AiReferenceAnswerError("source must contain exactly 10 questions")
+    if (
+        not isinstance(questions, list)
+        or not MIN_BATCH_QUESTION_COUNT <= len(questions) <= MAX_BATCH_QUESTION_COUNT
+    ):
+        raise AiReferenceAnswerError("source must contain between 1 and 10 questions")
     parsed = []
     for index, item in enumerate(questions):
         location = f"source.questions[{index}]"
@@ -157,8 +161,13 @@ def _parse_solution(payload, kind):
         raise AiReferenceAnswerError(f"unsupported {kind} schema_version")
     model = _model(payload["model"], f"{kind}.model")
     questions = payload["questions"]
-    if not isinstance(questions, list) or len(questions) != SOURCE_QUESTION_COUNT:
-        raise AiReferenceAnswerError(f"{kind} coverage must contain exactly 10 questions")
+    if (
+        not isinstance(questions, list)
+        or not MIN_BATCH_QUESTION_COUNT <= len(questions) <= MAX_BATCH_QUESTION_COUNT
+    ):
+        raise AiReferenceAnswerError(
+            f"{kind} coverage must contain between 1 and 10 questions"
+        )
     parsed = []
     for index, item in enumerate(questions):
         location = f"{kind}.questions[{index}]"
@@ -192,8 +201,13 @@ def _parse_review(payload):
         raise AiReferenceAnswerError("unsupported final_review schema_version")
     model = _model(payload["model"], "final_review.model")
     questions = payload["questions"]
-    if not isinstance(questions, list) or len(questions) != SOURCE_QUESTION_COUNT:
-        raise AiReferenceAnswerError("final_review coverage must contain exactly 10 questions")
+    if (
+        not isinstance(questions, list)
+        or not MIN_BATCH_QUESTION_COUNT <= len(questions) <= MAX_BATCH_QUESTION_COUNT
+    ):
+        raise AiReferenceAnswerError(
+            "final_review coverage must contain between 1 and 10 questions"
+        )
     parsed = []
     for index, item in enumerate(questions):
         location = f"final_review.questions[{index}]"

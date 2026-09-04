@@ -21,7 +21,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="严格校验并导入独立的 AI参考答案（默认仅 dry-run）"
     )
-    parser.add_argument("source_json", type=Path, help="10 题源清单 JSON")
+    parser.add_argument("source_json", type=Path, help="每批 1—10 题源清单 JSON")
     parser.add_argument(
         "generator_json", type=Path,
         help="第一轮生成证据 JSON（不作为展示内容）",

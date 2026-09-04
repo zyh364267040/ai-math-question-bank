@@ -283,6 +283,76 @@ class AiReferenceAnswerImportTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM ai_reference_subquestion_answers"
             ).fetchone()[0])
 
+    def test_accepts_one_and_three_question_batches_for_dry_run_and_apply(self):
+        originals = tuple(copy.deepcopy(payload) for payload in (
+            self.source, self.generator, self.independent, self.final_review,
+        ))
+        for question_count in (1, 3):
+            with self.subTest(question_count=question_count):
+                (
+                    self.source, self.generator, self.independent,
+                    self.final_review,
+                ) = tuple(copy.deepcopy(payload) for payload in originals)
+                db_copy = self.root / f"batch-{question_count}.db"
+                shutil.copy2(self.db, db_copy)
+                for payload in (
+                    self.source, self.generator, self.independent,
+                    self.final_review,
+                ):
+                    payload["questions"] = payload["questions"][:question_count]
+                paths = self._write_payloads()
+
+                dry_run = import_ai_reference_answers(db_copy, *paths)
+                self.assertEqual({
+                    "inserted": question_count,
+                    "unchanged": 0,
+                    "skipped": 0,
+                    "applied": False,
+                }, dry_run)
+                with sqlite3.connect(db_copy) as connection:
+                    self.assertEqual(0, connection.execute(
+                        "SELECT COUNT(*) FROM ai_reference_answers"
+                    ).fetchone()[0])
+
+                applied = import_ai_reference_answers(
+                    db_copy, *paths, apply=True
+                )
+                self.assertEqual({
+                    "inserted": question_count,
+                    "unchanged": 0,
+                    "skipped": 0,
+                    "applied": True,
+                }, applied)
+                with sqlite3.connect(db_copy) as connection:
+                    self.assertEqual(question_count, connection.execute(
+                        "SELECT COUNT(*) FROM ai_reference_answers"
+                    ).fetchone()[0])
+
+    def test_rejects_zero_and_eleven_question_batches_without_writes(self):
+        originals = tuple(copy.deepcopy(payload) for payload in (
+            self.source, self.generator, self.independent, self.final_review,
+        ))
+        for question_count in (0, 11):
+            with self.subTest(question_count=question_count):
+                (
+                    self.source, self.generator, self.independent,
+                    self.final_review,
+                ) = tuple(copy.deepcopy(payload) for payload in originals)
+                for payload in (
+                    self.source, self.generator, self.independent,
+                    self.final_review,
+                ):
+                    questions = payload["questions"]
+                    payload["questions"] = (
+                        [] if question_count == 0
+                        else questions + [copy.deepcopy(questions[0])]
+                    )
+                with self.assertRaisesRegex(
+                    AiReferenceAnswerError, "between 1 and 10"
+                ):
+                    self._run(apply=True)
+                self.assertEqual(0, self._count())
+
     def _official_snapshot(self):
         with sqlite3.connect(self.db) as connection:
             return (
@@ -321,9 +391,16 @@ class AiReferenceAnswerImportTests(unittest.TestCase):
 
     def test_strict_coverage_order_shape_lengths_and_subquestions(self):
         mutations = (
-            (lambda: self.source["questions"].pop(), "exactly 10"),
+            (lambda: self.source["questions"].pop(), "coverage"),
             (lambda: self.generator["questions"].pop(), "coverage"),
+            (lambda: self.independent["questions"].reverse(), "coverage"),
             (lambda: self.final_review["questions"].reverse(), "order"),
+            (lambda: self.generator["questions"][0].update({
+                "question_code": self.source["questions"][1]["question_code"],
+            }), "coverage"),
+            (lambda: self.independent["questions"][0].update({
+                "question_content_hash": "f" * 64,
+            }), "coverage"),
             (lambda: self.generator.update({"unexpected": True}), "unknown"),
             (lambda: self.generator["questions"][0].update({"answer_markdown": ""}), "non-empty"),
             (lambda: self.generator["questions"][0].update({"answer_markdown": "x" * 50001}), "length"),
