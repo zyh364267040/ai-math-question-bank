@@ -10,6 +10,7 @@
     {% if options.include_knowledge %}<p class="preview-meta">预览知识点：{{ q.primary_knowledge_name }}</p>{% endif %}
     {% if options.include_answers %}<p class="preview-answer"><b>答案：</b> {{ q.answer_display }}</p>{% endif %}
     {% if options.include_analysis %}<p class="preview-analysis"><b>解析：</b> {{ q.analysis_display }}</p>{% endif %}
+    {% if options.include_ai_answers and q.ai_reference_answer %}<section class="preview-ai-reference"><h4>AI参考答案</h4><p class="answer-disclaimer">AI生成并经复核，不是原卷官方答案</p><p><b>答案：</b> {{ q.ai_reference_answer.answer_markdown }}</p><p><b>解析：</b> {{ q.ai_reference_answer.analysis_markdown }}</p>{% for item in q.ai_reference_answer.subquestion_display.flat_items %}<div class="subquestion-answer"><h5>{{ item.display_label }}</h5><p><b>答案：</b> {{ item.answer_markdown }}</p><p><b>解析：</b> {{ item.analysis_markdown }}</p></div>{% endfor %}</section>{% endif %}
     <form method="post" action="/basket/remove/{{ q.question_code }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="/basket"><button type="submit">移出选题篮</button></form>
   </section>{% endfor %}
 </article>

@@ -624,6 +624,81 @@ CREATE TABLE IF NOT EXISTS subquestions (
            (answer_status = 'provided' AND length(trim(answer_markdown)) > 0))
 );
 
+-- AI reference answers are deliberately separate from the source-paper answer
+-- trust domain.  Displayable content comes only from final-review; generator and
+-- independent files remain hash/model evidence.  One conflict-checked evidence
+-- set may be approved per question.
+CREATE TABLE IF NOT EXISTS ai_reference_answers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    question_id INTEGER NOT NULL UNIQUE REFERENCES questions(id) ON DELETE CASCADE,
+    question_content_hash TEXT NOT NULL CHECK (length(question_content_hash) = 64),
+    answer_markdown TEXT NOT NULL CHECK (length(trim(answer_markdown)) BETWEEN 1 AND 50000),
+    analysis_markdown TEXT NOT NULL CHECK (length(trim(analysis_markdown)) BETWEEN 1 AND 100000),
+    generator_model TEXT NOT NULL CHECK (length(trim(generator_model)) BETWEEN 1 AND 200),
+    independent_model TEXT NOT NULL CHECK (length(trim(independent_model)) BETWEEN 1 AND 200),
+    final_review_model TEXT NOT NULL CHECK (length(trim(final_review_model)) BETWEEN 1 AND 200),
+    review_decision TEXT NOT NULL CHECK (review_decision = 'passed'),
+    review_notes TEXT NOT NULL DEFAULT '' CHECK (length(review_notes) <= 2000),
+    source_sha256 TEXT NOT NULL CHECK (length(source_sha256) = 64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    generator_sha256 TEXT NOT NULL CHECK (length(generator_sha256) = 64 AND generator_sha256 NOT GLOB '*[^0-9a-f]*'),
+    independent_sha256 TEXT NOT NULL CHECK (length(independent_sha256) = 64 AND independent_sha256 NOT GLOB '*[^0-9a-f]*'),
+    final_review_sha256 TEXT NOT NULL CHECK (length(final_review_sha256) = 64 AND final_review_sha256 NOT GLOB '*[^0-9a-f]*'),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_reference_subquestion_answers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ai_reference_answer_id INTEGER NOT NULL REFERENCES ai_reference_answers(id) ON DELETE CASCADE,
+    subquestion_id INTEGER NOT NULL REFERENCES subquestions(id) ON DELETE CASCADE,
+    display_order INTEGER NOT NULL CHECK (display_order > 0),
+    answer_markdown TEXT NOT NULL CHECK (length(trim(answer_markdown)) BETWEEN 1 AND 50000),
+    analysis_markdown TEXT NOT NULL CHECK (length(trim(analysis_markdown)) BETWEEN 1 AND 100000),
+    UNIQUE (ai_reference_answer_id, display_order),
+    UNIQUE (ai_reference_answer_id, subquestion_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_reference_subquestion
+ON ai_reference_subquestion_answers(subquestion_id);
+
+CREATE TRIGGER IF NOT EXISTS ai_reference_subquestion_validate_insert
+BEFORE INSERT ON ai_reference_subquestion_answers
+BEGIN
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM ai_reference_answers AS ai
+            JOIN subquestions AS s ON s.id = NEW.subquestion_id
+            WHERE ai.id = NEW.ai_reference_answer_id
+              AND ai.question_id = s.question_id
+        ) THEN RAISE(ABORT, 'AI reference subquestion question mismatch')
+        WHEN NOT EXISTS (
+            SELECT 1 FROM subquestions AS s
+            WHERE s.id = NEW.subquestion_id
+              AND s.display_order = NEW.display_order
+        ) THEN RAISE(ABORT, 'AI reference subquestion display_order mismatch')
+    END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS ai_reference_subquestion_validate_update
+BEFORE UPDATE OF ai_reference_answer_id, subquestion_id, display_order
+ON ai_reference_subquestion_answers
+BEGIN
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM ai_reference_answers AS ai
+            JOIN subquestions AS s ON s.id = NEW.subquestion_id
+            WHERE ai.id = NEW.ai_reference_answer_id
+              AND ai.question_id = s.question_id
+        ) THEN RAISE(ABORT, 'AI reference subquestion question mismatch')
+        WHEN NOT EXISTS (
+            SELECT 1 FROM subquestions AS s
+            WHERE s.id = NEW.subquestion_id
+              AND s.display_order = NEW.display_order
+        ) THEN RAISE(ABORT, 'AI reference subquestion display_order mismatch')
+    END;
+END;
+
 CREATE TABLE IF NOT EXISTS question_formulas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,

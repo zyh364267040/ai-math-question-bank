@@ -16,7 +16,7 @@
   </div></article>{% endfor %}</section>
 <section class="export-preview-panel">
 <form class="export-form" data-basket-preview-form method="post" action="/basket/export"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><h2>导出设置</h2>
-  <label><input type="checkbox" name="include_source"> 来源</label><label><input type="checkbox" name="include_knowledge"> 知识点</label><label><input type="checkbox" name="include_answers"> 答案</label><label><input type="checkbox" name="include_analysis"> 解析</label><p>题目必需的配图将自动携带。</p><button type="submit">导出新版本</button>
+  <label><input type="checkbox" name="include_source"> 来源</label><label><input type="checkbox" name="include_knowledge"> 知识点</label><label><input type="checkbox" name="include_answers"> 答案</label><label><input type="checkbox" name="include_analysis"> 解析</label><label><input type="checkbox" name="include_ai_answers"> AI参考答案</label><p>题目必需的配图将自动携带。</p><button type="submit">导出新版本</button>
 </form>
 <div class="preview-shell"><div class="preview-status" data-preview-status role="status" aria-live="polite">正在生成预览…</div><div data-preview-output></div><button class="preview-retry" data-preview-retry type="button" hidden>重试预览</button></div>
 </section>

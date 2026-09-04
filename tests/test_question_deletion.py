@@ -130,6 +130,7 @@ class FormalQuestionDeletionTests(unittest.TestCase):
         self.assertEqual(410, gone.status_code)
         self.assertIn("题目已删除，可前往恢复", gone.text)
         self.assertNotIn("&lt;b&gt;题干", gone.text)
+        self.assertNotIn("AI参考答案", gone.text)
         self.assertEqual(410, self.post(f"/basket/add/{self.code}").status_code)
         self.assertIn("选题篮还是空的", self.client.get("/basket").text)
         self.assertEqual(400, self.post("/basket/preview").status_code)

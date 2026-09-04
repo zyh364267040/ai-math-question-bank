@@ -3,6 +3,7 @@
 import json
 import hashlib
 import hmac
+import html
 import io
 import os
 import re
@@ -963,11 +964,72 @@ def _basket_questions(connection):
             "SELECT * FROM subquestions WHERE question_id=? ORDER BY display_order", (row["id"],)
         ).fetchall()
         item["subquestion_display"] = _group_labeled_subquestions(item["subquestions"])
+        item["ai_reference_answer"] = _valid_ai_reference_answer(
+            connection, row["id"]
+        )
         item["assets"] = connection.execute(
             "SELECT * FROM question_assets WHERE question_id=? ORDER BY asset_kind,display_order", (row["id"],)
         ).fetchall()
         result.append(item)
     return result
+
+
+def _valid_ai_reference_answer(connection, question_id):
+    """Return the whole AI answer only when formal subquestions match exactly."""
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN")
+    try:
+        answer = connection.execute(
+            """SELECT ai.*
+               FROM ai_reference_answers ai
+               JOIN questions q ON q.id=ai.question_id
+               WHERE ai.question_id=?
+                 AND ai.review_decision='passed'
+                 AND q.deleted_at IS NULL
+                 AND ai.question_content_hash=q.content_hash
+                 AND EXISTS (
+                     SELECT 1 FROM question_sources qs
+                     JOIN import_answer_sources ans
+                       ON ans.import_job_id=qs.import_job_id
+                     WHERE qs.question_id=q.id
+                       AND ans.source_answer_state='source_has_no_answer'
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM subquestions s
+                     LEFT JOIN ai_reference_subquestion_answers asa
+                       ON asa.ai_reference_answer_id=ai.id
+                      AND asa.subquestion_id=s.id
+                      AND asa.display_order=s.display_order
+                     WHERE s.question_id=q.id AND asa.id IS NULL
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM ai_reference_subquestion_answers asa
+                     LEFT JOIN subquestions s
+                       ON s.id=asa.subquestion_id
+                      AND s.question_id=q.id
+                      AND s.display_order=asa.display_order
+                     WHERE asa.ai_reference_answer_id=ai.id AND s.id IS NULL
+                 )""",
+            (question_id,),
+        ).fetchone()
+        if answer is None:
+            return None
+        subquestions = connection.execute(
+            """SELECT s.display_order,s.stem_markdown,
+                      asa.answer_markdown,asa.analysis_markdown
+               FROM ai_reference_subquestion_answers asa
+               JOIN subquestions s ON s.id=asa.subquestion_id
+               WHERE asa.ai_reference_answer_id=?
+               ORDER BY s.display_order""",
+            (answer["id"],),
+        ).fetchall()
+        result = dict(answer)
+        result["subquestion_display"] = _group_labeled_subquestions(subquestions)
+        return result
+    finally:
+        if owns_transaction and connection.in_transaction:
+            connection.rollback()
 
 
 def _verified_recovered_crop(connection, private_root, asset):
@@ -1194,6 +1256,7 @@ def _verified_asset_path(private_root, asset, connection=None):
 
 EXPORT_OPTION_NAMES = (
     "include_source", "include_knowledge", "include_answers", "include_analysis",
+    "include_ai_answers",
 )
 LEGACY_IGNORED_EXPORT_OPTIONS = {"include_images"}
 
@@ -1273,6 +1336,20 @@ def _export_markdown(private_root, questions, options, destination, connection):
             lines += [f"**答案：** {question['answer_display']}", ""]
         if options["include_analysis"]:
             lines += [f"**解析：** {question['analysis_display']}", ""]
+        ai_answer = question.get("ai_reference_answer")
+        if options["include_ai_answers"] and ai_answer:
+            lines += [
+                "### AI参考答案", "",
+                "> AI生成并经复核，不是原卷官方答案", "",
+                f"**答案：** {html.escape(ai_answer['answer_markdown'], quote=False)}", "",
+                f"**解析：** {html.escape(ai_answer['analysis_markdown'], quote=False)}", "",
+            ]
+            for subquestion in ai_answer["subquestion_display"]["flat_items"]:
+                label = subquestion["display_label"]
+                lines += [
+                    f"**{label}答案：** {html.escape(subquestion['answer_markdown'], quote=False)}", "",
+                    f"**{label}解析：** {html.escape(subquestion['analysis_markdown'], quote=False)}", "",
+                ]
     markdown = "\n".join(lines).rstrip() + "\n"
     target = destination / "练习.md"
     temporary = destination / ".练习.md.tmp"
@@ -3164,6 +3241,9 @@ def create_app(
                     for asset in asset_rows:
                         assets_by_question[asset["question_id"]].append(dict(asset))
                 for question in questions:
+                    question["has_ai_reference_answer"] = bool(
+                        _valid_ai_reference_answer(connection, question["id"])
+                    )
                     options = options_by_question[question["id"]]
                     content = _required_question_content(
                         question, options, assets_by_question[question["id"]]
@@ -3321,7 +3401,8 @@ def create_app(
                        JOIN knowledge_points kp ON kp.id=q.primary_knowledge_point_id
                        JOIN question_sources qs ON qs.question_id=q.id JOIN source_papers s ON s.id=qs.source_paper_id
                        LEFT JOIN import_answer_sources ans ON ans.import_job_id=qs.import_job_id
-                       WHERE q.question_code=?""", (question_code,)
+                       WHERE q.question_code=?""",
+                    (question_code,),
                 ).fetchone()
                 if row is None: return _error(request, templates, "未找到正式题目", 404)
                 if row["deleted_at"] is not None:
@@ -3331,6 +3412,9 @@ def create_app(
                 related = connection.execute("""SELECT k.code,k.name FROM question_related_knowledge_points r JOIN knowledge_points k ON k.id=r.knowledge_point_id WHERE r.question_id=? ORDER BY k.sort_order,k.id""", (row["id"],)).fetchall()
                 assets = connection.execute("SELECT * FROM question_assets WHERE question_id=? ORDER BY asset_kind,display_order", (row["id"],)).fetchall()
                 review = connection.execute("SELECT * FROM question_reviews WHERE question_id=? AND review_item='usability' ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
+                ai_reference_answer = _valid_ai_reference_answer(
+                    connection, row["id"]
+                )
                 in_basket = connection.execute("SELECT 1 FROM basket_items bi JOIN baskets b ON b.id=bi.basket_id WHERE b.basket_key='default' AND bi.question_id=?", (row["id"],)).fetchone() is not None
         except sqlite3.Error:
             return _error(request, templates, "题目数据暂时无法读取", 500)
@@ -3338,6 +3422,11 @@ def create_app(
             "question": dict(row), "options": options, "subquestions": subs,
             "subquestion_display": _group_labeled_subquestions(subs),
             "related": related, "assets": assets, "review": review,
+            "ai_reference_answer": ai_reference_answer,
+            "ai_reference_subquestion_display": (
+                ai_reference_answer["subquestion_display"]
+                if ai_reference_answer else _group_labeled_subquestions([])
+            ),
             "in_basket": in_basket,
         })
 
