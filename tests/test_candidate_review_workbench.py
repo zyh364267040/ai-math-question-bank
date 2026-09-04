@@ -42,6 +42,29 @@ class _InteractionParser(HTMLParser):
 
 
 class CandidateReviewWorkbenchTests(WebAppTests):
+    def test_stylesheet_url_uses_review_heading_cache_version(self):
+        page = self.client.get("/reviews/1/questions/1")
+
+        self.assertIn(
+            "/static/styles.css?v=20260904-review-heading",
+            page.text,
+        )
+
+    def test_review_heading_link_color_rule_excludes_buttons(self):
+        page = self.client.get("/reviews/1/questions/1")
+        self.assertIn('<a href="/papers">← 返回试卷列表</a>', page.text)
+        self.assertIn(
+            '<a class="button" href="/imports/1/classification">Codex 知识点分类</a>',
+            page.text,
+        )
+
+        css = self.client.get("/static/styles.css").text
+        self.assertRegex(
+            css,
+            r"\.review-heading>a:not\(\.button\)\{[^}]*color:var\(--green\)",
+        )
+        self.assertNotRegex(css, r"\.review-heading>a\{")
+
     def test_workbench_distinguishes_human_and_ai_approvals(self):
         self.assertEqual(303, self.quick_post(number=1).status_code)
         self.assertEqual(303, self.quick_post(number=2).status_code)
@@ -579,6 +602,37 @@ class CandidateReviewWorkbenchTests(WebAppTests):
         self.assertIn("需要图形题缺少必要配图", required_figure.text)
         with sqlite3.connect(self.db_path) as connection:
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM candidate_review_drafts").fetchone()[0])
+
+    def test_quick_approve_allows_empty_primary_knowledge_point_before_classification(self):
+        self.assertEqual(303, self.quick_post(number=1, action="needs_fix").status_code)
+        csrf_token = self.csrf("/reviews/1/questions/1")
+        with sqlite3.connect(self.db_path) as connection:
+            edited = json.loads(connection.execute(
+                "SELECT edited_json FROM candidate_review_drafts "
+                "WHERE import_job_id=1 AND source_question_no='1'"
+            ).fetchone()[0])
+            edited["primary_knowledge_point_code"] = ""
+            connection.execute(
+                "UPDATE candidate_review_drafts SET edited_json=? "
+                "WHERE import_job_id=1 AND source_question_no='1'",
+                (json.dumps(edited, ensure_ascii=False),),
+            )
+
+        response = self.client.post(
+            "/reviews/1/questions/1/quick-status",
+            data={"csrf_token": csrf_token, "version": "2", "action": "approve"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, response.status_code)
+        with sqlite3.connect(self.db_path) as connection:
+            self.assertEqual(
+                ("approved", "human"),
+                connection.execute(
+                    "SELECT status,approval_source FROM candidate_review_drafts "
+                    "WHERE import_job_id=1 AND source_question_no='1'"
+                ).fetchone(),
+            )
 
     def test_quick_status_security_errors_and_optimistic_lock_are_safe(self):
         path = "/reviews/1/questions/3/quick-status"

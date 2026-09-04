@@ -756,7 +756,11 @@ def _validate_review_approval(edited, original, valid_types, valid_points, crop,
         raise ValueError("审核通过前题干不能为空")
     type_code = edited.get("question_type_code")
     primary = edited.get("primary_knowledge_point_code")
-    if type_code not in valid_types or primary not in valid_points:
+    if (
+        type_code not in valid_types
+        or not isinstance(primary, str)
+        or (primary and primary not in valid_points)
+    ):
         raise ValueError("题型或知识点无效")
     options = edited.get("options", [])
     if not isinstance(options, list):
